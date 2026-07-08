@@ -1,0 +1,26 @@
+{
+  "name": "@intx/example-agent-anchored-audit",
+  "version": "0.1.2",
+  "license": "LGPL-2.1-only",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "scripts": {
+    "start": "bun run src/cli.ts"
+  },
+  "dependencies": {
+    "@ar.io/anchor": "^0.2.0",
+    "@ar.io/anchor-interchange": "file:./vendor/ar.io-anchor-interchange-0.1.0.tgz",
+    "@intx/agent": "workspace:*",
+    "@intx/crypto": "workspace:*",
+    "@intx/example-agent-common": "workspace:*",
+    "@intx/storage-isogit": "workspace:*",
+    "@intx/types": "workspace:*",
+    "arktype": "catalog:"
+  }
+}
