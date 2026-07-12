@@ -2405,6 +2405,12 @@ export type InferenceOptions = {
    * omitted, a built-in default policy is applied.
    */
   retryPolicy?: RetryPolicy;
+  /**
+   * Conversation turns prepended to the materialized prompt for this
+   * inference only. Not committed to durable history, so transient director
+   * guidance does not alter the cached baseline system prompt on later turns.
+   */
+  ephemeralTurns?: ConversationTurn[];
 };
 
 // ---------------------------------------------------------------------------
