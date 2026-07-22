@@ -172,16 +172,20 @@ export async function main(
 
   const contextDir = opts.contextDir ?? defaultContextDir(EXAMPLE_NAME);
   mkdirSync(contextDir, { recursive: true });
-  const storage = await createIsogitStore(contextDir);
 
-  // The agent's Ed25519 identity — the same crypto surface the runtime
-  // uses for SSH-signed commits — also signs the anchors.
-  //
+  // ONE identity, both signatures: the CryptoProvider's signSSH half is
+  // the store's CommitSigner (SSH-signed git commits — the binding
+  // createIsogitStore's signer parameter exists for), and its raw-sign
+  // half anchors (via signerFromCryptoProvider). No second key to
+  // custody, and the claim "the key that signs the commits signs the
+  // anchors" is wired, not narrated.
+  const identity = createEd25519Crypto(await generateKeyPair());
+  const storage = await createIsogitStore(contextDir, (payload) => identity.signSSH(payload));
+
   // Retention (sink + logStore) is injected ONCE here, on the anchorer —
   // the adapter inherits it untouched. The sink keeps a durable proof row
   // per event; the logStore keeps the EXACT bytes each on-chain hash
   // commits to, which is what lets the bundle below disclose them.
-  const identity = createEd25519Crypto(await generateKeyPair());
   const logStore = new FsLogStore(join(contextDir, "anchor", "logs"));
   const anchorer = createAnchorer({
     signer: signerFromCryptoProvider(identity),
