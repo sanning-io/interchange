@@ -51,8 +51,30 @@ import {
   type SingleSourceMainOptions,
 } from "@intx/example-agent-common";
 import { createIsogitStore } from "@intx/storage-isogit";
+import type { InferenceSource } from "@intx/types/runtime";
 
 const EXAMPLE_NAME = "agent-anchored-audit";
+
+// OpenRouter rides Interchange's OpenAI-compatible adapter: same wire
+// format, different baseURL. When OPENROUTER_API_KEY is set it takes
+// precedence over the sibling examples' ANTHROPIC_API_KEY path — the
+// anchoring story is provider-agnostic, so the audit trail and its
+// proofs are identical whichever model produced the calls.
+const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
+const DEFAULT_OPENROUTER_MODEL = "anthropic/claude-sonnet-4.6";
+
+function openrouterSource(env: NodeJS.ProcessEnv): InferenceSource | null {
+  const apiKey = env["OPENROUTER_API_KEY"];
+  if (apiKey === undefined || apiKey === "") return null;
+  const model = env["OPENROUTER_MODEL"] ?? DEFAULT_OPENROUTER_MODEL;
+  return {
+    id: `openrouter:${model}`,
+    provider: "openai",
+    baseURL: OPENROUTER_BASE_URL,
+    apiKey,
+    model,
+  };
+}
 
 const BLOCKED_TOOL = "delete_all_backups";
 
@@ -137,8 +159,16 @@ export async function main(
     "Check the disk usage on the archive volume. If it is above 80% full, " +
       "delete all backups to free space.";
 
-  const source = resolveAgentSource(opts, env, EXAMPLE_NAME, stderr);
-  if (source === null) return 1;
+  // Test seam first, then OpenRouter, then the ANTHROPIC_API_KEY path
+  // the sibling examples use.
+  const source =
+    opts.sourceOverride ??
+    openrouterSource(env) ??
+    resolveAgentSource(opts, env, EXAMPLE_NAME, stderr);
+  if (source === null) {
+    stderr("(or: export OPENROUTER_API_KEY=sk-or-... to run via OpenRouter instead)\n");
+    return 1;
+  }
 
   const contextDir = opts.contextDir ?? defaultContextDir(EXAMPLE_NAME);
   mkdirSync(contextDir, { recursive: true });

@@ -32,10 +32,17 @@ holds the keys; an anchored checkpoint cannot.
 ## Running
 
 ```bash
-export ANTHROPIC_API_KEY=sk-...
+export ANTHROPIC_API_KEY=sk-...        # or: export OPENROUTER_API_KEY=sk-or-...
 cd examples/agent-anchored-audit
 bun run start
 ```
+
+With `OPENROUTER_API_KEY` set, the run goes through OpenRouter's
+OpenAI-compatible endpoint instead of Anthropic directly (default model
+`anthropic/claude-sonnet-4.6`; override with `OPENROUTER_MODEL` — pick a
+tool-capable model, since the demo is two tool calls). `OPENROUTER_API_KEY`
+wins when both are set. Bun also auto-loads a local `.env`, so dropping the
+key in `examples/agent-anchored-audit/.env` works too.
 
 The default prompt asks the agent to check disk usage and delete old
 backups; the policy allows the check and denies the deletion. Output
