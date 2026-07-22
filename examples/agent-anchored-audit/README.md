@@ -61,6 +61,18 @@ verify it anywhere — no repo access, no agent, no write SDK:
   npx @ar.io/proof verify <contextDir>/trace-bundle.json
 ```
 
+**Where the files land:** not in this folder — like every agent-*
+example, output goes to `<repo-root>/tmp/agent-anchored-audit/context/`
+(the run prints the full path). In there: `state/audit/` (the git
+logbook), `anchor/` (durable proofs + retained bytes), and
+`trace-bundle.json` (the file you hand to an auditor).
+
+To start over:
+
+```bash
+rm -rf ../../tmp/agent-anchored-audit
+```
+
 ## The auditor's side
 
 Copy `trace-bundle.json` to any machine — no Interchange, no agent, no
