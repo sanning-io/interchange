@@ -56,6 +56,7 @@ checkpoint: <txId>
   https://turbo-gateway.com/<txId>
 
 portable evidence bundle: <contextDir>/trace-bundle.json
+  (2/2 records disclosed in-body, each bound to its committed hash)
 verify it anywhere — no repo access, no agent, no write SDK:
   npx @ar.io/proof verify <contextDir>/trace-bundle.json
 ```
@@ -72,17 +73,41 @@ npx @ar.io/proof verify trace-bundle.json https://arweave.net,https://permagate.
 ```
 
 It recomputes every record's signature, payload binding, and Merkle
-inclusion and prints a per-record + rollup verdict. Now tamper with
-anything — edit one byte of a record in the bundle, or of the
-corresponding `state/audit/` file an operator would hand over — and
-verification fails: the hash no longer binds.
+inclusion — and, because the bundle **discloses the raw records
+in-body**, it also recomputes each disclosed record's `SHA-256` against
+the committed `content_hash` (the `logs ✓` marks, `@ar.io/proof` ≥
+0.3.0). The auditor doesn't just verify *that* two tool calls happened;
+they read *what* the calls were — the blocked deletion included — and
+every byte of it is bound to the on-chain checkpoint. Drag-and-drop
+bundle viewers built on `verifyEvidenceBundle` show the same thing with
+full content coverage.
+
+Disclosure is opt-in per event: this example reads each record back
+from the anchorer's `logStore` and passes it to
+`anchorer.bundle(receipts, { disclose })`. Delete `disclose` and the
+same bundle verifies hash-only — auditors confirm integrity without
+reading a single tool call.
+
+Now tamper with anything — edit one byte of a record in the bundle, or
+of the corresponding `state/audit/` file an operator would hand over —
+and verification fails: the hash no longer binds.
+
+## Retention is the SDK's job
+
+The run also leaves a durable retention trail under
+`<contextDir>/anchor/`, injected once on the anchorer (`FsSink` +
+`FsLogStore` — the adapter inherits both untouched): `proofs.jsonl`
+holds one proof row per event and checkpoint, and `logs/` holds the
+exact committed bytes, content-addressed. Everything the bundle
+disclosed came from that store — no second copy of the truth.
 
 This run uses `@ar.io/anchor`'s dev mode (auto-minted wallet, free
 tier); the envelopes are permanently marked `environment: "dev"`
 inside the signed bytes. Production requires an explicit signer and
 funded wallet — see the adapter README.
 
-> **Note:** `@ar.io/anchor-interchange` is consumed here from a
-> vendored tarball (`vendor/`) while the package awaits its npm
-> release; the dependency becomes a normal version range at that
-> point.
+> **Note:** two dependencies are consumed from vendored tarballs
+> (`vendor/`): `@ar.io/anchor-interchange` awaits its npm release, and
+> `@ar.io/anchor` is a pre-release pack carrying the retention seams
+> (`FsSink`/`FsLogStore`) ahead of their npm publish. Both become
+> normal version ranges once published.

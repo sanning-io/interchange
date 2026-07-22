@@ -28,7 +28,7 @@ import { join } from "node:path";
 
 import { type } from "arktype";
 
-import { createAnchorer } from "@ar.io/anchor";
+import { createAnchorer, FsLogStore, FsSink } from "@ar.io/anchor";
 import {
   anchoredAuditStore,
   signerFromCryptoProvider,
@@ -176,9 +176,17 @@ export async function main(
 
   // The agent's Ed25519 identity — the same crypto surface the runtime
   // uses for SSH-signed commits — also signs the anchors.
+  //
+  // Retention (sink + logStore) is injected ONCE here, on the anchorer —
+  // the adapter inherits it untouched. The sink keeps a durable proof row
+  // per event; the logStore keeps the EXACT bytes each on-chain hash
+  // commits to, which is what lets the bundle below disclose them.
   const identity = createEd25519Crypto(await generateKeyPair());
+  const logStore = new FsLogStore(join(contextDir, "anchor", "logs"));
   const anchorer = createAnchorer({
     signer: signerFromCryptoProvider(identity),
+    sink: new FsSink(join(contextDir, "anchor", "proofs.jsonl")),
+    logStore,
   });
 
   // The integration: decorate the audit store. Everything else in the
@@ -248,11 +256,24 @@ export async function main(
   }
 
   // One signed, portable file: the records, their envelopes, the
-  // checkpoint, and every inclusion proof. Hand THIS to the auditor.
-  const bundle = await anchorer.bundle(receipts);
+  // checkpoint, every inclusion proof — AND the raw records themselves,
+  // read back from the logStore and disclosed in-body. toEvidenceBundle
+  // asserts each disclosed byte-string against the committed content_hash
+  // before signing, so a wrong copy throws here instead of shipping.
+  // Auditors verify not just THAT something happened but WHAT happened.
+  // (Delete `disclose` for the hash-only privacy mode.)
+  const disclose: Record<string, Uint8Array> = {};
+  for (const r of receipts) {
+    const bytes = await logStore.get(r.eventId);
+    if (bytes !== null) disclose[r.eventId] = bytes;
+  }
+  const bundle = await anchorer.bundle(receipts, { disclose });
   const bundlePath = join(contextDir, "trace-bundle.json");
   writeFileSync(bundlePath, JSON.stringify(bundle, null, 2));
   stdout(`\nportable evidence bundle: ${bundlePath}\n`);
+  stdout(
+    `  (${String(Object.keys(disclose).length)}/${String(receipts.length)} records disclosed in-body, each bound to its committed hash)\n`,
+  );
   stdout("verify it anywhere — no repo access, no agent, no write SDK:\n");
   stdout(`  npx @ar.io/proof verify ${bundlePath}\n`);
   return 0;
