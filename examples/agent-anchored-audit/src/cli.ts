@@ -186,11 +186,10 @@ export async function main(
   // the adapter inherits it untouched. The sink keeps a durable proof row
   // per event; the logStore keeps the EXACT bytes each on-chain hash
   // commits to, which is what lets the bundle below disclose them.
-  const logStore = new FsLogStore(join(contextDir, "anchor", "logs"));
   const anchorer = createAnchorer({
     signer: signerFromCryptoProvider(identity),
     sink: new FsSink(join(contextDir, "anchor", "proofs.jsonl")),
-    logStore,
+    logStore: new FsLogStore(join(contextDir, "anchor", "logs")),
   });
 
   // The integration: decorate the audit store. Everything else in the
@@ -261,22 +260,18 @@ export async function main(
 
   // One signed, portable file: the records, their envelopes, the
   // checkpoint, every inclusion proof — AND the raw records themselves,
-  // read back from the logStore and disclosed in-body. toEvidenceBundle
-  // asserts each disclosed byte-string against the committed content_hash
-  // before signing, so a wrong copy throws here instead of shipping.
-  // Auditors verify not just THAT something happened but WHAT happened.
+  // auto-disclosed in-body from the anchorer's logStore. The SDK asserts
+  // each disclosed byte-string against the committed content_hash before
+  // signing, so a wrong copy throws here instead of shipping. Auditors
+  // verify not just THAT something happened but WHAT happened.
   // (Delete `disclose` for the hash-only privacy mode.)
-  const disclose: Record<string, Uint8Array> = {};
-  for (const r of receipts) {
-    const bytes = await logStore.get(r.eventId);
-    if (bytes !== null) disclose[r.eventId] = bytes;
-  }
-  const bundle = await anchorer.bundle(receipts, { disclose });
+  const bundle = await anchorer.bundle(receipts, { disclose: true });
   const bundlePath = join(contextDir, "trace-bundle.json");
   writeFileSync(bundlePath, JSON.stringify(bundle, null, 2));
+  const disclosed = bundle.body.events.filter((e) => e.content !== undefined).length;
   stdout(`\nportable evidence bundle: ${bundlePath}\n`);
   stdout(
-    `  (${String(Object.keys(disclose).length)}/${String(receipts.length)} records disclosed in-body, each bound to its committed hash)\n`,
+    `  (${String(disclosed)}/${String(receipts.length)} records disclosed in-body, each bound to its committed hash)\n`,
   );
   stdout("verify it anywhere — no repo access, no agent, no write SDK:\n");
   stdout(`  npx @ar.io/proof verify ${bundlePath}\n`);

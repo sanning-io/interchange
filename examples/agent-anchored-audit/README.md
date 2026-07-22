@@ -82,11 +82,11 @@ every byte of it is bound to the on-chain checkpoint. Drag-and-drop
 bundle viewers built on `verifyEvidenceBundle` show the same thing with
 full content coverage.
 
-Disclosure is opt-in per event: this example reads each record back
-from the anchorer's `logStore` and passes it to
-`anchorer.bundle(receipts, { disclose })`. Delete `disclose` and the
-same bundle verifies hash-only — auditors confirm integrity without
-reading a single tool call.
+Disclosure is opt-in: `anchorer.bundle(receipts, { disclose: true })`
+embeds every record the anchorer's `logStore` retained (pass a per-event
+map instead for selective disclosure). Delete `disclose` and the same
+bundle verifies hash-only — auditors confirm integrity without reading
+a single tool call.
 
 Now tamper with anything — edit one byte of a record in the bundle, or
 of the corresponding `state/audit/` file an operator would hand over —
