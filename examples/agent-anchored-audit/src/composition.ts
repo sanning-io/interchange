@@ -40,6 +40,7 @@ import {
 import {
   anchoredAuditStore,
   signerFromCryptoProvider,
+  type InterchangeAnchorEvent,
 } from "@ar.io/anchor-interchange";
 import {
   createAgent,
@@ -47,7 +48,6 @@ import {
   createToolRunner,
   defineAgent,
   defineTool,
-  stringTool,
   type BaseEnv,
 } from "@intx/agent";
 import { createEd25519Crypto, generateKeyPair } from "@intx/crypto";
@@ -59,7 +59,20 @@ import type {
   KeyPair,
 } from "@intx/types/runtime";
 
+import { recoveryAuthorize, recoveryTools, SYSTEM_PROMPT } from "./job";
+
 export const EXAMPLE_NAME = "agent-anchored-audit";
+
+// The ROSTER display name — what Fleet shows for this producer. The
+// subject name sealed into the evidence stays `SANNING_AGENT_NAME`
+// (Meridian-Mutual.Subrogation, the persisted identity's history); the
+// roster override is the human name, per the SDK's displayName contract.
+const DEFAULT_DISPLAY_NAME = "Meridian Mutual — Recovery";
+
+export function rosterDisplayName(env: NodeJS.ProcessEnv): string {
+  const fromEnv = env["SANNING_DISPLAY_NAME"];
+  return fromEnv !== undefined && fromEnv !== "" ? fromEnv : DEFAULT_DISPLAY_NAME;
+}
 
 // OpenRouter rides Interchange's OpenAI-compatible adapter: same wire
 // format, different baseURL. When OPENROUTER_API_KEY is set it takes
@@ -84,7 +97,8 @@ export function openrouterSource(
   };
 }
 
-export const BLOCKED_TOOL = "delete_all_backups";
+// Re-exported so entry points name the governance gate from one place.
+export { BLOCKED_TOOL, buildRunPrompt, DEFAULT_CASE_REF } from "./job";
 
 // The shape of the committed record each receipt retains (the bytes the
 // on-chain hash commits to) — validated rather than asserted, per repo
@@ -229,83 +243,59 @@ export function createExampleAnchorer(
   };
 
   const sanningApiKey = env["SANNING_API_KEY"];
-  return sanningApiKey !== undefined && sanningApiKey !== ""
-    ? createAnchorer({
-        ...retention,
-        environment: "production",
-        wallet: new SolanaWalletSigner(
-          LocalEd25519Signer.fromSeedHex(
-            loadOrCreateWalletSeedHex(join(contextDir, "wallet.json")),
-          ),
+  if (sanningApiKey !== undefined && sanningApiKey !== "") {
+    return createAnchorer({
+      ...retention,
+      environment: "production",
+      wallet: new SolanaWalletSigner(
+        LocalEd25519Signer.fromSeedHex(
+          loadOrCreateWalletSeedHex(join(contextDir, "wallet.json")),
         ),
-        subject: {
-          type: "producer",
-          producer_id: env["SANNING_PRODUCER_ID"] ?? "interchange-audit-demo",
-          ...optional("name", env["SANNING_AGENT_NAME"]),
-        },
-        controlPlane: {
-          baseUrl:
-            env["SANNING_CONTROL_PLANE_URL"] ?? "https://console.sanning.io",
-          apiKey: sanningApiKey,
-          autoRegister: true,
-        },
-      })
-    : createAnchorer(retention);
+      ),
+      subject: {
+        type: "producer",
+        producer_id: env["SANNING_PRODUCER_ID"] ?? "interchange-audit-demo",
+        ...optional("name", env["SANNING_AGENT_NAME"]),
+      },
+      controlPlane: {
+        baseUrl:
+          env["SANNING_CONTROL_PLANE_URL"] ?? "https://console.sanning.io",
+        apiKey: sanningApiKey,
+        autoRegister: true,
+        // Roster-only override (never sealed): Fleet shows the human name.
+        displayName: rosterDisplayName(env),
+      },
+    });
+  }
+  // Dev mode. The default /anchor front may reject unauthenticated
+  // uploads; SANNING_DEV_UPLOAD_URL points dev runs at a local mock
+  // (`POST <url>/v1/tx -> { id }`) so the WHOLE flow — receipts, packs,
+  // service endpoints — is testable without spending an anchor.
+  const devUploadUrl = env["SANNING_DEV_UPLOAD_URL"];
+  return createAnchorer({
+    ...retention,
+    ...(devUploadUrl !== undefined && devUploadUrl !== ""
+      ? { arweave: { baseUrl: devUploadUrl } }
+      : {}),
+  });
 }
 
-// Two tools: one benign, one destructive. The authorize policy below
-// denies the destructive one, so the run produces BOTH audit shapes —
-// an allowed call (interchange.tool_call) and a blocked call
-// (interchange.tool_blocked). The blocked tool's handler never runs.
-const exampleTools = [
-  stringTool({
-    definition: {
-      name: "check_disk_usage",
-      description: "Report current disk usage of the archive volume.",
-      inputSchema: {
-        type: "object",
-        properties: {},
-        additionalProperties: false,
-      },
-    },
-    handler: async () => "archive volume: 82% used (410GB of 500GB)",
-  }),
-  stringTool({
-    definition: {
-      name: BLOCKED_TOOL,
-      description:
-        "Permanently delete every backup on the archive volume to free space.",
-      inputSchema: {
-        type: "object",
-        properties: {},
-        additionalProperties: false,
-      },
-    },
-    handler: async () => {
-      throw new Error("unreachable — authorization denies this tool");
-    },
-  }),
-];
-
+// The Recovery job's tools (see ./job): four deterministic reads over
+// the recovery casefile, the kernel-backed pack verification, the
+// allowed draft, and the DENIED send. The authorize policy denies
+// issuance, so a full run produces both audit shapes — allowed calls
+// (interchange.tool_call) and the blocked one (interchange.tool_blocked).
 const toolsFactory = defineTool({
   id: `@intx/example-${EXAMPLE_NAME}/tools`,
-  definitions: exampleTools.map((t) => ({ name: t.definition.name })),
+  definitions: recoveryTools.map((t) => ({ name: t.definition.name })),
   factory: () => {
-    const runner = createToolRunner(exampleTools);
+    const runner = createToolRunner(recoveryTools);
     return {
       definitions: runner.definitions,
       run: (call, signal) => runner.run(call, signal),
     };
   },
 });
-
-// A minimal real policy (contrast with permissiveAuthorize): every
-// tool is allowed except the destructive one. The denial itself
-// becomes an anchored, independently provable audit record.
-const denyDestructive: BaseEnv["authorize"] = async (resource) =>
-  resource === `tool:${BLOCKED_TOOL}`
-    ? { effect: "deny", matchingGrants: [], resolvedBy: null }
-    : { effect: "allow", matchingGrants: [], resolvedBy: null };
 
 /** Thrown when the session succeeded but the anchoring flush did not.
  *  The signed git audit trail in `contextDir` is intact either way. */
@@ -329,6 +319,11 @@ export interface RunSessionParams {
    *  BEFORE the anchoring flush — so callers can surface the reply even
    *  when anchoring subsequently fails. */
   onReply?: (reply: string) => void;
+  /** Called for every audit record as it is hash-committed (allowed,
+   *  blocked, and error records alike), BEFORE the flush — the seam the
+   *  service mode streams live progress from. Purely observational: the
+   *  committed bytes are unchanged. */
+  onAuditEvent?: (event: InterchangeAnchorEvent) => void;
   /** Inject inference deps (used by the harness-driven tests). */
   deps?: CommonMainOptions["deps"];
 }
@@ -374,16 +369,31 @@ export async function runAnchoredSession(
 
   const anchorer = createExampleAnchorer(contextDir, env, identity);
 
-  // The integration: decorate the audit store. Everything else in the
-  // composition is unchanged from the other agent-* examples.
-  const provenance = anchoredAuditStore(storage, anchorer);
+  // The integration: decorate the audit store. `mapPayload` here is
+  // purely observational — it hands each record to the caller's
+  // onAuditEvent and returns the payload unchanged, so the committed
+  // bytes are byte-identical to the no-callback path.
+  const onAuditEvent = params.onAuditEvent;
+  const provenance = anchoredAuditStore(
+    storage,
+    anchorer,
+    onAuditEvent !== undefined
+      ? {
+          mapPayload: (event) => {
+            try {
+              onAuditEvent(event);
+            } catch {
+              // A watching callback must never affect what is committed.
+            }
+            return event.payload;
+          },
+        }
+      : {},
+  );
 
   const def = defineAgent({
     id: EXAMPLE_NAME,
-    systemPrompt:
-      "You are a storage-maintenance assistant. Use your tools to carry " +
-      "out the request. Report what you did, and anything you were " +
-      "prevented from doing, in one short sentence each.",
+    systemPrompt: SYSTEM_PROMPT,
     tools: [toolsFactory],
     capabilities: [],
     inference: {
@@ -397,7 +407,7 @@ export async function runAnchoredSession(
     storage,
     workdir: contextDir,
     audit: provenance,
-    authorize: denyDestructive,
+    authorize: recoveryAuthorize,
     directors: createDefaultDirectorRegistry(),
     ...optional("deps", params.deps),
   };

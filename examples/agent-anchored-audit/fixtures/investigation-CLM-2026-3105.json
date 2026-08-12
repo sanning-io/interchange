@@ -1,0 +1,29 @@
+{
+  "reportId": "SIU-2026-3105-R1",
+  "claimId": "CLM-2026-3105",
+  "policyId": "HO-77341-2024",
+  "policyholder": { "id": "PH-201District", "name": "Dana Okafor" },
+  "property": "1442 Alder Row, Harrisview",
+  "lossDate": "2026-07-19",
+  "commissionedBy": "Meridian Mutual — Recovery Unit",
+  "engineer": "K. Ferrant, PE — Cause & Origin, Brightwell Forensic Engineering",
+  "siteExamDate": "2026-07-29",
+  "labExamDate": "2026-08-04",
+  "scope": "Post-payment cause-and-origin examination commissioned to determine whether a third party bears legal responsibility for the fire loss adjudicated under CLM-2026-3105.",
+  "summary": "Origin at the stovetop is CONFIRMED, consistent with the field adjuster's report (M. Delgado, 2026-07-23). Cause is REFINED: laboratory disassembly of the retained cooktop identified severe arcing damage at the supply-conductor termination inside the cooktop's appliance junction box — a lug left under-torqued when the cooktop circuit was installed during the March 2026 kitchen renovation. The loose termination produced resistive heating and arcing that ignited grease residue at the cooktop surface, presenting in the field as a cooking-fire event. The branch-circuit wiring in the walls is intact, as the field report correctly recorded; the defect was confined to the appliance junction box and is only observable on lab disassembly, which is beyond field-inspection scope.",
+  "findings": [
+    "Arc-mapping places first ignition inside the cooktop enclosure at the supply-conductor termination, not on the cooking surface.",
+    "The line-side lug shows classic signs of a loose termination: conductor strand annealing, localized melting, and arc beads absent anywhere else on the circuit.",
+    "The cooktop circuit was installed 2026-03-14 by Hollis & Verne Electrical under permit E-26-08812 (kitchen renovation); the permit's final inspection did not include appliance-side terminations.",
+    "No evidence of product defect in the cooktop itself; the manufacturer's termination-torque specification was not met.",
+    "The refinement does not disturb the coverage position: the loss remains sudden and accidental from the insured's standpoint."
+  ],
+  "liableParty": {
+    "name": "Hollis & Verne Electrical",
+    "role": "electrical contractor (kitchen renovation, March 2026)",
+    "workOrder": "HV-26-0231, dated 2026-03-14",
+    "basis": "Negligent workmanship: the cooktop supply termination was left under-torqued, in breach of the manufacturer's installation specification and the applicable electrical code's workmanship clause; the failure caused the fire.",
+    "insurer": "Cornerline Commercial Casualty (general liability, per certificate on the renovation file)"
+  },
+  "conclusion": "The fire loss paid under CLM-2026-3105 was caused by faulty electrical work performed by Hollis & Verne Electrical. Recovery prospects are assessed as STRONG: physical evidence is preserved, the work order and permit chain are documented, and the causal chain is short."
+}

@@ -1,0 +1,16 @@
+{
+  "policyId": "HO-77341-2024",
+  "product": "Meridian HomeShield Plus",
+  "section": "Conditions — Section II, Clause 14: Subrogation and Recovery",
+  "clauseText": "If we make a payment under this policy and the person to or for whom payment is made has a right to recover damages from another party, we are subrogated to that right to the extent of our payment. The insured must do nothing after a loss to impair our right of recovery, and must assist us on request in pursuing it. Amounts recovered are applied first to reimburse the insured's deductible, then to our payment, then any remainder to the insured.",
+  "recoveryRules": {
+    "demandBasis": "The recovery demand is the amount we paid on the claim plus the insured's deductible (the deductible is recovered on the insured's behalf and reimbursed first).",
+    "pursueThreshold": "Recovery is pursued where a liable third party is identified, the causal evidence is documented, and the expected recovery exceeds $5,000.",
+    "declineGrounds": "Recovery is declined where liability evidence is speculative, the target is uninsured and judgment-proof, or the expected recovery does not exceed $5,000."
+  },
+  "authority": {
+    "aiRecoverySpecialist": "May verify the upstream claim record, assess liability, and DRAFT the recovery demand.",
+    "issuance": "Issuing (sending) a recovery demand is reserved: any demand above $25,000 requires supervising counsel sign-off before it leaves Meridian. Drafting is delegated; issuance is not.",
+    "recordNote": "Every recovery decision must state its basis against the adjudicated claim record; work product that cannot cite a verified upstream record is not actionable."
+  }
+}

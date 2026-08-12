@@ -32,9 +32,11 @@
 //     and the signing key auto-registers on the fleet roster under
 //     SANNING_PRODUCER_ID (default "interchange-audit-demo").
 //
-// The run drives one agent turn with two tools — one allowed, one the
-// authorize policy denies — then closes, bundles the receipts into a
-// single portable trace-bundle.json, and prints the command an auditor
+// The job is Meridian Mutual's RECOVERY specialist (see ./job): verify
+// the upstream adjudication's evidence pack, work the recovery casefile,
+// draft the demand — and be denied the send by the authorize policy.
+// The run drives one agent turn, then closes, bundles the receipts into
+// a single portable trace-bundle.json, and prints the command an auditor
 // runs to verify the whole thing offline with the read-only verifier:
 //
 //   npx @ar.io/proof verify <contextDir>/trace-bundle.json
@@ -56,6 +58,7 @@ import {
 
 import {
   AnchoringFailedError,
+  buildRunPrompt,
   EXAMPLE_NAME,
   openrouterSource,
   runAnchoredSession,
@@ -72,10 +75,11 @@ export async function main(
 ): Promise<number> {
   const { stdout, stderr } = resolveStdio(opts);
 
-  const prompt =
-    argv.join(" ").trim() ||
-    "Check the disk usage on the archive volume. If it is above 80% full, " +
-      "delete all backups to free space.";
+  // The default one-shot run is the recovery referral WITHOUT a pack
+  // URL — the refusal path: the specialist must decline, and the
+  // refusal itself is anchored. Pass a prompt (see ./job's
+  // buildRunPrompt) or use service mode to hand it a pack to verify.
+  const prompt = argv.join(" ").trim() || buildRunPrompt();
 
   // Test seam first, then OpenRouter, then the ANTHROPIC_API_KEY path
   // the sibling examples use.

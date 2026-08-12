@@ -1,0 +1,30 @@
+{
+  "claimId": "CLM-2026-3105",
+  "policyId": "HO-77341-2024",
+  "policyholder": { "id": "PH-201District", "name": "Dana Okafor" },
+  "adjudication": {
+    "decision": "APPROVED",
+    "decidedBy": "Meridian-Mutual.Claims-Adjudication (AI adjudicator; sealed evidence pack on file)",
+    "claimedAmount": 46500,
+    "coverageLimit": 250000,
+    "deductible": 1000,
+    "approvedAmount": 45500
+  },
+  "payments": [
+    {
+      "paymentId": "PAY-2026-18744",
+      "date": "2026-08-01",
+      "payee": "Dana Okafor",
+      "method": "EFT",
+      "amount": 45500,
+      "memo": "CLM-2026-3105 fire loss settlement — approved amount in full"
+    }
+  ],
+  "totalPaid": 45500,
+  "paidInFull": true,
+  "reserveStatus": "closed 2026-08-01",
+  "recoveryReferral": {
+    "openedAt": "2026-08-06",
+    "reason": "Cause-and-origin examination identified a liable third party after payment."
+  }
+}

@@ -17,6 +17,7 @@
   "dependencies": {
     "@ar.io/anchor": "file:./vendor/ar.io-anchor-0.2.0.tgz",
     "@ar.io/anchor-interchange": "file:./vendor/ar.io-anchor-interchange-0.2.0.tgz",
+    "@sanning/proof": "file:./vendor/sanning-proof-0.4.0.tgz",
     "@intx/agent": "workspace:*",
     "@intx/crypto": "workspace:*",
     "@intx/example-agent-common": "workspace:*",

@@ -9,6 +9,37 @@ so the trail is verifiable by someone who trusts **neither this
 machine nor its operator**. A git history can be rewritten by whoever
 holds the keys; an anchored checkpoint cannot.
 
+## The job: Meridian Mutual — Recovery
+
+The agent this example hosts is a **real insurance worker**: Meridian
+Mutual's recovery (subrogation) specialist, stage four of the
+claims-demo fire-claim journey (claim `CLM-2026-3105`, paid $45,500).
+Everything about the job lives in [`src/job.ts`](src/job.ts) and
+[`fixtures/`](fixtures/):
+
+1. **`verify_evidence_pack` — the handoff moment.** Before doing any
+   work, the specialist fetches the upstream adjudication's sealed
+   evidence pack (produced by the claims-demo estate on the `sanning.*`
+   wire IDs) and verifies it **programmatically** with the vendored
+   `@sanning/proof` 0.4.0 kernel — signatures, Merkle inclusion,
+   disclosed-content hashes, all offline. No pack, or any verdict other
+   than `verified` → the specialist **refuses to proceed** and says why.
+   The refusal is anchored evidence too.
+2. **The casefile** (deterministic reads over fixtures): the
+   cause-and-origin investigation report (faulty rewiring by the
+   fictional contractor *Hollis & Verne Electrical* caused the fire),
+   the policy's subrogation clause, and the payout record.
+3. **Decide, draft, and be denied.** The specialist decides
+   PURSUE/DECLINE per the clause, drafts the demand letter
+   (`draft_demand_letter`, allowed) — and its attempt to
+   `send_demand_letter` is **denied by the authorize policy**: issuance
+   is reserved for supervising counsel. The denial becomes an anchored
+   `interchange.tool_blocked` record.
+
+The final message pins `DECISION:` / `AMOUNT:` / `TARGET:` /
+`RATIONALE:` lines — the shape the Meridian Workbench reads its outcome
+badges from.
+
 ## What it shows
 
 - **One-line integration.** The store you already pass as `env.audit`
@@ -50,10 +81,21 @@ The same composition also runs as a small resident HTTP service
 (`bun run serve`, port `4610`, override with
 `SANNING_AGENT_SERVICE_PORT`):
 
-- `POST /run` `{prompt?}` — one anchored agent session, exactly the
-  CLI's composition (`src/composition.ts` is shared by both entry
-  points), returning the session id, receipt count and a decision
-  summary.
+- `POST /run` `{caseRef?, packUrl?, prompt?}` — one anchored recovery
+  session, exactly the CLI's composition (`src/composition.ts` is
+  shared by both entry points), returning the session id, receipt count
+  and a decision summary. `packUrl` is the upstream adjudication pack
+  the specialist verifies first; absent → the run is the refusal path.
+- `POST /run?stream=1` — the same run as **SSE**, one JSON frame per
+  event in the Meridian Workbench's vocabulary (`agent_start` → `step`
+  per anchored audit record → `sealing` → `anchored` with
+  txIds/gatewayUrls → `pack` with the decision; `agent_error` on
+  failure), so the claims-demo relay passes frames through near-verbatim.
+- `GET /timeline/:sessionId` — the streamed run's step timeline (held
+  in memory for the service's lifetime).
+- `GET /pack/:sessionId` — that session's own evidence pack (fresh runs
+  from memory; older sessions reassembled from the durable retention
+  trail — the pack outlives the process).
 - `POST /assemble` `{since?, until?, sessionIds?}` — no model, no new
   anchors: reconstructs the inclusion receipts for the requested window
   from the durable retention trail (`anchor/proofs.jsonl` +
@@ -77,6 +119,9 @@ receives an approved evidence request on its mail trigger and calls
   `environment: "dev"`. Uploads go unauthenticated to the default
   `/anchor` front, which may reject them (HTTP 401); the example then
   warns and finishes — the signed git audit trail is intact either way.
+  For a fully local loop, set `SANNING_DEV_UPLOAD_URL` to a mock front
+  (`POST <url>/v1/tx → { id }`) and the whole flow — receipts, packs,
+  the service endpoints — works without spending an anchor.
 - **Set — production via the Sanning control plane.** Uploads go through
   `<SANNING_CONTROL_PLANE_URL>/anchor` (default
   `https://console.sanning.io`) with the key, and the signing identity
@@ -84,7 +129,19 @@ receives an approved evidence request on its mail trigger and calls
 
 Optional, keyed mode only: `SANNING_PRODUCER_ID` (identity on the
 roster, default `interchange-audit-demo`), `SANNING_AGENT_NAME`
-(display name sealed into the evidence), `SANNING_CONTROL_PLANE_URL`.
+(subject name sealed into the evidence — this deployment's history is
+`Meridian-Mutual.Subrogation`, kept for continuity),
+`SANNING_DISPLAY_NAME` (the roster-only display name Fleet shows;
+default `Meridian Mutual — Recovery` — a rename shows up in the console
+immediately and never rewrites what past envelopes were signed saying),
+`SANNING_CONTROL_PLANE_URL`.
+
+> **Two kernels, deliberately.** This agent's OWN anchors are `ario.*`
+> wire IDs (the vendored `@ar.io/anchor` 0.2.0) — its packs verify with
+> the published `npx @ar.io/proof`. The claims-demo packs it VERIFIES
+> are `sanning.*` — those go through the vendored `@sanning/proof`
+> 0.4.0 kernel, imported programmatically in the verify tool (never
+> `npx`: both kernels claim the bin name `proof`).
 
 ### Persisted identity
 
@@ -94,19 +151,24 @@ as the **same** producer. Keyed mode also keeps a separate data-item
 wallet keypair in `<contextDir>/wallet.json`. Deleting the context dir
 (below) mints a fresh identity.
 
-The default prompt asks the agent to check disk usage and delete old
-backups; the policy allows the check and denies the deletion. Output
-ends with:
+The default one-shot prompt is the recovery referral WITHOUT a pack
+URL — the refusal path (the specialist must decline, and the refusal
+is anchored). A full run through service mode with a verified pack
+ends with something like:
 
 ```
-anchored audit trail (2 record(s), one checkpoint write):
-  interchange.tool_call      check_disk_usage     seq 0
-  interchange.tool_blocked   delete_all_backups   seq 1  <- the denial, provable
+anchored audit trail (6 record(s), one checkpoint write):
+  interchange.tool_call      verify_evidence_pack        seq 0
+  interchange.tool_call      read_investigation_report   seq 1
+  interchange.tool_call      read_policy_recovery_clause seq 2
+  interchange.tool_call      read_payout_record          seq 3
+  interchange.tool_call      draft_demand_letter         seq 4
+  interchange.tool_blocked   send_demand_letter          seq 5  <- the denial, provable
 checkpoint: <txId>
   https://console.sanning.io/read/<txId>
 
 portable evidence bundle: <contextDir>/trace-bundle.json
-  (2/2 records disclosed in-body, each bound to its committed hash)
+  (6/6 records disclosed in-body, each bound to its committed hash)
 verify it anywhere — no repo access, no agent, no write SDK:
   npx @ar.io/proof verify <contextDir>/trace-bundle.json
 ```

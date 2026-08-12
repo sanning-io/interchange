@@ -109,6 +109,7 @@
         "@intx/example-agent-common": "workspace:*",
         "@intx/storage-isogit": "workspace:*",
         "@intx/types": "workspace:*",
+        "@sanning/proof": "file:./vendor/sanning-proof-0.4.0.tgz",
         "arktype": "catalog:",
       },
     },
@@ -1194,6 +1195,8 @@
     "@rollup/rollup-win32-x64-gnu": ["@rollup/rollup-win32-x64-gnu@4.60.4", "", { "os": "win32", "cpu": "x64" }, "sha512-DRS4G7mi9lJxqEDezIkKCaUIKCrLUUDCUaCsTPCi/rtqaC6D/jjwslMQyiDU50Ka0JKpeXeRBFBAXwArY52vBw=="],
 
     "@rollup/rollup-win32-x64-msvc": ["@rollup/rollup-win32-x64-msvc@4.60.4", "", { "os": "win32", "cpu": "x64" }, "sha512-QVTUovf40zgTqlFVrKA1uXMVvU2QWEFWfAH8Wdc48IxLvrJMQVMBRjuQyUpzZCDkakImib9eVazbWlC6ksWtJw=="],
+
+    "@sanning/proof": ["@sanning/proof@./vendor/sanning-proof-0.4.0.tgz", { "dependencies": { "@noble/ed25519": "^2.1.0", "canonicalize": "^2.0.0" }, "bin": { "proof": "./dist/cli.js" } }],
 
     "@sec-ant/readable-stream": ["@sec-ant/readable-stream@0.4.1", "", {}, "sha512-831qok9r2t8AlxLko40y2ebgSDhenenCatLVeW/uBtnHPyhHOvG0C7TvfgecV+wHzIm5KUICgzmVpWS+IMEAeg=="],
 
