@@ -44,6 +44,31 @@ tool-capable model, since the demo is two tool calls). `OPENROUTER_API_KEY`
 wins when both are set. Bun also auto-loads a local `.env`, so dropping the
 key in `examples/agent-anchored-audit/.env` works too.
 
+### Service mode
+
+The same composition also runs as a small resident HTTP service
+(`bun run serve`, port `4610`, override with
+`SANNING_AGENT_SERVICE_PORT`):
+
+- `POST /run` `{prompt?}` — one anchored agent session, exactly the
+  CLI's composition (`src/composition.ts` is shared by both entry
+  points), returning the session id, receipt count and a decision
+  summary.
+- `POST /assemble` `{since?, until?, sessionIds?}` — no model, no new
+  anchors: reconstructs the inclusion receipts for the requested window
+  from the durable retention trail (`anchor/proofs.jsonl` +
+  `anchor/logs/`), has the persisted identity sign ONE
+  `ario.evidence/v1` pack (`evidence-pack-<stamp>.json`, raw records
+  disclosed in-body), and returns its path, sha256 and counts. This is
+  the key-holder fulfilling an evidence request **after the fact** —
+  the sessions that produced the evidence are long gone.
+- `GET /health` — liveness, mode, producer, public key.
+
+[`fulfilment/`](fulfilment/README.md) closes the loop: an Interchange
+workflow (customer code — a tool package + workflow definition) that
+receives an approved evidence request on its mail trigger and calls
+`/assemble` to fulfil it.
+
 ### Anchoring modes
 
 `SANNING_API_KEY` switches how the anchors leave the machine:

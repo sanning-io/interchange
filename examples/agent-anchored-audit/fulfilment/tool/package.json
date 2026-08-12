@@ -1,0 +1,10 @@
+{
+  "name": "@intx/sanning-fulfilment",
+  "version": "0.1.0",
+  "description": "Sanning evidence-fulfilment tool: asks the anchored-audit agent service to assemble a signed evidence pack for an approved request window.",
+  "type": "module",
+  "license": "LGPL-2.1-only",
+  "interchange": {
+    "tools": "./sidecar-bundle.js"
+  }
+}

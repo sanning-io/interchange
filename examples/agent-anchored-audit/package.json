@@ -11,7 +11,8 @@
     }
   },
   "scripts": {
-    "start": "bun --conditions=intx-src run src/cli.ts"
+    "start": "bun --conditions=intx-src run src/cli.ts",
+    "serve": "bun --conditions=intx-src run src/serve.ts"
   },
   "dependencies": {
     "@ar.io/anchor": "file:./vendor/ar.io-anchor-0.2.0.tgz",

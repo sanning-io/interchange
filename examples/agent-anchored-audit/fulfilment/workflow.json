@@ -1,0 +1,36 @@
+{
+  "id": "wf_sanning_fulfilment",
+  "triggers": [
+    {
+      "type": "mail",
+      "to": "sanning-fulfilment@acme.localhost"
+    }
+  ],
+  "steps": {
+    "fulfil": {
+      "kind": "step",
+      "id": "fulfil",
+      "agent": {
+        "id": "sanning-fulfilment-agent",
+        "systemPrompt": "You are the evidence-fulfilment step of the Sanning anchored-audit demo. The triggering message body is a JSON object describing an APPROVED evidence request: {\"request_id\", \"period_since\", \"period_until\"}. Do exactly this: (1) call the assemble tool once, passing request_id, period_since and period_until through unchanged; (2) then reply with one short plain-text report stating the request_id, the evidence pack path, its sha256, and the records/disclosed/checkpoints counts from the tool result. Do not invent values. If the tool returns an error, report its error text instead.",
+        "toolFactories": [],
+        "capabilities": [],
+        "inference": {
+          "sources": [
+            {
+              "provider": "openai",
+              "model": "anthropic/claude-haiku-4.5"
+            }
+          ]
+        }
+      },
+      "drainBehavior": "cancel",
+      "input": {
+        "from": "trigger.payload"
+      }
+    }
+  },
+  "stepOrder": [
+    "fulfil"
+  ]
+}
