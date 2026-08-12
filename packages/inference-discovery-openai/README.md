@@ -36,28 +36,17 @@ const plugin = createOpencodeZenPlugin({
 // Hand off to runCapture from @intx/inference-discovery.
 ```
 
-Models: `kimi-k2.6`, `kimi-k2.7-code`, `kimi-k3`, `glm-5.1`,
-`deepseek-v4-pro`, `qwen3.6-plus`, `mimo-v2-omni`.
+Models: `kimi-k2.6`, `kimi-k2.7-code`, `kimi-k3`, `glm-5.2`,
+`deepseek-v4-pro`, `deepseek-v4-flash`, `qwen3.7-plus`, `mimo-v2.5`,
+`gpt-5.4-mini`.
 
 For the per-model, per-capability behaviour observed at capture
 time — including the discrepancies between vendor documentation
 and the actual wire bytes — see
 [`docs/discovery.md`](./docs/discovery.md).
-The matrix entries for this deployment live in `SUPPORT_MATRIX`;
-two vision entries are marked `refused` and `http-error` and so
-produce no fixtures.
-
-### Reasoning trace extraction
-
-OpenCode Zen routes `kimi-k2.6` between two upstream backends that
-emit reasoning content under different field paths. The deployment
-ships a reasoning extractor that probes the known paths and records
-which one held the non-empty value. For non-streaming reasoning
-captures the runner writes the result to `reasoning-trace.json`
-next to the response so a later routing change is detectable from
-the fixtures alone; streaming reasoning captures do not get the
-sidecar (the runner does not parse SSE bodies), and the routing
-signal lives in the captured event stream itself.
+The matrix entries for this deployment live in `SUPPORT_MATRIX`.
+`deepseek-v4-pro` vision-input is `http-error` and produces no
+fixture; other non-vision models simply omit vision rows.
 
 ### Environment
 
@@ -70,7 +59,7 @@ signal lives in the captured event stream itself.
 
 The `openai` deployment probes first-party `api.openai.com` directly,
 under provider name `openai` (distinct from `opencode-zen`, though both
-write fixtures into this package's `wire/` tree). The base URL is fixed
+write sessions into this package's `sessions/` tree). The base URL is fixed
 to `https://api.openai.com/v1`; the deployment reads only `OPENAI_API_KEY`.
 
 ```ts
@@ -80,17 +69,18 @@ const plugin = createOpenAIPlugin({ apiKey: process.env.OPENAI_API_KEY });
 // Hand off to runCapture from @intx/inference-discovery.
 ```
 
-Models: `gpt-5.5`.
+Models: `gpt-5.5`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`.
 
-`gpt-5.5` captures `plain-text`, `function-calling`,
-`function-calling-multi-turn`, `vision-input`, and `structured-output`
-(plus the streaming variants the OpenAI-protocol body builder emits).
-`reasoning-content` is marked `unsupported`: first-party
+Each first-party model captures `plain-text`, `function-calling`,
+`function-calling-multi-turn`, `vision-input`, `document-input`, and
+`structured-output` (plus the streaming variants the OpenAI-protocol body
+builder emits). `reasoning-content` is marked `unsupported`: first-party
 `api.openai.com` Chat Completions responses carry no reasoning field for
 the gpt-5 series (OpenAI surfaces reasoning only via the Responses API,
-which this plug-in does not probe). The `function-calling-multi-turn`
-and `vision-input` streaming variants carry no rows because the body
-builder does not build them — a rig gap, not a provider limitation.
+which this plug-in does not probe). The `function-calling-multi-turn`,
+`vision-input`, and `document-input` streaming variants carry no rows
+because the body builder does not build them — a rig gap, not a provider
+limitation.
 
 ### Environment
 

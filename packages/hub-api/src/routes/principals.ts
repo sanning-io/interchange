@@ -18,7 +18,7 @@ import { first, ts } from "../format";
 import { generateId } from "@intx/hub-common";
 import { idResource } from "../middleware/grant";
 import type { RequireGrant } from "../middleware/grant";
-import { resolveWorkflowPrincipalNames } from "./workflow-principal-name";
+import { resolveWorkflowPrincipalLabels } from "./workflow-principal-name";
 import {
   parsePageParams,
   cursorCondition,
@@ -58,9 +58,6 @@ async function resolveIdentities(
   const userRefIds = principals
     .filter((p) => p.kind === "user")
     .map((p) => p.refId);
-  const agentRefIds = principals
-    .filter((p) => p.kind === "agent")
-    .map((p) => p.refId);
   const workflowRefIds = principals
     .filter((p) => p.kind === "workflow")
     .map((p) => p.refId);
@@ -74,48 +71,10 @@ async function resolveIdentities(
     }
   }
 
-  if (agentRefIds.length > 0) {
-    // First pass: resolve definition principals (refId = agent.id)
-    const agents = await db.query.agent.findMany({
-      where: (a, { inArray }) => inArray(a.id, agentRefIds),
-    });
-    for (const a of agents) {
-      identities.set(a.id, { displayName: a.name });
-    }
-
-    // Second pass: resolve instance principals (refId = agentInstance.id)
-    const unresolvedRefIds = agentRefIds.filter((id) => !identities.has(id));
-    if (unresolvedRefIds.length > 0) {
-      const instances = await db.query.agentInstance.findMany({
-        where: (i, { inArray }) => inArray(i.id, unresolvedRefIds),
-      });
-      const definitionIds = [...new Set(instances.map((i) => i.agentId))];
-      const definitions =
-        definitionIds.length > 0
-          ? await db.query.agent.findMany({
-              where: (a, { inArray }) => inArray(a.id, definitionIds),
-            })
-          : [];
-      const defNames = new Map(definitions.map((d) => [d.id, d.name]));
-      for (const inst of instances) {
-        const name = defNames.get(inst.agentId);
-        if (name) {
-          identities.set(inst.id, { displayName: `${name} (instance)` });
-        }
-      }
-    }
-  }
-
   if (workflowRefIds.length > 0) {
-    // A workflow principal's refId is its run id; the run's deployment address
-    // is the only human-facing label it has, reached by joining the runId
-    // through workflow_run to workflow_deployment.
-    const workflowNames = await resolveWorkflowPrincipalNames(
-      db,
-      workflowRefIds,
-    );
-    for (const [runId, displayName] of workflowNames) {
-      identities.set(runId, { displayName });
+    const wfNames = await resolveWorkflowPrincipalLabels(db, workflowRefIds);
+    for (const [refId, displayName] of wfNames) {
+      identities.set(refId, { displayName });
     }
   }
 

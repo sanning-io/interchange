@@ -18,7 +18,6 @@ import {
   buildRequestBody,
   isSupportedCapability,
 } from "./request-body";
-import { extractReasoningTrace } from "./reasoning";
 import { createAnthropicPlugin, iterateCaptureSteps } from "./index";
 import type {
   AnthropicContentBlock,
@@ -55,7 +54,7 @@ function expectArrayContent(
 }
 
 const TEST_API_KEY = "test-anthropic-key";
-const SONNET = "claude-sonnet-4-5-20250929";
+const HAIKU = "claude-haiku-4-5-20251001";
 // A model that requires Anthropic's adaptive extended-thinking shape instead
 // of the classic thinking:{type:"enabled",budget_tokens}.
 const SONNET5 = "claude-sonnet-5";
@@ -90,8 +89,8 @@ describe("createAnthropicPlugin", () => {
     expect(plugin.name).toBe("anthropic");
     expect(plugin.models).toEqual([
       "claude-sonnet-5",
-      "claude-sonnet-4-5-20250929",
-      "claude-opus-4-1-20250805",
+      "claude-opus-5",
+      "claude-fable-5",
       "claude-haiku-4-5-20251001",
     ]);
     expect(plugin.redactRequestHeaders).toEqual(["x-api-key"]);
@@ -137,12 +136,12 @@ describe("endpoint URL helpers", () => {
 describe("buildRequestBody — wire-shape spot checks", () => {
   test("plain-text produces a single user message with max_tokens, no stream flag", () => {
     const body = buildRequestBody({
-      model: SONNET,
+      model: HAIKU,
       capability: "plain-text",
       intent: INTENTS["plain-text"],
     });
     expect(body).toEqual({
-      model: SONNET,
+      model: HAIKU,
       max_tokens: 512,
       messages: [{ role: "user", content: INTENTS["plain-text"].prompt }],
     });
@@ -150,7 +149,7 @@ describe("buildRequestBody — wire-shape spot checks", () => {
 
   test("plain-text-streaming sets stream: true", () => {
     const body = buildRequestBody({
-      model: SONNET,
+      model: HAIKU,
       capability: "plain-text-streaming",
       intent: INTENTS["plain-text-streaming"],
     });
@@ -159,7 +158,7 @@ describe("buildRequestBody — wire-shape spot checks", () => {
 
   test("function-calling carries the tool decl as input_schema", () => {
     const body = buildRequestBody({
-      model: SONNET,
+      model: HAIKU,
       capability: "function-calling",
       intent: INTENTS["function-calling"],
     });
@@ -176,7 +175,7 @@ describe("buildRequestBody — wire-shape spot checks", () => {
 
   test("function-calling-with-thinking attaches thinking config + raised max_tokens", () => {
     const body = buildRequestBody({
-      model: SONNET,
+      model: HAIKU,
       capability: "function-calling-with-thinking",
       intent: INTENTS["function-calling-with-thinking"],
     });
@@ -187,7 +186,7 @@ describe("buildRequestBody — wire-shape spot checks", () => {
 
   test("reasoning-content enables thinking with budget_tokens=1024", () => {
     const body = buildRequestBody({
-      model: SONNET,
+      model: HAIKU,
       capability: "reasoning-content",
       intent: INTENTS["reasoning-content"],
     });
@@ -195,28 +194,38 @@ describe("buildRequestBody — wire-shape spot checks", () => {
     expect(body.output_config).toBeUndefined();
   });
 
-  test("an adaptive-thinking model uses thinking:adaptive with output_config effort", () => {
-    for (const capability of [
-      "reasoning-content",
-      "function-calling-with-thinking",
-      "redacted-thinking",
+  test("adaptive-thinking models use thinking:adaptive with output_config effort", () => {
+    for (const model of [
+      SONNET5,
+      "claude-opus-5",
+      "claude-fable-5",
+      "claude-opus-4-8",
+      "claude-opus-4-6",
+      "claude-opus-4-7",
+      "claude-sonnet-4-6",
     ] as const) {
-      const body = buildRequestBody({
-        model: SONNET5,
-        capability,
-        intent: INTENTS[capability],
-      });
-      expect(body.thinking).toEqual({ type: "adaptive" });
-      expect(body.output_config).toEqual({ effort: "max" });
-      // The adaptive shape must not smuggle a budget_tokens field, which the
-      // API rejects for these models.
-      expect(body.thinking).not.toHaveProperty("budget_tokens");
+      for (const capability of [
+        "reasoning-content",
+        "function-calling-with-thinking",
+        "redacted-thinking",
+      ] as const) {
+        const body = buildRequestBody({
+          model,
+          capability,
+          intent: INTENTS[capability],
+        });
+        expect(body.thinking).toEqual({ type: "adaptive" });
+        expect(body.output_config).toEqual({ effort: "max" });
+        // The adaptive shape must not smuggle a budget_tokens field, which the
+        // API rejects for these models.
+        expect(body.thinking).not.toHaveProperty("budget_tokens");
+      }
     }
   });
 
   test("vision-input embeds a base64 image source", () => {
     const body = buildRequestBody({
-      model: SONNET,
+      model: HAIKU,
       capability: "vision-input",
       intent: INTENTS["vision-input"],
     });
@@ -235,7 +244,7 @@ describe("buildRequestBody — wire-shape spot checks", () => {
 
   test("document-input embeds a base64 application/pdf source", () => {
     const body = buildRequestBody({
-      model: SONNET,
+      model: HAIKU,
       capability: "document-input",
       intent: INTENTS["document-input"],
     });
@@ -256,7 +265,7 @@ describe("buildRequestBody — wire-shape spot checks", () => {
 
   test("code-execution declares the server-side code_execution tool", () => {
     const body = buildRequestBody({
-      model: SONNET,
+      model: HAIKU,
       capability: "code-execution",
       intent: INTENTS["code-execution"],
     });
@@ -267,7 +276,7 @@ describe("buildRequestBody — wire-shape spot checks", () => {
 
   test("grounding declares the server-side web_search tool", () => {
     const body = buildRequestBody({
-      model: SONNET,
+      model: HAIKU,
       capability: "grounding",
       intent: INTENTS["grounding"],
     });
@@ -284,7 +293,7 @@ describe("buildRequestBody — wire-shape spot checks", () => {
     for (const capability of multipart) {
       expect(() =>
         buildRequestBody({
-          model: SONNET,
+          model: HAIKU,
           capability,
           intent: INTENTS[capability],
         }),
@@ -294,7 +303,7 @@ describe("buildRequestBody — wire-shape spot checks", () => {
 
   test("multi-turn capabilities return the turn-1 body (used by iterateCaptureSteps)", () => {
     const turn1 = buildRequestBody({
-      model: SONNET,
+      model: HAIKU,
       capability: "function-calling-multi-turn",
       intent: INTENTS["function-calling-multi-turn"],
     });
@@ -305,7 +314,7 @@ describe("buildRequestBody — wire-shape spot checks", () => {
 
   test("redacted-thinking returns a turn-1 body with thinking enabled", () => {
     const turn1 = buildRequestBody({
-      model: SONNET,
+      model: HAIKU,
       capability: "redacted-thinking",
       intent: INTENTS["redacted-thinking"],
     });
@@ -327,7 +336,7 @@ describe("buildRequestBody — wire-shape spot checks", () => {
     for (const capability of unsupported) {
       expect(() =>
         buildRequestBody({
-          model: SONNET,
+          model: HAIKU,
           capability,
           intent: INTENTS[capability],
         }),
@@ -340,7 +349,7 @@ describe("buildFunctionCallingTurn2Body", () => {
   test("echoes assistant content verbatim and appends a tool_result user turn", () => {
     const intent = INTENTS["function-calling-multi-turn"];
     const turn1 = buildRequestBody({
-      model: SONNET,
+      model: HAIKU,
       capability: "function-calling-multi-turn",
       intent,
     });
@@ -355,7 +364,7 @@ describe("buildFunctionCallingTurn2Body", () => {
     ];
     const turn1Response = { content: assistantBlocks };
     const turn2 = buildFunctionCallingTurn2Body({
-      model: SONNET,
+      model: HAIKU,
       capability: "function-calling-multi-turn",
       intent,
       turn1Body: turn1,
@@ -382,13 +391,13 @@ describe("buildFunctionCallingTurn2Body", () => {
   test("throws when turn-1 lacks a tool_use block", () => {
     const intent = INTENTS["function-calling-multi-turn"];
     const turn1 = buildRequestBody({
-      model: SONNET,
+      model: HAIKU,
       capability: "function-calling-multi-turn",
       intent,
     });
     expect(() =>
       buildFunctionCallingTurn2Body({
-        model: SONNET,
+        model: HAIKU,
         capability: "function-calling-multi-turn",
         intent,
         turn1Body: turn1,
@@ -431,7 +440,7 @@ describe("buildRedactedThinkingTurn2Body", () => {
   test("echoes redacted_thinking blocks verbatim and appends a user follow-up", () => {
     const intent: CapabilityIntent = INTENTS["redacted-thinking"];
     const turn1: ReturnType<typeof buildFunctionCallingTurn2Body> = {
-      model: SONNET,
+      model: HAIKU,
       max_tokens: 2048,
       messages: [{ role: "user", content: intent.prompt }],
       thinking: { type: "enabled", budget_tokens: 1024 },
@@ -442,7 +451,7 @@ describe("buildRedactedThinkingTurn2Body", () => {
     ];
     const turn1Response = { content: assistantBlocks };
     const turn2 = buildRedactedThinkingTurn2Body({
-      model: SONNET,
+      model: HAIKU,
       intent,
       turn1Body: turn1,
       turn1Response,
@@ -463,7 +472,7 @@ describe("buildRedactedThinkingTurn2Body", () => {
 describe("buildFilesApiGenerateBody", () => {
   test("references the uploaded file by file_id and uses the intent prompt", () => {
     const body = buildFilesApiGenerateBody({
-      model: SONNET,
+      model: HAIKU,
       fileId: "file_abc",
       intent: INTENTS["files-api-reference"],
       stream: false,
@@ -485,7 +494,7 @@ describe("buildFilesApiGenerateBody", () => {
 
   test("sets stream when the streaming variant is requested", () => {
     const body = buildFilesApiGenerateBody({
-      model: SONNET,
+      model: HAIKU,
       fileId: "file_abc",
       intent: INTENTS["files-api-reference-streaming"],
       stream: true,
@@ -495,9 +504,9 @@ describe("buildFilesApiGenerateBody", () => {
 });
 
 describe("iterateCaptureSteps", () => {
-  test("single-step capability yields one JSON step with no subdir", () => {
+  test("single-step capability yields one JSON step", () => {
     const steps = collectSteps({
-      model: SONNET,
+      model: HAIKU,
       capability: "plain-text",
       responses: [],
     });
@@ -505,7 +514,6 @@ describe("iterateCaptureSteps", () => {
     const [only] = steps;
     if (only === undefined) throw new Error("missing step");
     expect(only.kind).toBe("json");
-    expect(only.subdir).toBeNull();
     expect(only.url).toBe("https://api.anthropic.com/v1/messages");
   });
 
@@ -526,13 +534,11 @@ describe("iterateCaptureSteps", () => {
       bytes: null,
     };
     const steps = collectSteps({
-      model: SONNET,
+      model: HAIKU,
       capability: "function-calling-multi-turn",
       responses: [turn1Response],
     });
     expect(steps.length).toBe(2);
-    expect(steps[0]?.subdir).toBe("turn-1");
-    expect(steps[1]?.subdir).toBe("turn-2");
     for (const step of steps) {
       expect(step.kind).toBe("json");
       expect(step.url).toBe("https://api.anthropic.com/v1/messages");
@@ -552,13 +558,11 @@ describe("iterateCaptureSteps", () => {
       bytes: null,
     };
     const steps = collectSteps({
-      model: SONNET,
+      model: HAIKU,
       capability: "redacted-thinking",
       responses: [turn1Response],
     });
     expect(steps.length).toBe(2);
-    expect(steps[0]?.subdir).toBe("turn-1");
-    expect(steps[1]?.subdir).toBe("turn-2");
   });
 
   test("files-api yields a raw upload step then a JSON generate step", () => {
@@ -569,7 +573,7 @@ describe("iterateCaptureSteps", () => {
       bytes: null,
     };
     const steps = collectSteps({
-      model: SONNET,
+      model: HAIKU,
       capability: "files-api-reference",
       responses: [uploadResponse],
     });
@@ -579,7 +583,6 @@ describe("iterateCaptureSteps", () => {
       throw new Error("missing steps");
     }
     expect(upload.kind).toBe("raw");
-    expect(upload.subdir).toBe("upload");
     expect(upload.url).toBe("https://api.anthropic.com/v1/files");
     if (upload.kind !== "raw") throw new Error("unreachable");
     expect(upload.contentType).toMatch(/^multipart\/form-data; boundary=/);
@@ -587,7 +590,6 @@ describe("iterateCaptureSteps", () => {
     expect(upload.body.byteLength).toBeGreaterThan(0);
 
     expect(generate.kind).toBe("json");
-    expect(generate.subdir).toBe("generate");
     expect(generate.url).toBe("https://api.anthropic.com/v1/messages");
   });
 
@@ -616,7 +618,7 @@ describe("iterateCaptureSteps", () => {
       bytes: new TextEncoder().encode(turn1Sse),
     };
     const steps = collectSteps({
-      model: SONNET,
+      model: HAIKU,
       capability: "function-calling-multi-turn-streaming",
       responses: [turn1Response],
     });
@@ -652,7 +654,7 @@ describe("iterateCaptureSteps", () => {
 
   test("code-execution carries the beta header on the per-step headers map", () => {
     const steps = collectSteps({
-      model: SONNET,
+      model: HAIKU,
       capability: "code-execution",
       responses: [],
     });
@@ -663,65 +665,13 @@ describe("iterateCaptureSteps", () => {
 
   test("plain-text does NOT carry any anthropic-beta header", () => {
     const steps = collectSteps({
-      model: SONNET,
+      model: HAIKU,
       capability: "plain-text",
       responses: [],
     });
     const [only] = steps;
     if (only === undefined) throw new Error("missing step");
     expect(only.headers?.["anthropic-beta"]).toBeUndefined();
-  });
-});
-
-describe("extractReasoningTrace", () => {
-  test("returns the first thinking block with field path and signature", () => {
-    const trace = extractReasoningTrace({
-      content: [
-        {
-          type: "thinking",
-          thinking: "Let me reason through this step by step.",
-          signature: "sig-abc",
-        },
-        { type: "text", text: "Result." },
-      ],
-    });
-    expect(trace).toEqual({
-      blockType: "thinking",
-      fieldPath: "content[0].thinking",
-      sample: "Let me reason through this step by step.",
-      signature: "sig-abc",
-    });
-  });
-
-  test("returns the first redacted_thinking block with field path", () => {
-    const trace = extractReasoningTrace({
-      content: [
-        {
-          type: "redacted_thinking",
-          data: "encrypted-bytes-here",
-          signature: "sig-z",
-        },
-      ],
-    });
-    expect(trace).toEqual({
-      blockType: "redacted_thinking",
-      fieldPath: "content[0].data",
-      sample: "encrypted-bytes-here",
-      signature: "sig-z",
-    });
-  });
-
-  test("returns null when no thinking-class block is present", () => {
-    expect(
-      extractReasoningTrace({
-        content: [{ type: "text", text: "no thinking" }],
-      }),
-    ).toBeNull();
-  });
-
-  test("returns null for a non-object input", () => {
-    expect(extractReasoningTrace("not an object")).toBeNull();
-    expect(extractReasoningTrace(null)).toBeNull();
   });
 });
 

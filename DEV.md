@@ -146,6 +146,31 @@ If the database already exists and you just need to apply new migrations:
 bin/db-migrate
 ```
 
+### One-time agent-fold migration (workflow_deployment dissolution)
+
+Migrations 0055–0057 dissolve the `workflow_deployment` projection onto
+first-class `workflow_run` anchor runs and promote `workflow_run.definition_id`
+to `NOT NULL`. Applying them on a populated database required a one-time,
+rows-only fold that projected a `workflow_definition` over every legacy agent
+and native workflow asset before the SQL migrations ran. That fold has run
+everywhere it needed to, and the tooling that performed it has been retired, so
+this is now a historical note: a fresh database applies these migrations with
+nothing to fold (they no-op over an empty `workflow_deployment`), and the
+populated environments are already migrated.
+
+Because that tooling is gone, two migrations fail loud rather than silently
+corrupting data if they ever meet a database that was never folded. Migration
+0055 aborts if any pre-fold deployment still lacks a folded
+`workflow_definition` (its reconstructed anchor run would be definition-less).
+Migration 0068 aborts before dropping the legacy agent tables if `agent_instance`
+still holds rows — that instance routing/mail/turn state was never folded into
+`workflow_run`, and no tool ever converted it, so a bare drop would destroy it.
+If either guard fires, the database predates the completed fold and there is no
+automated path back: reconcile it by hand — create the missing
+`workflow_definition` for the deployment's asset, or retire the remaining agent
+instances — before re-running the migration. On a fresh or already-migrated
+database neither guard fires.
+
 ## Build Pipeline
 
 The Makefile is the canonical entry point for the build verbs. It runs
@@ -159,6 +184,7 @@ make build-admin-ui # admin-ui production bundle (vite build)
 make lint           # Prettier + ESLint + API docs freshness
 make format         # Prettier auto-fix
 make test           # All tests
+make test-e2e       # Admin UI browser end-to-end suite (excluded from all)
 make docs           # Regenerate API documentation
 make clean          # Remove tsbuildinfo, dist directories, env stamp
 ```
@@ -166,6 +192,28 @@ make clean          # Remove tsbuildinfo, dist directories, env stamp
 The pre-commit hook checks out the staged tree into a temporary
 directory and runs `make lint` against it, so only committed content
 is validated.
+
+### End-to-End Suite
+
+`make test-e2e` runs the Playwright browser suite in `tests/admin-ui-e2e`.
+It builds the admin UI bundle (`make build-admin-ui`), brings up a
+hermetic stack headless -- a fresh per-run database, a hub, and a vite
+preview server serving the built admin UI -- and drives a real browser
+through a login against that UI. It is excluded from `make all` and
+`make test`; run it on its own.
+
+Local prerequisites:
+
+- An already-running PostgreSQL. The suite does not use docker.
+- A maintenance/superuser Postgres connection available through the
+  ambient `PG*` libpq environment (`PGHOST`, `PGPORT`, `PGUSER`, ...),
+  so the per-run provisioner can `CREATE DATABASE`. This is the same
+  superuser basis `bin/db-reset` relies on.
+- A one-time browser install: `bunx playwright install chromium`.
+
+The harness sets `ADMIN_UI_HUB_ORIGIN` for the run; the vite preview
+proxy reads it to point the admin UI's `/api` calls at that run's hub.
+You do not set it by hand.
 
 ## Bin Scripts
 

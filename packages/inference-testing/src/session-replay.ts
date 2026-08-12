@@ -2,7 +2,7 @@
 // for every captured exchange, register tool handlers that serve
 // captured dispatch results verbatim, and drive production
 // `runInference` through it. Replay surfaces orchestration-layer
-// regressions that the single-exchange compat-replay layer cannot
+// regressions that a single-exchange parser regression cannot
 // see — multi-turn body construction, conversation history
 // threading, dispatch wiring, terminal sequencing across turns.
 //
@@ -21,11 +21,23 @@ import type {
   ConversationTurn,
   InferenceEvent,
   InferenceSource,
+  ToolDefinition,
 } from "@intx/types/runtime";
+
+import { runInference, type Dependencies } from "@intx/inference";
+import { createDefaultDependencies } from "@intx/inference/providers";
 
 import { UnmatchedFetchError } from "./errors";
 import { setupHarness } from "./harness";
-import { loadSessionManifest, type SessionManifest } from "./session-manifest";
+import {
+  loadCaptureManifest,
+  type CaptureManifest,
+} from "@intx/inference-discovery/catalog";
+import {
+  INVARIANTS,
+  type Invariant,
+  type InvariantViolation,
+} from "./invariants";
 import { isDelayedEnvelope } from "./tool-handler";
 
 /**
@@ -120,11 +132,18 @@ export interface RunTurnOpts {
    * the full replay.
    */
   nextSeq?: () => number;
+  /**
+   * Tool definitions to declare on this turn's request, mirroring what the
+   * recording sent. A capture whose request declared tools reconstructs into a
+   * matching body only if the same tools are declared here; omit for captures
+   * that carried none.
+   */
+  tools?: ToolDefinition[];
 }
 
 export interface ReplayHarness {
   /** The captured session's loaded manifest. */
-  readonly manifest: SessionManifest;
+  readonly manifest: CaptureManifest;
   /** The `InferenceSource` reconstructed from the manifest. */
   readonly source: InferenceSource;
   /**
@@ -152,12 +171,19 @@ export interface ReplayHarness {
   dispose(): void;
 }
 
-export interface CapturedExchange {
+// The request side is a discriminated union: a JSON request carries its
+// parsed body (matched by canonical-JSON equality), a raw request carries only
+// its byte length on the public shape (the bytes match by byte equality — the
+// Files-API upload step, not driven by the runInference replay). The response
+// side is orthogonal and identical across both.
+export type CapturedExchange = {
   index: number;
-  capturedRequest: unknown;
   responseHeaders: Record<string, string>;
   responseKind: "sse" | "json";
-}
+} & (
+  | { requestKind: "json"; capturedRequest: unknown }
+  | { requestKind: "raw"; requestByteLength: number }
+);
 
 export interface CapturedDispatch {
   index: number;
@@ -166,9 +192,34 @@ export interface CapturedDispatch {
   result: unknown;
 }
 
-interface InternalExchange extends CapturedExchange {
-  canonicalRequestText: string;
+type InternalExchange = {
+  index: number;
+  responseHeaders: Record<string, string>;
+  responseKind: "sse" | "json";
   responseBytes: Uint8Array;
+} & (
+  | {
+      requestKind: "json";
+      capturedRequest: unknown;
+      canonicalRequestText: string;
+    }
+  | { requestKind: "raw"; requestBytes: Uint8Array }
+);
+
+// Byte-equality is the match primitive for a raw request body (request.bin);
+// canonical-JSON equality does not apply to opaque bytes. The runInference
+// replay driver never invokes this — it rejects raw exchanges up front — so it
+// exists for a future Files-API-aware driver that replays the upload step.
+export function requestBytesMatch(a: Uint8Array, b: Uint8Array): boolean {
+  return Buffer.from(a).equals(Buffer.from(b));
+}
+
+// The captured request to surface in a mismatch diagnostic: the parsed JSON
+// body for a JSON exchange, or null for a raw one. Raw exchanges never reach
+// the runInference replay driver (rejected at construction), so the raw arm is
+// defensive.
+function reportedRequest(e: InternalExchange): unknown {
+  return e.requestKind === "json" ? e.capturedRequest : null;
 }
 
 interface ToolDispatchQueue {
@@ -295,37 +346,48 @@ async function loadExchanges(sessionDir: string): Promise<InternalExchange[]> {
   for (const { name, index } of parsed) {
     const dir = path.join(exchangesRoot, name);
 
-    // The recording side can write either `request.json` (JSON body)
-    // or `request.bin` (raw bytes) — they're mutually exclusive in a
-    // well-formed capture. Replay today only matches JSON bodies via
-    // canonical comparison; if `request.bin` is present, we cannot
-    // serve this session and the right move is to reject loudly at
-    // load time rather than fail later with an opaque ENOENT.
+    // A well-formed exchange carries exactly one request body: `request.json`
+    // (a JSON body, matched by canonical-JSON equality) or `request.bin` (raw
+    // bytes — e.g. a Files-API upload — matched by byte equality). Both
+    // present or neither present is a malformed capture. A raw request loads
+    // fine here; whether a given replay driver can *drive* it is a separate
+    // constraint the driver enforces (createReplayHarness rejects raw).
     const requestJsonPath = path.join(dir, "request.json");
     const requestBinPath = path.join(dir, "request.bin");
     const jsonRequestExists = await fileExists(requestJsonPath);
     const binRequestExists = await fileExists(requestBinPath);
-    if (binRequestExists && !jsonRequestExists) {
-      throw new Error(
-        `Session replay: exchange ${String(index)} in ${dir} has a raw-body ` +
-          `request (request.bin) but session replay only supports JSON request ` +
-          `bodies. Sessions with raw-body requests cannot be replayed yet.`,
-      );
-    }
     if (binRequestExists && jsonRequestExists) {
       throw new Error(
         `Session replay: exchange ${String(index)} in ${dir} has both ` +
           `request.json and request.bin; the capture is malformed.`,
       );
     }
-    if (!jsonRequestExists) {
+    if (!binRequestExists && !jsonRequestExists) {
       throw new Error(
         `Session replay: exchange ${String(index)} in ${dir} has no ` +
-          `request.json (and no request.bin); the capture is malformed.`,
+          `request.json and no request.bin; the capture is malformed.`,
       );
     }
-    const requestText = await fs.readFile(requestJsonPath, "utf-8");
-    const capturedRequest: unknown = JSON.parse(requestText);
+    let request:
+      | {
+          requestKind: "json";
+          capturedRequest: unknown;
+          canonicalRequestText: string;
+        }
+      | { requestKind: "raw"; requestBytes: Uint8Array };
+    if (jsonRequestExists) {
+      const requestText = await fs.readFile(requestJsonPath, "utf-8");
+      request = {
+        requestKind: "json",
+        capturedRequest: JSON.parse(requestText),
+        canonicalRequestText: canonicaliseJSONText(requestText),
+      };
+    } else {
+      request = {
+        requestKind: "raw",
+        requestBytes: new Uint8Array(await fs.readFile(requestBinPath)),
+      };
+    }
 
     const parsedHeaders = await readJSONObject(
       path.join(dir, "response-headers.json"),
@@ -364,8 +426,7 @@ async function loadExchanges(sessionDir: string): Promise<InternalExchange[]> {
 
     out.push({
       index,
-      capturedRequest,
-      canonicalRequestText: canonicaliseJSONText(requestText),
+      ...request,
       responseBytes,
       responseHeaders: headers,
       responseKind,
@@ -424,7 +485,7 @@ export async function createReplayHarness(
   opts: CreateReplayHarnessOpts,
 ): Promise<ReplayHarness> {
   const { sessionDir } = opts;
-  const manifest = await loadSessionManifest(sessionDir);
+  const manifest = await loadCaptureManifest(sessionDir);
   const exchanges = await loadExchanges(sessionDir);
   const dispatches = await loadDispatches(sessionDir);
 
@@ -434,12 +495,31 @@ export async function createReplayHarness(
     );
   }
 
+  // This harness drives replay through `runInference` (see runTurn). A raw
+  // request body is a Files-API upload step, which is not a `runInference`
+  // call, so this driver cannot faithfully replay it. Reject loudly here — at
+  // the layer that owns the constraint — rather than let runTurn register a
+  // JSON matcher that silently never binds. A Files-API-aware driver is the
+  // layer that would drive such a session.
+  const rawExchange = exchanges.find((e) => e.requestKind === "raw");
+  if (rawExchange !== undefined) {
+    throw new Error(
+      `Session replay: ${sessionDir} contains a raw-byte request (Files-API ` +
+        `upload) at exchange ${String(rawExchange.index)}, which the ` +
+        `runInference replay driver cannot drive; a Files-API-aware driver is ` +
+        `required.`,
+    );
+  }
+
   const source: InferenceSource = {
     id: opts.sourceId ?? `${manifest.source.provider}:${manifest.source.model}`,
     provider: manifest.source.provider,
     baseURL: manifest.source.baseURL,
     apiKey: opts.apiKey ?? "session-replay-stub",
     model: manifest.source.model,
+    ...(manifest.source.quirks !== undefined
+      ? { quirks: manifest.source.quirks }
+      : {}),
   };
 
   const inner = setupHarness();
@@ -516,7 +596,7 @@ export async function createReplayHarness(
       throw new SessionReplayMismatchError({
         kind: "exchanges_over_consumed",
         exchangeIndex,
-        captured: lastExchange.capturedRequest,
+        captured: reportedRequest(lastExchange),
         actual: null,
         diff:
           `runTurn called ${String(turnCount + 1)} times but the capture has only ` +
@@ -528,6 +608,15 @@ export async function createReplayHarness(
     if (exchange === undefined) {
       throw new Error(
         `Session replay: exchange ${String(exchangeIndex)} missing from loaded set (internal bug)`,
+      );
+    }
+    if (exchange.requestKind !== "json") {
+      // Unreachable: createReplayHarness rejects sessions carrying a raw
+      // exchange. Kept so a future change that relaxes that guard fails loudly
+      // here rather than silently registering a JSON matcher that never binds.
+      throw new Error(
+        `Session replay: exchange ${String(exchangeIndex)} is a raw-byte ` +
+          `request; the runInference replay driver only drives JSON exchanges.`,
       );
     }
     // Track which matched request count we had BEFORE the turn so we
@@ -586,7 +675,10 @@ export async function createReplayHarness(
         // result. Pin an abort-only policy so the inert scheduler
         // does not deadlock the wrapper on the retry-delay setTimeout
         // when an unmatched-fetch error surfaces through the harness.
-        inferenceOptions: { retryPolicy: () => ({ kind: "abort" }) },
+        inferenceOptions: {
+          retryPolicy: () => ({ kind: "abort" }),
+          ...(runOpts.tools !== undefined ? { tools: runOpts.tools } : {}),
+        },
       })) {
         events.push(ev);
       }
@@ -714,7 +806,7 @@ export async function createReplayHarness(
       throw new SessionReplayMismatchError({
         kind: "exchanges_under_consumed",
         exchangeIndex: expectedIndex,
-        captured: expected.capturedRequest,
+        captured: reportedRequest(expected),
         actual: null,
         diff:
           `Replay ended after ${String(turnCount)} exchange(s), but the capture has ${String(exchanges.length)}. ` +
@@ -738,12 +830,23 @@ export async function createReplayHarness(
     }
   };
 
-  const capturedExchanges: CapturedExchange[] = exchanges.map((e) => ({
-    index: e.index,
-    capturedRequest: e.capturedRequest,
-    responseHeaders: e.responseHeaders,
-    responseKind: e.responseKind,
-  }));
+  const capturedExchanges: CapturedExchange[] = exchanges.map((e) =>
+    e.requestKind === "json"
+      ? {
+          index: e.index,
+          requestKind: "json",
+          capturedRequest: e.capturedRequest,
+          responseHeaders: e.responseHeaders,
+          responseKind: e.responseKind,
+        }
+      : {
+          index: e.index,
+          requestKind: "raw",
+          requestByteLength: e.requestBytes.length,
+          responseHeaders: e.responseHeaders,
+          responseKind: e.responseKind,
+        },
+  );
 
   return {
     manifest,
@@ -754,4 +857,134 @@ export async function createReplayHarness(
     capturedDispatches: dispatches,
     dispose: () => inner.dispose(),
   };
+}
+
+// Anything-goes parser replay: drive each captured JSON exchange's response
+// through the real adapter with a stub fetch, ignoring the request body and
+// the conversation entirely. This is the loose counterpart to
+// createReplayHarness's strict, body-matched, chained replay — it lets the
+// parser regression exercise every captured response's decoding without
+// threading a multi-turn conversation or dispatches.
+//
+// It shares the session loader (loadExchanges) with strict replay but drives
+// the raw @intx/inference `runInference` directly, NOT the inner harness, so a
+// captured response that terminates on a tool_call collects its events instead
+// of tripping the inner harness's auto-dispatch (which throws for want of a
+// registered handler). Raw-byte (Files-API upload) exchanges are skipped
+// per-exchange rather than rejecting the whole session, so a two-step
+// Files-API session's generate exchange is still exercised.
+//
+// Each replayed exchange also carries the invariant violations found over its
+// decoded event stream, so a caller checking parser output against the wire
+// contract reads events and violations from one uniform result rather than
+// re-running the invariants itself.
+export type ParserReplayResult =
+  | {
+      index: number;
+      kind: "replayed";
+      events: InferenceEvent[];
+      violations: InvariantViolation[];
+    }
+  | { index: number; kind: "skipped"; reason: "raw_request" };
+
+export type ParserReplayOpts = {
+  sessionDir: string;
+  /** Invariants to apply to each replayed exchange. Defaults to INVARIANTS. */
+  invariants?: readonly Invariant[];
+};
+
+export async function replayResponsesForParsing(
+  opts: ParserReplayOpts,
+): Promise<ParserReplayResult[]> {
+  const { sessionDir } = opts;
+  const checks = opts.invariants ?? INVARIANTS;
+  const manifest = await loadCaptureManifest(sessionDir);
+  const exchanges = await loadExchanges(sessionDir);
+  if (exchanges.length === 0) {
+    throw new Error(
+      `Parser replay: ${sessionDir} contains no exchanges; nothing to replay`,
+    );
+  }
+
+  const source: InferenceSource = {
+    id: `${manifest.source.provider}:${manifest.source.model}`,
+    provider: manifest.source.provider,
+    baseURL: manifest.source.baseURL,
+    apiKey: "session-replay-stub",
+    model: manifest.source.model,
+    ...(manifest.source.quirks !== undefined
+      ? { quirks: manifest.source.quirks }
+      : {}),
+  };
+
+  // Build the adapter registry + scheduler once; only `fetch` (which closes
+  // over the per-exchange call counter and captured bytes) varies per turn.
+  const baseDeps = createDefaultDependencies();
+
+  const results: ParserReplayResult[] = [];
+  for (const exchange of exchanges) {
+    if (exchange.requestKind === "raw") {
+      // A Files-API upload step is not a runInference call; there is no
+      // adapter response to parse, so skip it. The sibling generate exchange
+      // is a normal JSON exchange and is still replayed.
+      results.push({
+        index: exchange.index,
+        kind: "skipped",
+        reason: "raw_request",
+      });
+      continue;
+    }
+
+    // Serve the captured response verbatim, including its content-type header,
+    // which the harness branches on to pick the SSE or JSON decode path. An
+    // abort-only retry policy keeps a parse failure surfacing as one
+    // inference.error event rather than a retry that re-opens the fetch; a
+    // single fetch call is therefore expected.
+    let fetchCallCount = 0;
+    const headers = new Headers(exchange.responseHeaders);
+    const deps: Dependencies = {
+      ...baseDeps,
+      fetch: () => {
+        fetchCallCount++;
+        return Promise.resolve(
+          new Response(exchange.responseBytes, { status: 200, headers }),
+        );
+      },
+    };
+
+    let seq = 0;
+    const events: InferenceEvent[] = [];
+    for await (const event of runInference({
+      turns: [
+        { role: "user", content: [{ type: "text", text: "x" }], timestamp: 0 },
+      ],
+      source,
+      nextSeq: () => ++seq,
+      deps,
+      inferenceOptions: { retryPolicy: () => ({ kind: "abort" }) },
+    })) {
+      events.push(event);
+    }
+
+    if (fetchCallCount !== 1) {
+      throw new Error(
+        `Parser replay: exchange ${String(exchange.index)} in ${sessionDir} ` +
+          `opened ${String(fetchCallCount)} fetch call(s); expected exactly one.`,
+      );
+    }
+
+    const violations: InvariantViolation[] = [];
+    for (const invariant of checks) {
+      violations.push(...invariant.check(events));
+    }
+
+    results.push({
+      index: exchange.index,
+      kind: "replayed",
+      events,
+      violations,
+    });
+  }
+
+  return results;
 }

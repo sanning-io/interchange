@@ -50,6 +50,9 @@ interface FixtureSpec {
   entryModuleSource?: string; // emitted at the interchange.tools path
   interchangeDirectorsRelPath?: string | null; // null means omit the field
   directorsModuleSource?: string; // emitted at the interchange.directors path
+  // Inline `interchange.credentials` value, written verbatim into
+  // package.json. `unknown` so malformed-shape cases can be exercised.
+  interchangeCredentials?: unknown;
   extraFiles?: Record<string, string>;
   dependencies?: Record<string, string>;
   optionalDependencies?: Record<string, string>;
@@ -75,7 +78,7 @@ async function packFixture(
     name: spec.name,
     version: spec.version,
   };
-  const interchangeField: Record<string, string> = {};
+  const interchangeField: Record<string, unknown> = {};
   if (spec.interchangeToolsRelPath !== null) {
     interchangeField.tools = spec.interchangeToolsRelPath ?? "./tools.js";
   }
@@ -84,6 +87,9 @@ async function packFixture(
     spec.interchangeDirectorsRelPath !== undefined
   ) {
     interchangeField.directors = spec.interchangeDirectorsRelPath;
+  }
+  if (spec.interchangeCredentials !== undefined) {
+    interchangeField.credentials = spec.interchangeCredentials;
   }
   if (Object.keys(interchangeField).length > 0) {
     pkgJson.interchange = interchangeField;
@@ -228,6 +234,159 @@ describe("createToolLoader", () => {
     expect(loaded[0]?.name).toBe("tools-leaf");
     expect(loaded[0]?.factories).toHaveLength(1);
     expect(loaded[0]?.factories[0]?.id).toBe("@vendor/leaf/main");
+    // A package that declares no credentials surfaces an empty array,
+    // not a missing field -- the reconcile downstream reads it verbatim.
+    expect(loaded[0]?.credentials).toEqual([]);
+  });
+
+  test("materializes package files independently from the cache extraction", async () => {
+    const cache = createTarballCache({
+      rootDir: cacheDir,
+      maxBytes: 10_000_000,
+    });
+    const fixture = await packFixture({
+      name: "copied-tool",
+      version: "1.0.0",
+      entryModuleSource: "original contents",
+    });
+    const loader = createToolLoader({
+      cache,
+      registries: new Map([["npmjs", { url: "https://r.test" }]]),
+      host: { os: "linux", cpu: "x64" },
+      fetchTarball: async () => fixture.bytes,
+      importModule: async () => ({
+        main: makeFakeFactory("@vendor/copied/main"),
+      }),
+    });
+
+    await loader.loadManifest({
+      manifest: {
+        schemaVersion: "1",
+        topLevel: [{ name: "copied-tool", version: "1.0.0" }],
+        entries: [
+          {
+            name: "copied-tool",
+            version: "1.0.0",
+            integrity: fixture.integrity,
+            source: { kind: "registry", registry: "npmjs" },
+          },
+        ],
+      },
+      instanceScratchDir: instanceDir,
+      assetRoot,
+      assetMounts: new Map(),
+    });
+
+    const extraction = await cache.extractTarball(fixture.integrity);
+    try {
+      const cachedFile = path.join(extraction.dir, "tools.js");
+      const materializedFile = path.join(
+        instanceDir,
+        "store",
+        "copied-tool",
+        "1.0.0",
+        "tools.js",
+      );
+      expect(await fs.readFile(materializedFile, "utf8")).toBe(
+        "original contents",
+      );
+
+      await fs.writeFile(materializedFile, "materialized change");
+      expect(await fs.readFile(cachedFile, "utf8")).toBe("original contents");
+    } finally {
+      extraction.release();
+    }
+  });
+
+  test("surfaces interchange.credentials declarations on the loaded package", async () => {
+    const cache = createTarballCache({
+      rootDir: cacheDir,
+      maxBytes: 10_000_000,
+    });
+    const fixture = await packFixture({
+      name: "tools-creds",
+      version: "1.0.0",
+      entryModuleSource: "// stub; importer is faked",
+      interchangeCredentials: [
+        { handle: "openai", scopes: ["chat"] },
+        { handle: "stripe" },
+      ],
+    });
+
+    const fakeFactory = makeFakeFactory("@vendor/creds/main", ["env.thing"]);
+    const loader = createToolLoader({
+      cache,
+      registries: new Map([["npmjs", { url: "https://r.test" }]]),
+      host: { os: "linux", cpu: "x64" },
+      fetchTarball: async () => fixture.bytes,
+      importModule: async () => ({ main: fakeFactory }),
+    });
+
+    const loaded = await loader.loadManifest({
+      manifest: {
+        schemaVersion: "1",
+        topLevel: [{ name: "tools-creds", version: "1.0.0" }],
+        entries: [
+          {
+            name: "tools-creds",
+            version: "1.0.0",
+            integrity: fixture.integrity,
+            source: { kind: "registry", registry: "npmjs" },
+          },
+        ],
+      },
+      instanceScratchDir: instanceDir,
+      assetRoot,
+      assetMounts: new Map(),
+    });
+
+    expect(loaded[0]?.credentials).toEqual([
+      { handle: "openai", scopes: ["chat"] },
+      { handle: "stripe" },
+    ]);
+  });
+
+  test("rejects interchange.credentials with a duplicate handle", async () => {
+    const cache = createTarballCache({
+      rootDir: cacheDir,
+      maxBytes: 10_000_000,
+    });
+    const fixture = await packFixture({
+      name: "tools-dupcred",
+      version: "1.0.0",
+      entryModuleSource: "// stub; importer is faked",
+      interchangeCredentials: [{ handle: "openai" }, { handle: "openai" }],
+    });
+
+    const loader = createToolLoader({
+      cache,
+      registries: new Map([["npmjs", { url: "https://r.test" }]]),
+      host: { os: "linux", cpu: "x64" },
+      fetchTarball: async () => fixture.bytes,
+      importModule: async () => ({
+        main: makeFakeFactory("@vendor/dupcred/main", ["env.thing"]),
+      }),
+    });
+
+    await expect(
+      loader.loadManifest({
+        manifest: {
+          schemaVersion: "1",
+          topLevel: [{ name: "tools-dupcred", version: "1.0.0" }],
+          entries: [
+            {
+              name: "tools-dupcred",
+              version: "1.0.0",
+              integrity: fixture.integrity,
+              source: { kind: "registry", registry: "npmjs" },
+            },
+          ],
+        },
+        instanceScratchDir: instanceDir,
+        assetRoot,
+        assetMounts: new Map(),
+      }),
+    ).rejects.toThrow(/duplicate credential handles/);
   });
 
   test("rejects a non-positive registryFetchTimeoutMs", () => {
@@ -839,7 +998,7 @@ describe("loader error categories", () => {
     // matched integrity, then point the manifest at it. Extraction
     // fails inside `tar.extract` (not at the integrity re-check), so
     // the loader must NOT evict — a sibling agent in the same process
-    // may be hardlinking from the same extraction tree at this moment.
+    // may be copying from the same extraction tree at this moment.
     const cache = createTarballCache({
       rootDir: cacheDir,
       maxBytes: 10_000_000,
@@ -2151,7 +2310,7 @@ describe("entry-path containment", () => {
     extractedHandle.release();
 
     // `aaa-jump` is named to sort before the inner directory so
-    // hardlinkTree's walk hits it before recursing into the inner
+    // copyTree's walk hits it before recursing into the inner
     // tree. Its literal target string `inner/escape` resolves to a
     // path inside the extraction root, so the literal-target check
     // accepts it; only the realpath sees through `escape` to the
@@ -2983,7 +3142,7 @@ export const main = Object.assign(
     } catch (err) {
       caught = err;
     }
-    // The symlink fires `hardlinkTree`'s containment guard at layout
+    // The symlink fires `copyTree`'s containment guard at layout
     // time, before either walker runs. The directors walker's own
     // realpath containment check is the second line of defense and
     // shares the same operator-facing category; the test asserts the

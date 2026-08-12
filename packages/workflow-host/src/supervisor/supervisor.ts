@@ -56,16 +56,22 @@ import {
   dequeueToProcessing as defaultDequeueToProcessing,
   markConsumed as defaultMarkConsumed,
   readOwnedMessageIds,
+  readWorkflowRunLifecycle,
   replayProcessingToInbox as defaultReplayProcessingToInbox,
+  StaleInboxEnqueueError,
   DEFAULT_CONSUMED_RETENTION_MS,
-  type NewlyTerminalRun,
   type Principal,
   type WorkflowRunSupervisorPrincipal,
   type WorkflowRunWorkflowProcessPrincipal,
 } from "@intx/hub-sessions/substrate";
-import { base64Decode, base64Encode, deriveMessageId } from "@intx/types";
-import type { SignalKind } from "@intx/types";
-import { RepoId } from "@intx/types/sidecar";
+import {
+  base64Decode,
+  base64Encode,
+  deriveMessageId,
+  deriveWorkflowRunId,
+  signalName,
+} from "@intx/types";
+import { RepoId, type CredentialDelivery } from "@intx/types/sidecar";
 import type {
   ApprovalSnapshot,
   InferenceSource,
@@ -92,6 +98,7 @@ import {
 import { commitCancelRequested } from "./cancel-signing";
 import { buildChildSpawnEnv } from "./spawn-env";
 import { compactRunEvents } from "./run-event-compaction";
+import { extractConversationText } from "../conversation-text";
 import {
   createDrainTimeoutAccumulator,
   DEFAULT_DRAIN_TIMEOUT_MS,
@@ -132,29 +139,25 @@ import {
 const logger = getLogger(["workflow-host", "supervisor"]);
 
 /**
- * Default watchdog timeout for the supervisor's
- * `synchronouslyDispatchTerminalWrite`. The handler holds the
- * `substrate.write.response` back to the child until the dispatch
- * loop's `markConsumed` settles for the matching terminal event; an
- * unbounded wait would chain into a child / runtime / dispatch loop
- * deadlock if `markConsumed` never armed (bug in the dispatch loop, a
- * torn-down cohort, a stalled inbox primitive). 30s sits between the
- * recycle path's `DEFAULT_KILL_TIMEOUT_MS` (5s, a hard process-level
- * kill cap) and `DEFAULT_DRAIN_TIMEOUT_MS` (60s, the per-deployment
- * drain budget) -- generous enough to absorb a slow legitimate
- * markConsumed, tight enough to surface a real deadlock long before
- * the drainTimeout would otherwise mask it.
- */
-export const DEFAULT_TERMINAL_WRITE_WATCHDOG_MS = 30_000;
-
-/**
  * Default watchdog for `reEmitParkedCorrelations`' wait on the child's
- * `parked-correlations.response`. Shares the terminal-write watchdog's 30s
- * budget: generous enough for a healthy child to enumerate its in-flight runs
- * and load each parked snapshot, tight enough that a wedged-but-alive child
- * does not hang the reconnect caller until some coarser timeout intervenes.
+ * `parked-correlations.response`. 30s is generous enough for a healthy child
+ * to enumerate its in-flight runs and load each parked snapshot, tight
+ * enough that a wedged-but-alive child does not hang the reconnect caller
+ * until some coarser timeout intervenes.
  */
 export const DEFAULT_PARKED_QUERY_WATCHDOG_MS = 30_000;
+
+/**
+ * Backstop for `waitForRunTerminalOrPark`. A dispatch waits here for the child
+ * to park or terminate the run before releasing `markConsumed`; a lost park
+ * wake or a wedged child would otherwise hang the deployment's dispatch loop
+ * forever. Five minutes is far beyond any healthy per-message dispatch (which
+ * settles in well under a second), so this never fires on a legitimately long
+ * run without also being a genuine fault -- and when it does fire it is logged
+ * loudly and fails the dispatch (the mail is left reclaimable, never consumed
+ * on the assumption the run made progress), not silently swallowed.
+ */
+export const TERMINAL_OR_PARK_BACKSTOP_MS = 300_000;
 
 /**
  * Public surface returned by `createWorkflowSupervisor`. Each method
@@ -226,6 +229,14 @@ export interface WorkflowSupervisor {
    * closing pipe. Throws otherwise.
    */
   deliverSources(opts: DeliverSourcesOpts): Promise<void>;
+  /**
+   * Push refreshed credential material to the child's in-memory cell. Mirrors
+   * `deliverSources`: the supervisor is the single producer of
+   * `credentials-updated` control frames, phase-guarded to starting/running so
+   * a frame is never written into a recycling child's closing pipe. A revoked
+   * credential is delivered by omitting its material so the child evicts it.
+   */
+  deliverCredentials(opts: DeliverCredentialsOpts): Promise<void>;
   /**
    * Re-register every correlation the child is currently parked on by
    * querying it for its parked correlations and re-emitting each through
@@ -332,6 +343,15 @@ export type DeliverSourcesOpts = {
   defaultSource: string;
 };
 
+export type DeliverCredentialsOpts = {
+  /**
+   * The refreshed credential material and per-handle descriptors. A revoked
+   * credential is delivered by omitting its material entry, so the child's
+   * wholesale swap evicts it.
+   */
+  delivery: CredentialDelivery;
+};
+
 export type RecycleOpts = {
   reason: string;
   /**
@@ -344,22 +364,6 @@ export type RecycleOpts = {
 };
 
 /**
- * Raised when a `pendingMerges` entry or a
- * `markConsumedCompletionWaiters` waiter is rejected because the
- * cohort it was registered against has been aborted (cohort transition
- * during a recycle, or a supervisor shutdown). Callers awaiting the
- * resolved value receive an instance of this error so the failure mode
- * is recognisable from a generic substrate-merge or markConsumed
- * failure.
- */
-export class MergeAbortedError extends Error {
-  constructor(reason: string) {
-    super(`supervisor cohort aborted before completion: ${reason}`);
-    this.name = "MergeAbortedError";
-  }
-}
-
-/**
  * Construct a per-deployment supervisor. All host-specific
  * dependencies are pulled in via `bindings`; nothing in the
  * supervisor reaches into `process.env` or a singleton.
@@ -369,22 +373,63 @@ export function createWorkflowSupervisor(
 ): WorkflowSupervisor {
   let state: SupervisorState = { phase: "idle" };
   /**
-   * In-flight runIds the supervisor knows about. A runId enters this
-   * set when the supervisor forwards a `trigger.fire` for it on the
-   * control channel; the runId leaves the set when the dispatch
-   * loop's terminal-event watcher fires `markConsumed`. The drain
-   * path arms one accumulator per entry here.
+   * ALL runIds the current child cohort is driving, regardless of
+   * who spawned them: supervisor-dispatched + self-discovered.
+   * Populated at `trigger.fire` time and when the child reports
+   * `resumed.runs`. Removed on terminal event or cohort teardown.
+   *
+   * Used by: `drain()` to arm one drainTimeout accumulator per run.
    */
-  const inFlightRuns = new Set<string>();
-  // D2 attribution (measurement-only): the runId the dispatch loop is
+  const cohortRunIds = new Set<string>();
+  /**
+   * Runs observed terminal in this supervisor process. The terminal control
+   * frame follows the durable event commit, but retaining the observation
+   * closes the short visibility window before the working tree reflects that
+   * commit. Terminal membership is permanent for a deployment: the stable
+   * top-level run is never cleared and fired again.
+   */
+  const terminalRunIds = new Set<string>();
+  /**
+   * Per-run input channel cache. When a long-lived run parks on an input
+   * signal, the child sends `park.notify` with `parkKind: "input"`. The
+   * supervisor stores the `correlationId` here so that subsequent mail
+   * deliveries can fire `signal.deliver` without re-reading the substrate.
+   * Cleared on terminal event or cohort abort.
+   */
+  const runInputChannels = new Map<
+    string,
+    { correlationId: string; parkKind: "input" }
+  >();
+  /**
+   * Waiters for dispatch loops blocked on a `park.notify` for a
+   * specific runId. When `park.notify` arrives, the handler resolves
+   * the waiter so the dispatch loop re-evaluates routing.
+   */
+  const parkNotifyWaiters = new Map<string, () => void>();
+  /**
+   * Monotonic per-run INPUT-park generation. Bumped on every
+   * `park.notify(input)` for a runId. `waitForRunTerminalOrPark` captures a
+   * `sinceGen` before its caller's pre-wait awaits and returns `"parked"` when
+   * the generation later exceeds it, so the wait keys on the park EDGE rather
+   * than `runInputChannels`' LEVEL state: a park that fired during the pre-wait
+   * awaits (before the waiter armed, so `resolveParkNotifyWaiter` no-op'd) is
+   * still observed, and a stale `runInputChannels` entry from a prior run or
+   * incarnation cannot false-positive because it did not bump the generation
+   * past `sinceGen`. Incarnation-scoped: cleared with `parkNotifyWaiters` on
+   * recycle/teardown so a reused runId cannot carry a stale captured generation
+   * across incarnations.
+   */
+  const parkGenerations = new Map<string, number>();
+  // D2 attribution (measurement-only): the messageId the dispatch loop is
   // currently servicing. Set at `dispatch-start`, cleared after
   // `reply-produced`. The dispatch loop is strictly serial (one message
   // in flight at a time -- the sustained interactive case the bench
-  // drives), so a child-proxied WAL `substrate.write.request` (whose
-  // `agent-state/<key>/...` preservePrefix carries no runId) is
-  // unambiguously attributable to this runId. Run-event writes carry the
-  // runId in their `runs/<runId>/events/` prefix and do not need it.
-  let currentDispatchRunId: string | null = null;
+  // drives), so a child-proxied `substrate.write.request` is unambiguously
+  // attributable to this message. Both the WAL leg (whose `agent-state/...`
+  // prefix names no run) and the run-event leg (whose `runs/<runId>/events/`
+  // prefix names only the stable per-deployment run id, not the message)
+  // take their per-message key from here.
+  let currentDispatchMessageId: string | null = null;
   /**
    * Per-run drainTimeout accumulators armed by `drain()`. Held so
    * `shutdown()` can stop every accumulator cleanly before tearing
@@ -412,8 +457,6 @@ export function createWorkflowSupervisor(
       }
     });
   const drainTimeoutMs = bindings.drainTimeoutMs ?? DEFAULT_DRAIN_TIMEOUT_MS;
-  const terminalWriteWatchdogMs =
-    bindings.terminalWriteWatchdogMs ?? DEFAULT_TERMINAL_WRITE_WATCHDOG_MS;
   const parkedQueryWatchdogMs =
     bindings.parkedQueryWatchdogMs ?? DEFAULT_PARKED_QUERY_WATCHDOG_MS;
 
@@ -422,17 +465,17 @@ export function createWorkflowSupervisor(
   // throwing observer is swallowed and logged so a benchmark hook bug
   // cannot wedge the dispatch loop.
   function emitDispatchTiming(
-    runId: string,
+    messageId: string,
     marker: "dispatch-start" | "reply-produced",
     atMs: number,
   ): void {
     const observer = bindings.onDispatchTiming;
     if (observer === undefined) return;
     try {
-      observer({ kind: "roundtrip", runId, marker, atMs });
+      observer({ kind: "roundtrip", messageId, marker, atMs });
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : String(cause);
-      logger.warn`onDispatchTiming observer threw for ${runId} (${marker}): ${message}`;
+      logger.warn`onDispatchTiming observer threw for ${messageId} (${marker}): ${message}`;
     }
   }
 
@@ -445,25 +488,25 @@ export function createWorkflowSupervisor(
   // observability: a throwing observer is swallowed + logged so a
   // benchmark hook bug cannot wedge dispatch, and no clock or directory
   // is sampled when the observer is unwired.
-  function legMarkStart(runId: string, leg: DispatchSubstrateLeg): number {
+  function legMarkStart(messageId: string, leg: DispatchSubstrateLeg): number {
     if (bindings.onDispatchTiming === undefined) return 0;
     const atMs = performance.now();
     try {
       bindings.onDispatchTiming({
         kind: "leg",
-        runId,
+        messageId,
         leg,
         phase: "start",
         atMs,
       });
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : String(cause);
-      logger.warn`onDispatchTiming leg observer threw for ${runId} (${leg} start): ${message}`;
+      logger.warn`onDispatchTiming leg observer threw for ${messageId} (${leg} start): ${message}`;
     }
     return atMs;
   }
 
-  function legMarkEnd(runId: string, leg: DispatchSubstrateLeg): void {
+  function legMarkEnd(messageId: string, leg: DispatchSubstrateLeg): void {
     const observer = bindings.onDispatchTiming;
     if (observer === undefined) return;
     const atMs = performance.now();
@@ -477,12 +520,12 @@ export function createWorkflowSupervisor(
       // surface it on the log and emit the end mark without counters so
       // the timing slope is still recoverable.
       const message = cause instanceof Error ? cause.message : String(cause);
-      logger.warn`structural-counter sample failed for ${runId} (${leg}): ${message}`;
+      logger.warn`structural-counter sample failed for ${messageId} (${leg}): ${message}`;
     }
     try {
       observer({
         kind: "leg",
-        runId,
+        messageId,
         leg,
         phase: "end",
         atMs,
@@ -490,7 +533,7 @@ export function createWorkflowSupervisor(
       });
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : String(cause);
-      logger.warn`onDispatchTiming leg observer threw for ${runId} (${leg} end): ${message}`;
+      logger.warn`onDispatchTiming leg observer threw for ${messageId} (${leg} end): ${message}`;
     }
   }
 
@@ -527,27 +570,26 @@ export function createWorkflowSupervisor(
 
   /**
    * Classify a child-proxied `substrate.write.request` into the D2 leg it
-   * represents, plus the runId the per-message OLS fit groups on.
-   * `runs/<runId>/events/` is the run-event bracket commit (runId from the
-   * prefix); `agent-state/...` is the D1 conversation WAL append (no runId
-   * in the prefix -- attributed to the dispatch loop's current serial
-   * runId). Any other prefix is an unmarked proxied write. Returns `null`
-   * when no observer is wired (so the supervisor samples nothing) or the
-   * prefix is not an attributed leg.
+   * represents, plus the messageId the per-message OLS fit groups on.
+   * `runs/<runId>/events/` is the run-event bracket commit and `agent-state/...`
+   * is the D1 conversation WAL append; neither prefix carries the message
+   * identity (the run-event prefix names only the stable per-deployment run
+   * id), so both are attributed to the dispatch loop's current serial
+   * message. Any other prefix is an unmarked proxied write. Returns `null`
+   * when no observer is wired (so the supervisor samples nothing), when the
+   * prefix is not an attributed leg, or when no message is in flight to
+   * attribute it to.
    */
   function classifyProxiedWriteLeg(
     preservePrefix: string,
-  ): { leg: DispatchSubstrateLeg; runId: string } | null {
+  ): { leg: DispatchSubstrateLeg; messageId: string } | null {
     if (bindings.onDispatchTiming === undefined) return null;
-    const runEventMatch = /^runs\/([^/]+)\/events\/$/.exec(preservePrefix);
-    if (runEventMatch !== null) {
-      const runId = runEventMatch[1];
-      if (runId !== undefined) return { leg: "runevent", runId };
+    if (currentDispatchMessageId === null) return null;
+    if (/^runs\/[^/]+\/events\/$/.test(preservePrefix)) {
+      return { leg: "runevent", messageId: currentDispatchMessageId };
     }
     if (preservePrefix.startsWith("agent-state/")) {
-      if (currentDispatchRunId !== null) {
-        return { leg: "wal", runId: currentDispatchRunId };
-      }
+      return { leg: "wal", messageId: currentDispatchMessageId };
     }
     return null;
   }
@@ -630,7 +672,13 @@ export function createWorkflowSupervisor(
     void shutdownInternal({ reason });
   }
 
-  function onMailMessage(rawMessage: Uint8Array): void {
+  // Resolves once the inbound mail is durably accepted (its inbox write landed
+  // or the message was already durably present); rejects when it was not (a
+  // phase where the deployment is not accepting mail, a transient enqueue
+  // failure, or a stale refusal). The host propagates that settlement to the
+  // wire, so resolution is the durable-receipt ACK signal and rejection is the
+  // WITHHOLD signal -- a withheld message is redelivered by the hub.
+  async function onMailMessage(rawMessage: Uint8Array): Promise<void> {
     // Every inbound mail flows through the FIFO inbox claim-check
     // queue, regardless of the supervisor's current phase. The
     // dispatch loop (started by `spawn()` and restarted by the
@@ -645,15 +693,31 @@ export function createWorkflowSupervisor(
       state.phase === "stopping" ||
       state.phase === "stopped"
     ) {
-      // The host's higher-level lifecycle is already tearing the
-      // deployment down; the message drops on the floor rather than
-      // landing in an inbox no live dispatch loop will service.
-      return;
+      // The host's higher-level lifecycle is already tearing the deployment
+      // down; nothing is enqueued. Reject rather than silently drop so the
+      // ack is WITHHELD and the hub redelivers -- a later generation (or a
+      // recycle-installed dispatch loop) may accept it, and a permanently
+      // torn-down address exhausts the hub's bounded retry budget instead of
+      // losing a message a transiently-idle deployment would have taken.
+      throw new Error(
+        `inbound mail not accepted: supervisor phase is "${state.phase}"`,
+      );
     }
-    void enqueueInboundMail(rawMessage).catch((cause) => {
-      const message = cause instanceof Error ? cause.message : String(cause);
-      logger.error`enqueueInbox failed: ${message}`;
-    });
+    try {
+      await enqueueInboundMail(rawMessage);
+    } catch (cause) {
+      // Both branches WITHHOLD (rethrow); the split only sets log severity so
+      // a stale refusal surfaces as its own loud signal rather than blending
+      // into ordinary enqueue-failure noise. The ack/withhold decision is the
+      // rethrow itself, never this classification.
+      if (cause instanceof StaleInboxEnqueueError) {
+        logger.error`inbound mail refused as stale, withholding ack (hub will redeliver): ${cause.message}`;
+      } else {
+        const message = cause instanceof Error ? cause.message : String(cause);
+        logger.error`enqueueInbox failed, withholding ack (hub will redeliver): ${message}`;
+      }
+      throw cause;
+    }
   }
 
   async function enqueueInboundMail(rawMessage: Uint8Array): Promise<void> {
@@ -672,11 +736,11 @@ export function createWorkflowSupervisor(
     const rawMessageBase64 = base64Encode(rawMessage);
     // D2 leg: `enqueueInbox` runs in `onMailMessage` BEFORE dispatch, so
     // it is paid OUTSIDE the dispatch-start..reply-produced window -- its
-    // growth is invisible to the 4.7 bracket. The leg mark, keyed by the
-    // same messageId the dispatch loop later uses as the runId, makes the
-    // out-of-window cost visible and joinable to the in-window legs.
+    // growth is invisible to the 4.7 bracket. This leg mark is keyed by the
+    // messageId, the same per-message key every in-window leg uses, so the
+    // D2 per-message OLS fit groups the enqueue leg with the rest.
     legMarkStart(messageId, "enqueue");
-    await inboxPrimitives.enqueueInbox(
+    const outcome = await inboxPrimitives.enqueueInbox(
       bindings.repoStore,
       inboxWritePrincipal,
       bindings.workflowRunRepoId,
@@ -689,7 +753,19 @@ export function createWorkflowSupervisor(
       },
     );
     legMarkEnd(messageId, "enqueue");
-    wakeDispatch();
+    // Only a fresh enqueue added a new inbox entry; wake the dispatch loop for
+    // it alone. An `already-present` outcome landed nothing new -- returning
+    // (which acks) without waking is correct, since the earlier delivery of
+    // the same messageId already drives dispatch. This resolves for both
+    // outcomes: both mean the bytes are durably accounted for, so both ack.
+    if (outcome.outcome === "enqueued") {
+      wakeDispatch();
+    } else {
+      // A redelivery of a message already durably present: the ack still
+      // fires (it is on disk), but no new run is dispatched. Surface it so an
+      // at-least-once redelivery being made effectively-once is observable.
+      logger.info`inbound mail ${messageId} already durably present (${outcome.reason}); acknowledging without re-dispatch`;
+    }
   }
 
   /**
@@ -767,31 +843,82 @@ export function createWorkflowSupervisor(
         // to-one with its cohort's `controlIncoming` iterator: a
         // buffered `terminal.event` the OLD child emitted before kill
         // landed must NEVER route to the NEW cohort's broadcaster.
-        // Without this binding, a stale OLD-cohort frame for a runId
-        // the NEW cohort happens to be dispatching under the same id
-        // (the normal recycle/replay case) would falsely settle the
-        // NEW cohort's `waitForRunTerminal` and commit `markConsumed`
+        // Every run shares the stable runId (the deployment mail
+        // address), so an OLD-cohort frame and a NEW-cohort run collide
+        // on that id by construction (the recycle/replay case); without
+        // this binding the stale frame would falsely settle the NEW
+        // cohort's `waitForRunTerminalOrPark` and commit `markConsumed`
         // on a run still in flight. The broadcaster's own `dispose()`
         // on cohort teardown turns post-dispose notify into a no-op,
         // so a stale frame dequeued after the cohort was torn down
         // drops cleanly without leaking into any successor cohort.
         const event = terminalEventFromPayload(payload.data);
         cohortBroadcaster.notify(payload.data.runId, event);
+        terminalRunIds.add(payload.data.runId);
+        // Clean up cohort tracking for the terminated run. Self-discovered
+        // runs have no dispatch-loop entry, so their cleanup happens here.
+        cohortRunIds.delete(payload.data.runId);
+        runInputChannels.delete(payload.data.runId);
         continue;
       }
       if (payload.type === "park.notify") {
         // The workflow-process child reported a control-plane suspension: an
         // agent step parked on a reserved `signalName(correlationId)` channel.
-        // Register it the same way the reconnect re-emit driver does, through
-        // the shared `registerSuspension` transform.
-        registerSuspension({
-          runId: payload.data.runId,
-          correlationId: payload.data.correlationId,
-          kind: payload.data.kind,
-          ...(payload.data.snapshot !== undefined
-            ? { snapshot: payload.data.snapshot }
-            : {}),
-        });
+        if (payload.data.parkKind === "input") {
+          // Input parks are owned by the supervisor, not the hub. Register
+          // cohort membership BEFORE caching the correlationId so a run is
+          // never a channel-without-cohort entry (the routing-hygiene
+          // invariant); a live run that parked is always in cohortRunIds
+          // already, so this is idempotent belt-and-suspenders. Cache the
+          // correlationId so the dispatch loop can fire signal.deliver on
+          // subsequent mail without a substrate round-trip.
+          cohortRunIds.add(payload.data.runId);
+          runInputChannels.set(payload.data.runId, {
+            correlationId: payload.data.correlationId,
+            parkKind: "input",
+          });
+          // Stop any drain accumulator for a run that has parked. Input parks
+          // own this because a drain arms no accumulator for a run that already
+          // holds an input channel; an approval park never carries one, so its
+          // drain interaction is a separate concern and stays out of this arm.
+          const accumulator = drainAccumulators.get(payload.data.runId);
+          if (accumulator !== undefined) {
+            accumulator.stop();
+            drainAccumulators.delete(payload.data.runId);
+          }
+        } else if (payload.data.parkKind === "approval") {
+          // Approval parks are hub-registered through the shared
+          // `registerSuspension` transform.
+          registerSuspension({
+            runId: payload.data.runId,
+            correlationId: payload.data.correlationId,
+            parkKind: "approval",
+            ...(payload.data.snapshot !== undefined
+              ? { snapshot: payload.data.snapshot }
+              : {}),
+          });
+        } else {
+          // A `signal-relay` park is relayed down into the body child by the
+          // section runtime and is never hub-registered, so it does not ride
+          // `park.notify`. One arriving here is a protocol violation; log and
+          // drop rather than mis-registering it as an approval.
+          logger.error`park.notify for run ${payload.data.runId} carried parkKind=${payload.data.parkKind}, which is not a hub-registered kind; dropping`;
+        }
+        // A park of ANY kind suspends the run, so a dispatch loop waiting on
+        // `waitForRunTerminalOrPark` after firing the trigger (or delivering
+        // the last signal) must be released here regardless of park kind. An
+        // approval park that only registered its suspension would leave that
+        // loop hanging to the terminal-or-park backstop. Bump the park
+        // generation BEFORE resolving the waiter: a dispatch loop that captured
+        // `sinceGen` for this run must see the newer generation both when its
+        // armed waiter fires here and when it re-reads the generation after
+        // arming (the check-after-register).
+        parkGenerations.set(
+          payload.data.runId,
+          (parkGenerations.get(payload.data.runId) ?? 0) + 1,
+        );
+        // Wake any dispatch loop waiting for this run to park.
+        resolveParkNotifyWaiter(payload.data.runId);
         continue;
       }
       if (payload.type === "parked-correlations.response") {
@@ -800,6 +927,15 @@ export function createWorkflowSupervisor(
         // timed out and dropped it) is logged and dropped, never thrown, so it
         // cannot tear the pump down.
         resolveParkedResponse(payload.data);
+        continue;
+      }
+      if (payload.type === "resumed.runs") {
+        // The child self-discovered runs from the substrate after reconnect
+        // or recycle. Seed cohort tracking so drain accumulators and dispatch
+        // routing account for runs the supervisor did not personally fire.
+        for (const runId of payload.data.runIds) {
+          cohortRunIds.add(runId);
+        }
         continue;
       }
       logger.warn`workflow-process upstream control payload ignored: type=${payload.type}`;
@@ -824,13 +960,13 @@ export function createWorkflowSupervisor(
   const pendingMerges = new Map<string, PendingMerge>();
 
   /**
-   * Reject every pending merge round-trip and every
-   * `markConsumed` completion waiter. Invoked on cohort transitions
-   * (shutdown, recycle's `installNewChild`) so closures awaiting these
-   * promises do not outlive the cohort that armed them. Without this,
-   * a `handleSubstrateWriteRequest` mid-merge or a dispatch-loop
-   * caller awaiting `markConsumed` would sit on a resolver that the
-   * dying control channel will never invoke.
+   * Reject every pending merge round-trip and every park-notify
+   * waiter. Invoked on cohort transitions (shutdown, recycle's
+   * `installNewChild`) so closures awaiting these promises do not
+   * outlive the cohort that armed them. Without this, a
+   * `handleSubstrateWriteRequest` mid-merge or a dispatch loop
+   * waiting for park would sit on a resolver that the dying control
+   * channel will never invoke.
    */
   function rejectCohortAwaiters(reason: string): void {
     for (const [requestId, entry] of pendingMerges) {
@@ -841,11 +977,9 @@ export function createWorkflowSupervisor(
       pendingParkedQueries.delete(requestId);
       entry.settle(null);
     }
-    for (const [runId, waiter] of markConsumedCompletionWaiters.entries()) {
-      markConsumedCompletionWaiters.delete(runId);
-      waiter.reject(
-        new MergeAbortedError(`markConsumed waiter (${runId}): ${reason}`),
-      );
+    for (const [runId, resolve] of parkNotifyWaiters.entries()) {
+      parkNotifyWaiters.delete(runId);
+      resolve();
     }
   }
 
@@ -896,7 +1030,7 @@ export function createWorkflowSupervisor(
   function registerSuspension(park: {
     runId: string;
     correlationId: string;
-    kind: SignalKind;
+    parkKind: "approval";
     snapshot?: ApprovalSnapshot;
   }): void {
     if (bindings.onSuspensionRegister === undefined) {
@@ -907,7 +1041,7 @@ export function createWorkflowSupervisor(
       bindings.onSuspensionRegister({
         runId: park.runId,
         correlationId: park.correlationId,
-        kind: park.kind,
+        kind: park.parkKind,
         deploymentId: bindings.deploymentId,
         agentAddress: bindings.deploymentMailAddress,
         ...(park.snapshot !== undefined
@@ -1009,8 +1143,27 @@ export function createWorkflowSupervisor(
     // answered): nothing to re-emit; the next re-establishment re-drives.
     if (outcome === "timeout" || outcome === null) return;
     for (const parked of outcome) {
-      registerSuspension(parked);
+      if (parked.parkKind === "input") {
+        // Register cohort membership BEFORE the input channel so the run is
+        // never a channel-without-cohort entry: the dispatch loop's routing
+        // hygiene drops exactly such entries, and a live resumed run must not
+        // be mistaken for a dead one and have its channel deleted.
+        cohortRunIds.add(parked.runId);
+        runInputChannels.set(parked.runId, {
+          correlationId: parked.correlationId,
+          parkKind: "input",
+        });
+      } else {
+        registerSuspension({ ...parked, parkKind: "approval" });
+      }
     }
+  }
+
+  function resolveParkNotifyWaiter(runId: string): void {
+    const resolve = parkNotifyWaiters.get(runId);
+    if (resolve === undefined) return;
+    parkNotifyWaiters.delete(runId);
+    resolve();
   }
 
   /**
@@ -1153,7 +1306,7 @@ export function createWorkflowSupervisor(
     // benchmark's per-message OLS fit groups on.
     const legClassification = classifyProxiedWriteLeg(data.preservePrefix);
     if (legClassification !== null) {
-      legMarkStart(legClassification.runId, legClassification.leg);
+      legMarkStart(legClassification.messageId, legClassification.leg);
     }
     try {
       const { commitSha, newlyTerminalRuns } =
@@ -1215,23 +1368,11 @@ export function createWorkflowSupervisor(
         );
       // D2 leg end: the substrate commit (hash objects, write tree,
       // advance ref under the per-repo lock) just resolved. Stamped here,
-      // before the terminal-write markConsumed-coupling wait below, so the
-      // run-event/wal leg measures only its own commit and not the
-      // dispatch loop's markConsumed (which the `markconsumed` leg owns).
+      // before the response, so the run-event/wal leg measures only its own
+      // commit and not the dispatch loop's markConsumed (which the
+      // `markconsumed` leg owns).
       if (legClassification !== null) {
-        legMarkEnd(legClassification.runId, legClassification.leg);
-      }
-      const watchdog =
-        await synchronouslyDispatchTerminalWrite(newlyTerminalRuns);
-      if (!watchdog.ok) {
-        await controlSender.send({
-          type: "substrate.write.response",
-          data: {
-            requestId: data.requestId,
-            result: { ok: false, reason: watchdog.reason },
-          },
-        });
-        return;
+        legMarkEnd(legClassification.messageId, legClassification.leg);
       }
       await controlSender.send({
         type: "substrate.write.response",
@@ -1280,149 +1421,6 @@ export function createWorkflowSupervisor(
     }
   }
 
-  // Per-runId synchronization between the substrate-write handler
-  // and the dispatch loop's `markConsumed`. The handler arms a
-  // waiter when it commits a terminal-event blob and waits for the
-  // dispatch loop to fire `resolveMarkConsumedWaiter(runId)` before
-  // sending the substrate.write.response back to the child.
-  const markConsumedCompletionWaiters = new Map<
-    string,
-    { resolve: () => void; reject: (err: Error) => void }
-  >();
-
-  function resolveMarkConsumedWaiter(runId: string): void {
-    const waiter = markConsumedCompletionWaiters.get(runId);
-    if (waiter === undefined) return;
-    markConsumedCompletionWaiters.delete(runId);
-    waiter.resolve();
-  }
-
-  /**
-   * Hold the substrate.write.response until the dispatch loop's
-   * markConsumed settles for each run the kind handler reports as newly
-   * terminal in this commit. Terminal-ness comes from the handler's typed
-   * `newlyTerminalRuns` signal -- determined authoritatively during
-   * validation -- not re-derived from the committed path shape, so it
-   * survives the run-event layout changing (e.g. compaction folding a
-   * run's per-event files into one combined file). The wait is per-runId
-   * so multiple runs can proceed concurrently if a future dispatch loop
-   * ever processes more than one mail in parallel.
-   *
-   * A watchdog timeout (`terminalWriteWatchdogMs`) caps each wait so a
-   * never-arming markConsumed (a bug in the dispatch loop, a torn-down
-   * cohort, a stalled inbox primitive) does not deadlock the child's
-   * write -- and therefore the runtime body, and therefore the dispatch
-   * loop. On expiry the waiter is force-released and a structured failure
-   * propagates back to the child as
-   * `{ ok: false, reason: "terminal-write watchdog timeout: ..." }`.
-   */
-  async function synchronouslyDispatchTerminalWrite(
-    newlyTerminalRuns: readonly NewlyTerminalRun[],
-  ): Promise<{ ok: true } | { ok: false; reason: string }> {
-    const holds: Promise<{ ok: true } | { ok: false; reason: string }>[] = [];
-    for (const { runId, terminalEventJson } of newlyTerminalRuns) {
-      if (!inFlightRuns.has(runId)) continue;
-      holds.push(holdResponseForMarkConsumed(runId, terminalEventJson));
-    }
-    if (holds.length === 0) return { ok: true };
-    const results = await Promise.all(holds);
-    return results.find((r) => !r.ok) ?? { ok: true };
-  }
-
-  async function holdResponseForMarkConsumed(
-    runId: string,
-    terminalEventJson: string,
-  ): Promise<{ ok: true } | { ok: false; reason: string }> {
-    const completed = new Promise<void>((resolve, reject) => {
-      markConsumedCompletionWaiters.set(runId, { resolve, reject });
-    });
-    const broadcaster = activeTerminalBroadcaster();
-    if (broadcaster !== null) {
-      const synthetic = synthesizeTerminalEvent(terminalEventJson);
-      if (synthetic !== null) {
-        broadcaster.notify(runId, synthetic);
-      }
-    }
-    let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
-    const watchdog = new Promise<{ ok: false; reason: string }>((resolve) => {
-      timeoutHandle = setTimeout(() => {
-        timeoutHandle = null;
-        // Force-release the waiter so the dispatch loop's eventual
-        // resolve does not strand a dangling map entry, then surface
-        // the structured failure to the caller. The reason text is
-        // logged through the package logger so the watchdog is not
-        // silent on the host side.
-        const stillPending =
-          markConsumedCompletionWaiters.get(runId) !== undefined;
-        if (stillPending) {
-          markConsumedCompletionWaiters.delete(runId);
-        }
-        const reason = `terminal-write watchdog timeout: markConsumed for runId=${runId} did not settle within ${String(terminalWriteWatchdogMs)}ms`;
-        logger.error`${reason}`;
-        resolve({ ok: false, reason });
-      }, terminalWriteWatchdogMs);
-    });
-    const result = await Promise.race([
-      completed.then(() => ({ ok: true }) as const),
-      watchdog,
-    ]);
-    if (timeoutHandle !== null) {
-      clearTimeout(timeoutHandle);
-    }
-    return result;
-  }
-
-  function synthesizeTerminalEvent(
-    terminalEventJson: string,
-  ): TerminalRunEvent | null {
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(terminalEventJson);
-    } catch {
-      return null;
-    }
-    if (
-      typeof parsed !== "object" ||
-      parsed === null ||
-      !("type" in parsed) ||
-      !("seq" in parsed)
-    ) {
-      return null;
-    }
-    const body = parsed as {
-      type?: unknown;
-      seq?: unknown;
-      at?: unknown;
-      error?: { message?: unknown };
-    };
-    if (typeof body.seq !== "number") return null;
-    const at = typeof body.at === "string" ? body.at : new Date().toISOString();
-    if (body.type === "RunCompleted") {
-      return { kind: "RunCompleted", seq: body.seq, at };
-    }
-    if (body.type === "RunCancelled") {
-      return { kind: "RunCancelled", seq: body.seq, at };
-    }
-    if (body.type === "RunFailed") {
-      // The wire schema makes `error.message` required when the event
-      // type is `RunFailed`. An event that doesn't carry one is a
-      // contract violation upstream of the supervisor; coercing it to an
-      // empty string would silently hide the producer bug.
-      if (typeof body.error?.message !== "string") {
-        throw new Error(
-          `synthesizeTerminalEvent: RunFailed event missing required error.message`,
-        );
-      }
-      return {
-        kind: "RunFailed",
-        seq: body.seq,
-        at,
-        error: { message: body.error.message },
-      };
-    }
-    return null;
-  }
-
   function activeControlSender(): ControlChannelSender | null {
     if (
       state.phase === "starting" ||
@@ -1430,17 +1428,6 @@ export function createWorkflowSupervisor(
       state.phase === "recycling"
     ) {
       return state.controlSender;
-    }
-    return null;
-  }
-
-  function activeTerminalBroadcaster(): TerminalBroadcaster | null {
-    if (
-      state.phase === "starting" ||
-      state.phase === "running" ||
-      state.phase === "recycling"
-    ) {
-      return state.terminalBroadcaster;
     }
     return null;
   }
@@ -1947,26 +1934,28 @@ export function createWorkflowSupervisor(
 
   /**
    * Forward one dequeued inbox entry to the child as `trigger.fire`
-   * and record its runId as in-flight. The runId is the messageId
-   * the envelope carries (one run per trigger fire per discovery
-   * Q3.1); the same value is what the dispatch loop waits on via
-   * `terminalEventSource`.
+   * and record its runId as in-flight. The runId is the deployment's
+   * mail address (see `deriveWorkflowRunId`), identifying its one top-level
+   * run; the `messageId` rides alongside it so the child can
+   * recover the trigger's mail bytes by claim-check. The runId is the
+   * same value the dispatch loop waits on via `terminalEventSource`.
    */
   async function forwardDispatchedEntry(
     sender: ControlChannelSender,
     messageId: string,
     receivedAt: number,
+    runId: string,
   ): Promise<string> {
     await sender.send({
       type: "trigger.fire",
       data: {
-        runId: messageId,
+        runId,
         messageId,
         receivedAt,
       },
     });
-    inFlightRuns.add(messageId);
-    return messageId;
+    cohortRunIds.add(runId);
+    return runId;
   }
 
   /**
@@ -2008,6 +1997,17 @@ export function createWorkflowSupervisor(
           },
         },
       });
+      // Deliver the deployment's credential material on the same pre-trigger
+      // barrier, so a tool that resolves a credential on the first step already
+      // has it in the child's cell. The material is the decrypted delivery the
+      // hub put on the deploy frame; a later rotation flows through
+      // `deliverCredentials` instead. Absent when the deployment binds none.
+      if (bindings.credentialDelivery !== undefined) {
+        await sender.send({
+          type: "credentials-updated",
+          data: { delivery: bindings.credentialDelivery },
+        });
+      }
       return false;
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : String(cause);
@@ -2026,11 +2026,14 @@ export function createWorkflowSupervisor(
 
   /**
    * One iteration of the dispatch loop: dequeue the FIFO-first inbox
-   * entry, forward it as a `trigger.fire`, wait for the corresponding
-   * run's terminal event (or for the cohort to abort), then
-   * `markConsumed`. Returns `true` if a dispatch landed (caller should
-   * loop immediately) and `false` if the inbox was empty (caller
-   * should await the next wake).
+   * entry, decide whether to `signal.deliver` or `trigger.fire` (or wait
+   * if the run is in-flight but not yet parked), then `markConsumed`
+   * once the child has taken up the message -- for a `trigger.fire` that
+   * means after the run reaches a terminal event or parks, so the
+   * claim-check entry the child still needs to read is not deleted out
+   * from under it. Returns `true` if a dispatch landed (caller should
+   * loop immediately) and `false` if the inbox was empty (caller should
+   * await the next wake).
    */
   async function dispatchOne(
     sender: ControlChannelSender,
@@ -2038,12 +2041,6 @@ export function createWorkflowSupervisor(
     broadcaster: TerminalBroadcaster,
   ): Promise<boolean> {
     if (cohortAbort.signal.aborted) return false;
-    // Subscribe to the terminal broadcaster BEFORE forwarding the
-    // trigger.fire so a terminal event the child notifies between
-    // forward and subscribe cannot be missed. The broadcaster fires
-    // its listeners synchronously inside `notify`; with the subscribe
-    // ordered first the listener buffers the event until the
-    // dispatch loop's `iter.next()` consumes it.
     const beforeDequeueMs = dispatchTimingEnabled() ? performance.now() : 0;
     const dequeued = await inboxPrimitives.dequeueToProcessing(
       bindings.repoStore,
@@ -2053,64 +2050,272 @@ export function createWorkflowSupervisor(
     );
     if (dequeued === null) return false;
     const envelope = dequeued.envelope;
-    const runId = envelope.messageId;
-    currentDispatchRunId = runId;
-    emitDispatchTiming(runId, "dispatch-start", beforeDequeueMs);
+    const runId = deriveWorkflowRunId(bindings.deploymentMailAddress);
+    const messageId = envelope.messageId;
+    let rejection:
+      | {
+          code: string;
+          message: string;
+        }
+      | undefined;
+    const rejectTerminalRun = () => {
+      if (rejection !== undefined) return;
+      rejection = {
+        code: "workflow_run_terminal",
+        message: `Workflow run ${runId} is terminal and cannot be fired again`,
+      };
+      logger.warn`rejecting inbound mail ${messageId}: workflow run ${runId} is terminal`;
+    };
+    currentDispatchMessageId = messageId;
+    emitDispatchTiming(messageId, "dispatch-start", beforeDequeueMs);
     // D2 leg: the claim-check dequeue READ. `dispatch-start` is sampled
     // BEFORE the dequeue (so the roundtrip bracket includes the read);
     // the dequeue leg's own start mark is that same pre-dequeue sample
     // re-stamped under the leg channel, and its end is now (the read just
     // completed). Emitting the start retroactively here -- rather than
-    // before the await -- keeps the leg keyed by the runId, which is only
-    // known after the dequeue resolves.
+    // before the await -- keeps the leg keyed by the messageId, which is
+    // only known after the dequeue resolves.
     if (bindings.onDispatchTiming !== undefined) {
       try {
         bindings.onDispatchTiming({
           kind: "leg",
-          runId,
+          messageId,
           leg: "dequeue",
           phase: "start",
           atMs: beforeDequeueMs,
         });
       } catch (cause) {
         const message = cause instanceof Error ? cause.message : String(cause);
-        logger.warn`onDispatchTiming leg observer threw for ${runId} (dequeue start): ${message}`;
+        logger.warn`onDispatchTiming leg observer threw for ${messageId} (dequeue start): ${message}`;
       }
     }
-    legMarkEnd(runId, "dequeue");
-    const iterable = broadcaster.source(runId);
-    const iter = iterable[Symbol.asyncIterator]();
-    // Per-run grants barrier. When `onRunStart` is wired, push this run's
-    // grants snapshot BEFORE the `trigger.fire` so the child's authorize
-    // closure binds to it rather than throwing on a null snapshot. The push
-    // and the fire share the child's control channel, so a `grants-updated`
-    // awaited here is observed by the child ahead of the trigger. A barrier
-    // failure (the sink throws, or the push fails) fails the run loudly --
-    // a synthesized `RunFailed` fanned out to this run's watcher -- and the
-    // trigger is NOT fired, so no step ever runs against absent grants.
-    const barrierFailed = await pushRunGrants(sender, runId, broadcaster);
-    if (!barrierFailed) {
-      await forwardDispatchedEntry(
-        sender,
-        envelope.messageId,
-        envelope.receivedAt,
-      );
+    legMarkEnd(messageId, "dequeue");
+    // In-memory cohort membership is deliberately not the lifecycle
+    // authority: it is empty for a new run, after a terminal frame, and while
+    // a child is rediscovering a live run after restart. Consult the durable
+    // log before deciding that "no cohort" means "fire". A live log is added
+    // back to cohort tracking so the existing terminal/park wait handles the
+    // recovery window; a terminal log is rejected permanently.
+    if (!cohortRunIds.has(runId)) {
+      const lifecycle = terminalRunIds.has(runId)
+        ? "terminal"
+        : await readWorkflowRunLifecycle(
+            bindings.repoStore,
+            bindings.workflowRunRepoId,
+            runId,
+          );
+      if (lifecycle === "terminal") {
+        rejectTerminalRun();
+      } else if (lifecycle === "live") {
+        cohortRunIds.add(runId);
+      }
     }
-    await waitForRunTerminal(iter, cohortAbort.signal);
-    emitDispatchTiming(runId, "reply-produced", performance.now());
-    inFlightRuns.delete(runId);
+
+    if (rejection === undefined) {
+      // Subscribe to the terminal broadcaster BEFORE the grants barrier so
+      // a synthetic `RunFailed` from a barrier failure can be captured.
+      const preIter = broadcaster.source(runId)[Symbol.asyncIterator]();
+      // Per-run grants barrier. When `onRunStart` is wired, push this run's
+      // grants snapshot BEFORE the trigger/signal so the child's authorize
+      // closure binds to it rather than throwing on a null snapshot. The push
+      // and the fire share the child's control channel, so a `grants-updated`
+      // awaited here is observed by the child ahead of the trigger. A barrier
+      // failure (the sink throws, or the push fails) fails the run loudly --
+      // a synthesized `RunFailed` fanned out to this run's watcher -- and the
+      // trigger is NOT fired, so no step ever runs against absent grants.
+      const barrierFailed = await pushRunGrants(sender, runId, broadcaster);
+      if (barrierFailed) {
+        // Wait for the synthetic RunFailed before consuming the message.
+        await waitForRunTerminal(preIter, cohortAbort.signal);
+        // Clean up for synthetic barrier failure (real terminal events are
+        // cleaned up by pumpUpstreamControl, but synthetic ones are not).
+        cohortRunIds.delete(runId);
+        runInputChannels.delete(runId);
+      } else {
+        // Dispose the pre-created iterator; the normal path creates fresh
+        // iterators inside the dispatch-decision loop when waiting.
+        if (typeof preIter.return === "function") {
+          await preIter.return();
+        }
+        // Unified dispatch: park → signal.deliver; no live run → trigger.fire;
+        // in-flight but undecided → wait for terminal or park, then re-evaluate.
+        while (!cohortAbort.signal.aborted) {
+          if (terminalRunIds.has(runId)) {
+            rejectTerminalRun();
+            break;
+          }
+          // Capture the park generation BEFORE this iteration's pre-wait awaits
+          // so `waitForRunTerminalOrPark` can accept a strictly-newer park that
+          // fires during them (see the latch there). Re-captured each iteration
+          // so a wait that returned "parked" is not re-counted next time around.
+          const sinceGen = parkGenerations.get(runId) ?? 0;
+          // Routing hygiene (defense-in-depth the latch never depends on): a
+          // runInputChannels entry with no live run in this cohort is a stale
+          // routing hazard left by a dead incarnation. Drop it BEFORE the signal
+          // branch so a fresh mail cannot be routed onto a dead run's
+          // correlation. The resumed.runs invariant (cohortRunIds registered
+          // before its input channel) keeps a LIVE resumed run out of this
+          // branch, so this only ever drops genuinely-dead entries.
+          if (!cohortRunIds.has(runId) && runInputChannels.has(runId)) {
+            runInputChannels.delete(runId);
+          }
+          const inputChannel = runInputChannels.get(runId);
+          if (inputChannel !== undefined) {
+            // Resolve the inbound mail to conversation text HERE, the single
+            // site that knows this payload's provenance is mail, applying the
+            // SAME extraction the turn-1 trigger does (resolveTriggerPayload).
+            // The signal.deliver frame's payload is the resume decision in FINAL
+            // form; deliverSignal's structured signals ship their own payload
+            // unchanged. Done BEFORE minting the terminal watcher so a failure
+            // here cannot leak an un-finalized iterator.
+            let inputText: string;
+            try {
+              if (envelope.rawMessage === undefined) {
+                throw new Error("inbound mail carries no rawMessage bytes");
+              }
+              inputText = extractConversationText(
+                base64Decode(envelope.rawMessage),
+                envelope.messageId,
+              );
+            } catch (cause) {
+              // A malformed turn-2 mail cannot resume the parked agent. DROP it:
+              // log loudly and consume it (break to the post-loop markConsumed)
+              // rather than throwing -- a throw aborts the dispatch without
+              // consuming, and replay re-delivers the same poison mail forever.
+              // The run stays parked on its current correlation, ready for the
+              // next valid mail; one bad mail must not tear down a long-lived
+              // conversation.
+              const message =
+                cause instanceof Error ? cause.message : String(cause);
+              logger.error`signal.deliver for run ${runId}: dropping malformed inbound mail ${envelope.messageId}: ${message}`;
+              break;
+            }
+            // Mint the terminal watcher only now, after the payload resolved, so
+            // a terminal the resumed run reaches right after applying the signal
+            // is not missed; the park watcher is armed inside
+            // waitForRunTerminalOrPark.
+            const iter = broadcaster.source(runId)[Symbol.asyncIterator]();
+            let waitEntered = false;
+            try {
+              await sender.send({
+                type: "signal.deliver",
+                data: {
+                  runId,
+                  signalName: signalName(inputChannel.correlationId),
+                  signalId: envelope.messageId,
+                  payload: inputText,
+                },
+              });
+              // Invalidate the cached input channel: its correlation is now
+              // consumed by this delivery, so the NEXT mail must not reuse it.
+              // The resumed run re-parks on a FRESH correlation (a new
+              // park.notify repopulates runInputChannels); a mail arriving before
+              // that re-park waits via the in-flight branch rather than
+              // delivering onto the stale channel. Routing hygiene only -- the
+              // wait keys on the park-generation edge, not this level state.
+              runInputChannels.delete(runId);
+              // Durable-consume contract, mirroring the trigger.fire path: hold
+              // markConsumed until the child has durably taken up the signal --
+              // the resumed run re-parks or reaches a terminal event. That gate
+              // is downstream of durability DESPITE the child's fire-and-forget
+              // SignalReceived writer: the runtime reaches re-park/terminal only
+              // by resuming from the COMMITTED SignalReceived, which its per-run
+              // subscribeKind substrate subscription surfaces only after the
+              // commit lands -- so the substrate subscription IS the ack, and a
+              // failed deliver commit is observed by nothing, never re-parks, and
+              // never releases markConsumed (the mail stays reclaimable). A crash
+              // before the re-park/terminal leaves the claim-check entry in
+              // processing/, so replayProcessingToInbox re-delivers the signal on
+              // restart. On cohort abort the wait returns and the post-loop guard
+              // skips markConsumed.
+              waitEntered = true;
+              await waitForRunTerminalOrPark(
+                iter,
+                cohortAbort.signal,
+                runId,
+                sinceGen,
+              );
+            } finally {
+              // waitForRunTerminalOrPark finalizes the iterator it consumes; the
+              // only leak is when `sender.send` throws before the wait is
+              // entered, so finalize only in that case.
+              if (!waitEntered && typeof iter.return === "function") {
+                await iter.return(undefined).catch(() => {
+                  /* best-effort finalisation of the watcher iterator. */
+                });
+              }
+            }
+            break;
+          }
+          if (!cohortRunIds.has(runId)) {
+            // Subscribe the terminal watcher BEFORE the trigger fires. The
+            // broadcaster drops a notify that has no listener (its subscribe-
+            // before-fire contract), so a terminal that lands while
+            // forwardDispatchedEntry is in flight would be lost and the wait
+            // would hang to the backstop.
+            const iter = broadcaster.source(runId)[Symbol.asyncIterator]();
+            let waitEntered = false;
+            try {
+              await forwardDispatchedEntry(
+                sender,
+                envelope.messageId,
+                envelope.receivedAt,
+                runId,
+              );
+
+              // Wait for the child to process this trigger before allowing
+              // `markConsumed` to move the claim-check entry out of
+              // `processing/`. The child reads the trigger payload from that
+              // entry; racing `markConsumed` would delete the entry before the
+              // child resolves it. On cohort abort the wait returns and the
+              // post-loop guard skips markConsumed.
+              waitEntered = true;
+              await waitForRunTerminalOrPark(
+                iter,
+                cohortAbort.signal,
+                runId,
+                sinceGen,
+              );
+            } finally {
+              // waitForRunTerminalOrPark finalizes the iterator it consumes; the
+              // only leak is when forward throws before the wait is
+              // entered, so finalize only in that case.
+              if (!waitEntered && typeof iter.return === "function") {
+                await iter.return(undefined).catch(() => {
+                  /* best-effort finalisation of the watcher iterator. */
+                });
+              }
+            }
+            break;
+          }
+          const iter = broadcaster.source(runId)[Symbol.asyncIterator]();
+          const outcome = await waitForRunTerminalOrPark(
+            iter,
+            cohortAbort.signal,
+            runId,
+            sinceGen,
+          );
+          if (outcome === "aborted") break;
+          if (outcome === "terminal") {
+            // This message was waiting for an already-live run to expose its
+            // next input correlation. The run terminated first, so the mail
+            // was never delivered and must not fall through to trigger.fire.
+            rejectTerminalRun();
+            break;
+          }
+          // Continue loop: re-evaluate runInputChannels / cohortRunIds
+        }
+      }
+    }
     if (cohortAbort.signal.aborted) {
-      // The cohort tore down before the terminal event arrived (or
-      // alongside it). Skip `markConsumed` so the recycle path's
-      // drain-side replay can reclaim the processing entry.
-      currentDispatchRunId = null;
-      resolveMarkConsumedWaiter(runId);
+      currentDispatchMessageId = null;
       return false;
     }
-    // D2 leg: `markConsumed` is paid AFTER `reply-produced` (stamped
-    // above), so its growth is invisible to the 4.7 round-trip bracket --
-    // the leg mark makes the out-of-window cost visible.
-    legMarkStart(runId, "markconsumed");
+    emitDispatchTiming(messageId, "reply-produced", performance.now());
+    // D2 leg: `markConsumed` is paid AFTER `reply-produced`, so its growth
+    // is invisible to the 4.7 round-trip bracket -- the leg mark makes the
+    // out-of-window cost visible.
+    legMarkStart(messageId, "markconsumed");
     try {
       await inboxPrimitives.markConsumed(
         bindings.repoStore,
@@ -2122,17 +2327,21 @@ export function createWorkflowSupervisor(
           runId,
           consumedAt: Date.now(),
           retentionHorizonMs: consumedRetentionMs,
+          ...(rejection !== undefined ? { rejection } : {}),
         },
       );
     } catch (cause) {
-      const message = cause instanceof Error ? cause.message : String(cause);
-      logger.error`markConsumed failed for run ${runId}: ${message}`;
+      // A markConsumed failure is fatal:
+      // swallowing it treats the dispatch as complete while the mail is NOT
+      // durably recorded consumed, hiding the failure and leaving a mail that
+      // is neither cleanly consumed nor visibly failed. Propagate into the
+      // dispatch fault handler so the failure surfaces and the mail stays
+      // reclaimable.
+      throw new Error(`failed to markConsumed for run ${runId}`, { cause });
     }
-    legMarkEnd(runId, "markconsumed");
-    resolveMarkConsumedWaiter(runId);
-    // §10c forced-repack A/B (measurement-only; no-op when unwired).
+    legMarkEnd(messageId, "markconsumed");
     maybeRepack(runId);
-    currentDispatchRunId = null;
+    currentDispatchMessageId = null;
     return true;
   }
 
@@ -2177,6 +2386,102 @@ export function createWorkflowSupervisor(
   }
 
   /**
+   * Wait until the run's terminal event lands on the cohort
+   * broadcaster's iterator, the child parks the run (bumping the park
+   * generation past `sinceGen`), or the cohort aborts. Returns `"terminal"`
+   * when a terminal event arrived, `"parked"` when the run parked,
+   * and `"aborted"` when the cohort tore down. Throws when the backstop
+   * fires (see `TERMINAL_OR_PARK_BACKSTOP_MS`).
+   *
+   * `sinceGen` is the park generation the CALLER captured before its pre-wait
+   * awaits; the wait accepts only a STRICTLY NEWER park (`generation >
+   * sinceGen`). Keying on that edge -- not `runInputChannels`' level state --
+   * makes the wait's correctness local: a park during the pre-wait awaits is
+   * observed even though its `resolveParkNotifyWaiter` no-op'd, and a stale
+   * channel entry from a prior run or incarnation cannot false-positive.
+   */
+  async function waitForRunTerminalOrPark(
+    iter: AsyncIterator<TerminalRunEvent>,
+    abortSignal: AbortSignal,
+    runId: string,
+    sinceGen: number,
+  ): Promise<"terminal" | "parked" | "aborted"> {
+    let onAbort: (() => void) | null = null;
+    const abortPromise = new Promise<{ source: "abort" }>((resolve) => {
+      if (abortSignal.aborted) {
+        resolve({ source: "abort" });
+        return;
+      }
+      onAbort = () => resolve({ source: "abort" });
+      abortSignal.addEventListener("abort", onAbort, { once: true });
+    });
+
+    let parkResolve: (() => void) | null = null;
+    const parkPromise = new Promise<{ source: "park" }>((resolve) => {
+      parkResolve = () => resolve({ source: "park" });
+      parkNotifyWaiters.set(runId, parkResolve);
+    });
+
+    let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+    const timeoutPromise = new Promise<{ source: "timeout" }>((resolve) => {
+      timeoutHandle = setTimeout(
+        () => resolve({ source: "timeout" }),
+        TERMINAL_OR_PARK_BACKSTOP_MS,
+      );
+    });
+
+    try {
+      if (abortSignal.aborted) return "aborted";
+      // Check-after-register: read the generation now that the waiter above is
+      // armed, SYNCHRONOUSLY (no await between arming and this read, so no
+      // `park.notify` can interleave). A generation past `sinceGen` means the
+      // run already parked -- during the caller's pre-wait awaits, before the
+      // waiter armed, so `resolveParkNotifyWaiter` no-op'd and the armed
+      // parkPromise would never fire -- and this catches it rather than hanging
+      // to the backstop.
+      if ((parkGenerations.get(runId) ?? 0) > sinceGen) return "parked";
+      const result = await Promise.race([
+        iter.next().then((r) => ({ source: "iter" as const, r })),
+        abortPromise,
+        parkPromise,
+        timeoutPromise,
+      ]);
+      if (result.source === "abort") return "aborted";
+      if (result.source === "park") return "parked";
+      if (result.source === "timeout") {
+        // Backstop against a lost wake or a wedged child: the run neither
+        // parked, terminated, nor aborted within a generous window. Surface it
+        // LOUDLY and throw so the dispatch fails -- the caller does not
+        // markConsumed on a throw, so the mail stays reclaimable in
+        // processing/ and is never consumed on the assumption the run
+        // progressed.
+        logger.error`waitForRunTerminalOrPark backstop fired for run ${runId} after ${TERMINAL_OR_PARK_BACKSTOP_MS}ms; failing the dispatch so the mail stays reclaimable`;
+        throw new Error(
+          `waitForRunTerminalOrPark backstop: run ${runId} did not park or terminate within ${TERMINAL_OR_PARK_BACKSTOP_MS}ms`,
+        );
+      }
+      if (result.r.done === true) return "aborted";
+      // A terminal event for this runId arrived; stop waiting.
+      return "terminal";
+    } finally {
+      if (timeoutHandle !== undefined) {
+        clearTimeout(timeoutHandle);
+      }
+      if (parkResolve !== null) {
+        parkNotifyWaiters.delete(runId);
+      }
+      if (onAbort !== null) {
+        abortSignal.removeEventListener("abort", onAbort);
+      }
+      if (typeof iter.return === "function") {
+        await iter.return(undefined).catch(() => {
+          /* swallowed: best-effort finalisation of the watcher iterator. */
+        });
+      }
+    }
+  }
+
+  /**
    * The dispatch loop body. Runs until the cohort aborts; each
    * iteration drains one inbox entry through the FIFO claim-check
    * pipeline. The loop is restarted by `installNewChild` after a
@@ -2202,6 +2507,13 @@ export function createWorkflowSupervisor(
       if (cohortAbort.signal.aborted) return;
     }
     while (!cohortAbort.signal.aborted) {
+      // Capture the wake BEFORE the dispatch iteration (capture-before-check,
+      // same discipline as the park-generation latch). `wakeDispatch` resolves
+      // the CURRENT promise and swaps in a fresh one, so a mail that enqueues
+      // DURING dispatchOne resolves THIS captured promise; capturing it after
+      // dispatchOne would await the fresh, unresolved promise and strand that
+      // mail until some later wake.
+      const wake = dispatchWake.promise;
       let dispatched: boolean;
       try {
         dispatched = await dispatchOne(sender, cohortAbort, broadcaster);
@@ -2216,7 +2528,6 @@ export function createWorkflowSupervisor(
       }
       if (dispatched) continue;
       if (cohortAbort.signal.aborted) return;
-      const wake = dispatchWake.promise;
       const abortPromise = new Promise<void>((resolve) => {
         if (cohortAbort.signal.aborted) {
           resolve();
@@ -2287,13 +2598,17 @@ export function createWorkflowSupervisor(
         }
       }
       drainAccumulators.clear();
+      cohortRunIds.clear();
+      runInputChannels.clear();
+      parkNotifyWaiters.clear();
+      parkGenerations.clear();
       if (
         prior.phase === "starting" ||
         prior.phase === "running" ||
         prior.phase === "recycling"
       ) {
         prior.terminalCohortAbort.abort();
-        // Reject every pending merge round-trip and markConsumed waiter
+        // Reject every pending merge round-trip and park-notify waiter
         // so handler closures awaiting them (including fire-and-forget
         // `handleSubstrateWriteRequest` instances) cannot outlive the
         // dying cohort. Without this, the `await new Promise` inside
@@ -2471,12 +2786,18 @@ export function createWorkflowSupervisor(
     // body's cancellation cascade tears the run down without the
     // supervisor having to thread any per-run wiring beyond what the
     // accumulator already encapsulates.
+    //
+    // Runs that are already parked do not need drain escalation; the
+    // runtime parks the run and the supervisor simply stops delivering
+    // new mail. The cohort abort on shutdown/recycle will eventually
+    // tear the run down.
     const cohortSource = perCohortTerminalSource(
       state.terminalCohortAbort,
       state.terminalBroadcaster,
     );
-    for (const runId of inFlightRuns) {
+    for (const runId of cohortRunIds) {
       if (drainAccumulators.has(runId)) continue;
+      if (runInputChannels.has(runId)) continue;
       const accumulator = accumulatorFactory({
         substrate: bindings.repoStore,
         repoId: bindings.workflowRunRepoId,
@@ -2631,7 +2952,11 @@ export function createWorkflowSupervisor(
               accumulator.stop();
             }
             drainAccumulators.clear();
-            // Reject every pending merge round-trip and markConsumed
+            cohortRunIds.clear();
+            runInputChannels.clear();
+            parkNotifyWaiters.clear();
+            parkGenerations.clear();
+            // Reject every pending merge round-trip and park-notify
             // waiter registered against the dying cohort so handler
             // closures cannot survive the kill/respawn gap. The new
             // child will re-issue substrate writes through fresh
@@ -2815,6 +3140,25 @@ export function createWorkflowSupervisor(
     });
   }
 
+  async function deliverCredentials(
+    opts: DeliverCredentialsOpts,
+  ): Promise<void> {
+    // The supervisor is the single producer of `credentials-updated` control
+    // frames. Phase-guarded exactly like `deliverSources`: outside
+    // starting/running the control sender points at a dying child, so a frame
+    // would buffer behind the SIGTERM or write into a closed pipe. Rejecting
+    // surfaces the race so the caller can retry once the recycle completes.
+    if (state.phase !== "running" && state.phase !== "starting") {
+      throw new Error(
+        `supervisor: deliverCredentials called in phase ${state.phase}; expected starting/running`,
+      );
+    }
+    await state.controlSender.send({
+      type: "credentials-updated",
+      data: { delivery: opts.delivery },
+    });
+  }
+
   function getCredentialsSnapshot(): CredentialsSnapshot | null {
     if (state.phase === "starting" || state.phase === "running") {
       return state.credentialsSnapshot;
@@ -2830,6 +3174,7 @@ export function createWorkflowSupervisor(
     recycle,
     deliverSignal,
     deliverSources,
+    deliverCredentials,
     reEmitParkedCorrelations,
     getCredentialsSnapshot,
   };

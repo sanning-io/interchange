@@ -330,6 +330,223 @@
       "when": 1784685004809,
       "tag": "0046_approval_signal_correlation_run_fk",
       "breakpoints": true
+    },
+    {
+      "idx": 47,
+      "version": "7",
+      "when": 1784837465838,
+      "tag": "0047_create_workflow_definition",
+      "breakpoints": true
+    },
+    {
+      "idx": 48,
+      "version": "7",
+      "when": 1784843439588,
+      "tag": "0048_workflow_definition_origin_agent_id",
+      "breakpoints": true
+    },
+    {
+      "idx": 49,
+      "version": "7",
+      "when": 1784874344480,
+      "tag": "0049_curly_omega_flight",
+      "breakpoints": true
+    },
+    {
+      "idx": 50,
+      "version": "7",
+      "when": 1784900369564,
+      "tag": "0050_late_crystal",
+      "breakpoints": true
+    },
+    {
+      "idx": 51,
+      "version": "7",
+      "when": 1784904262816,
+      "tag": "0051_funny_madelyne_pryor",
+      "breakpoints": true
+    },
+    {
+      "idx": 52,
+      "version": "7",
+      "when": 1784930942498,
+      "tag": "0052_drop_inference_turn_instance_fk",
+      "breakpoints": true
+    },
+    {
+      "idx": 53,
+      "version": "7",
+      "when": 1784937859340,
+      "tag": "0053_session_mail_session_id_index",
+      "breakpoints": true
+    },
+    {
+      "idx": 54,
+      "version": "7",
+      "when": 1784954863099,
+      "tag": "0054_rekey_instance_grants_to_workflow_run",
+      "breakpoints": true
+    },
+    {
+      "idx": 55,
+      "version": "7",
+      "when": 1785022747684,
+      "tag": "0055_backfill_anchor_workflow_runs",
+      "breakpoints": true
+    },
+    {
+      "idx": 56,
+      "version": "7",
+      "when": 1785077765166,
+      "tag": "0056_repoint_deployment_fks_to_anchor_run",
+      "breakpoints": true
+    },
+    {
+      "idx": 57,
+      "version": "7",
+      "when": 1785081029417,
+      "tag": "0057_drop_workflow_deployment_projection",
+      "breakpoints": true
+    },
+    {
+      "idx": 58,
+      "version": "7",
+      "when": 1785085643398,
+      "tag": "0058_repoint_offering_fk_to_definition",
+      "breakpoints": true
+    },
+    {
+      "idx": 59,
+      "version": "7",
+      "when": 1785087256544,
+      "tag": "0059_repoint_transaction_fk_to_run",
+      "breakpoints": true
+    },
+    {
+      "idx": 60,
+      "version": "7",
+      "when": 1785089581427,
+      "tag": "0060_drop_session_mail_instance_fk",
+      "breakpoints": true
+    },
+    {
+      "idx": 61,
+      "version": "7",
+      "when": 1785089702623,
+      "tag": "0061_drop_session_asset_instance_fk",
+      "breakpoints": true
+    },
+    {
+      "idx": 62,
+      "version": "7",
+      "when": 1785165557463,
+      "tag": "0062_drop_agent_asset_table",
+      "breakpoints": true
+    },
+    {
+      "idx": 63,
+      "version": "7",
+      "when": 1785167954461,
+      "tag": "0063_repoint_agent_role_fk_to_definition",
+      "breakpoints": true
+    },
+    {
+      "idx": 64,
+      "version": "7",
+      "when": 1785169484868,
+      "tag": "0064_repoint_agent_session_fk_to_definition",
+      "breakpoints": true
+    },
+    {
+      "idx": 65,
+      "version": "7",
+      "when": 1785179839765,
+      "tag": "0065_add_workflow_definition_model_requirements",
+      "breakpoints": true
+    },
+    {
+      "idx": 66,
+      "version": "7",
+      "when": 1785280000000,
+      "tag": "0066_rekey_agent_definition_principals_to_workflow",
+      "breakpoints": true
+    },
+    {
+      "idx": 67,
+      "version": "7",
+      "when": 1785400000000,
+      "tag": "0067_add_workflow_definition_kind",
+      "breakpoints": true
+    },
+    {
+      "idx": 68,
+      "version": "7",
+      "when": 1785500000000,
+      "tag": "0068_drop_agent_tables_and_origin_agent_id",
+      "breakpoints": true
+    },
+    {
+      "idx": 69,
+      "version": "7",
+      "when": 1785337102704,
+      "tag": "0069_drop_workflow_definition_kind",
+      "breakpoints": true
+    },
+    {
+      "idx": 70,
+      "version": "7",
+      "when": 1785519721882,
+      "tag": "0070_flashy_proteus",
+      "breakpoints": true
+    },
+    {
+      "idx": 72,
+      "version": "7",
+      "when": 1785788422511,
+      "tag": "0072_add_workflow_definition_credential_bindings",
+      "breakpoints": true
+    },
+    {
+      "idx": 73,
+      "version": "7",
+      "when": 1785791424774,
+      "tag": "0073_grant_target_exactly_one_check",
+      "breakpoints": true
+    },
+    {
+      "idx": 74,
+      "version": "7",
+      "when": 1785884353793,
+      "tag": "0074_add_provider_api_base_url",
+      "breakpoints": true
+    },
+    {
+      "idx": 75,
+      "version": "7",
+      "when": 1786055554289,
+      "tag": "0075_workflow_run_launch_spec",
+      "breakpoints": true
+    },
+    {
+      "idx": 76,
+      "version": "7",
+      "when": 1786055582673,
+      "tag": "0076_sidecar_allocation",
+      "breakpoints": true
+    },
+    {
+      "idx": 77,
+      "version": "7",
+      "when": 1786055601046,
+      "tag": "0077_workflow_run_dispatch",
+      "breakpoints": true
+    },
+    {
+      "idx": 78,
+      "version": "7",
+      "when": 1786055642946,
+      "tag": "0078_workflow_run_dispatch_kind",
+      "breakpoints": true
     }
   ]
 }

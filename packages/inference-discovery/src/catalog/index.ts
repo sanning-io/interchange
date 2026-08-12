@@ -9,8 +9,17 @@ export {
 export {
   SUPPORT_MATRIX,
   SupportEntry,
-  getFixtureDir,
+  getSessionDir,
   isFixtureBearing,
 } from "./support-matrix";
 export { catalogCapabilitiesFor } from "./catalog-capabilities";
-export { FixtureManifest } from "./manifest";
+export {
+  adapterForCatalogProvider,
+  baseURLForCatalogProvider,
+} from "./provider-adapter";
+export {
+  CaptureManifest,
+  loadCaptureManifest,
+  writeCaptureManifest,
+} from "./capture-manifest";
+export { CapabilityNotBuildableError } from "./errors";

@@ -71,19 +71,6 @@ export type {
   ReplayContext,
 } from "./invariants";
 
-export { runCompatReplay } from "./compat-replay";
-export type {
-  CompatReplayOpts,
-  CompatReplayResult,
-  CompatReplaySkipReason,
-} from "./compat-replay";
-
-export {
-  SessionManifest,
-  loadSessionManifest,
-  writeSessionManifest,
-} from "./session-manifest";
-
 export {
   createRecordingHarness,
   SessionRecordingBudgetExceededError,
@@ -96,12 +83,25 @@ export type {
 
 export {
   createReplayHarness,
+  replayResponsesForParsing,
   SessionReplayMismatchError,
 } from "./session-replay";
 export type {
   CapturedDispatch,
   CapturedExchange,
   CreateReplayHarnessOpts,
+  ParserReplayOpts,
+  ParserReplayResult,
   ReplayHarness,
   RunTurnOpts,
 } from "./session-replay";
+
+export { classifyReplay, classifySession } from "./classify-replay";
+export type { ReplayOutcome, ReplayClassification } from "./classify-replay";
+
+export { userTurn } from "./turns";
+export {
+  LIVE_WEATHER_TOOL,
+  LIVE_TOOL_DEFINITIONS,
+  LIVE_TOOL_PROMPT,
+} from "./live-tool-scenario";

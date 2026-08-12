@@ -6,12 +6,15 @@ import git from "isomorphic-git";
 import { type, type Type } from "arktype";
 
 import { createInMemoryGrantStore, evaluateGrants } from "@intx/authz";
-import { base64Decode, ErrorResponse } from "@intx/types";
+import { WorkflowRunDispatchPayloadConflictError } from "@intx/db";
+import { base64Decode, ErrorResponse, signalName } from "@intx/types";
+import type { SidecarAllocationStatus } from "@intx/types";
 import type { GrantRule } from "@intx/types/authz";
 import {
   asset as assetTable,
   grant as grantTable,
   principal as principalTable,
+  sidecarAllocation as sidecarAllocationTable,
   workflowRun as workflowRunTable,
 } from "@intx/db/schema";
 import {
@@ -26,6 +29,7 @@ import {
   deriveDeploymentAddress,
   deriveWorkflowRunRepoId,
   walkCapabilities,
+  WorkflowDefinitionInvalidError,
 } from "@intx/workflow-deploy";
 
 import { createApp } from "../app";
@@ -36,9 +40,13 @@ import {
   type DeployWorkflowDefinitionParams,
   type DeployWorkflowDefinitionResult,
   type EventCollectorRegistry,
+  type PrepareExclusiveWorkflowDeploymentArgs,
   type RepoStore,
   type SessionService,
   type SidecarRouter,
+  type WorkflowAllocationService,
+  type WorkflowDispatchService,
+  type WorkflowRunLifecycle,
 } from "@intx/hub-sessions";
 import type { GetSession } from "../session";
 
@@ -106,6 +114,11 @@ const deploymentRow = {
   createdAt: new Date("2025-01-02"),
 };
 
+type DeploymentProjectionRow = typeof deploymentRow & {
+  allocationStatus?: SidecarAllocationStatus | null;
+  allocationNextAttemptAt?: Date | null;
+};
+
 const WORKFLOW_JSON = JSON.stringify({
   id: "wf_demo",
   triggers: [{ type: "manual" }],
@@ -125,6 +138,11 @@ const WORKFLOW_JSON = JSON.stringify({
     },
     wait: { kind: "awaitSignal", id: "wait", name: "go", after: ["plan"] },
   },
+});
+
+const EXCLUSIVE_WORKFLOW_JSON = JSON.stringify({
+  ...JSON.parse(WORKFLOW_JSON),
+  sidecarPlacement: { sharing: "exclusive", reuse: "same-deployment" },
 });
 
 // A workflow whose sole step declares two tools, one approval-gated. The
@@ -259,8 +277,14 @@ type InsertRecord = { table: unknown; values: unknown };
 type MockDBOpts = {
   assetRow?: typeof workflowAssetRow | undefined;
   deploymentRow?: typeof deploymentRow | undefined;
-  deploymentList?: (typeof deploymentRow)[];
+  deploymentList?: DeploymentProjectionRow[];
   inserts?: InsertRecord[];
+  tenantConfig?: unknown;
+  allocationId?: string;
+  allocationStatus?: SidecarAllocationStatus;
+  lockedAllocationStatus?: SidecarAllocationStatus;
+  anchorStatus?: "running" | "completed" | "failed" | "cancelled";
+  topLevelRunStatus?: "running" | "completed" | "failed" | "cancelled" | null;
 };
 
 function createMockDB(opts: MockDBOpts) {
@@ -286,21 +310,135 @@ function createMockDB(opts: MockDBOpts) {
   // already-materialized guard select resolves through `.limit`, returning
   // no rows so the mock always exercises the first-commit insert path (a
   // redelivery no-op is covered against a real database).
-  const select = () => ({
-    from: () => ({
-      where: () => ({
-        orderBy: () => Promise.resolve(list),
-        limit: () => Promise.resolve([]),
-      }),
-    }),
-  });
+  const select = () => {
+    const from = (table: unknown) => {
+      // The anchor-run existence check selects the run alone; the trigger route
+      // and the deploy readback additionally inner-join the definition to read
+      // its asset. Track the join so the join case answers with the anchor's
+      // full assembled shape (id, tenant, definition, asset, created-at) and the
+      // plain case with the bare id, both keyed on the deployment.
+      let joined = false;
+      const selectedRows = (locked: boolean) => {
+        if (table === sidecarAllocationTable) {
+          const status = opts.allocationStatus ?? "allocated";
+          return opts.allocationId === undefined
+            ? []
+            : [
+                {
+                  id: opts.allocationId,
+                  status: locked
+                    ? (opts.lockedAllocationStatus ?? status)
+                    : status,
+                },
+              ];
+        }
+        if (table !== workflowRunTable || opts.deploymentRow === undefined) {
+          if (table === principalTable) {
+            return inserts
+              .filter((record) => record.table === principalTable)
+              .map((record) => record.values);
+          }
+          if (table === grantTable) {
+            return inserts
+              .filter((record) => record.table === grantTable)
+              .map((record) =>
+                typeof record.values === "object" && record.values !== null
+                  ? { ...record.values, roleId: null }
+                  : record.values,
+              );
+          }
+          return [];
+        }
+        return joined
+          ? [
+              {
+                id: opts.deploymentRow.id,
+                tenantId: opts.deploymentRow.tenantId,
+                deploymentId: opts.deploymentRow.id,
+                definitionId: `wfd_${opts.deploymentRow.id}`,
+                definitionAssetId: opts.deploymentRow.definitionAssetId,
+                allocationId: opts.allocationId ?? null,
+                allocationStatus:
+                  opts.allocationId === undefined
+                    ? null
+                    : (opts.allocationStatus ?? "allocated"),
+                anchorStatus: opts.anchorStatus ?? "running",
+                runStatus:
+                  opts.topLevelRunStatus === undefined
+                    ? "running"
+                    : opts.topLevelRunStatus,
+                createdAt: opts.deploymentRow.createdAt,
+              },
+            ]
+          : [
+              {
+                id: opts.deploymentRow.id,
+                allocationId: opts.allocationId ?? null,
+                allocationStatus:
+                  opts.allocationId === undefined
+                    ? null
+                    : (opts.allocationStatus ?? "allocated"),
+                status:
+                  opts.topLevelRunStatus ?? opts.anchorStatus ?? "running",
+              },
+            ];
+      };
+      const chain = {
+        innerJoin: () => {
+          joined = true;
+          return chain;
+        },
+        leftJoin: () => {
+          joined = true;
+          return chain;
+        },
+        where: () => ({
+          orderBy: () =>
+            Promise.resolve(
+              table === grantTable
+                ? selectedRows(false).sort((left, right) => {
+                    const leftId =
+                      typeof left === "object" &&
+                      left !== null &&
+                      "id" in left &&
+                      typeof left.id === "string"
+                        ? left.id
+                        : "";
+                    const rightId =
+                      typeof right === "object" &&
+                      right !== null &&
+                      "id" in right &&
+                      typeof right.id === "string"
+                        ? right.id
+                        : "";
+                    return leftId.localeCompare(rightId);
+                  })
+                : list,
+            ),
+          limit: () =>
+            Object.assign(Promise.resolve(selectedRows(false)), {
+              for: () => Promise.resolve(selectedRows(true)),
+            }),
+        }),
+      };
+      return chain;
+    };
+    return { from };
+  };
   // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- drizzle PgDatabase type cannot be structurally satisfied in tests
   return {
     query: {
-      tenant: { findFirst: async () => testTenant },
+      tenant: {
+        findFirst: async () => ({
+          ...testTenant,
+          config: opts.tenantConfig ?? null,
+        }),
+        findMany: async () => [
+          { id: testTenant.id, config: opts.tenantConfig ?? null },
+        ],
+      },
       principal: { findFirst: async () => testPrincipal },
       asset: { findFirst: async () => opts.assetRow },
-      workflowDeployment: { findFirst: async () => opts.deploymentRow },
     },
     select,
     insert,
@@ -308,9 +446,9 @@ function createMockDB(opts: MockDBOpts) {
       fn: (tx: {
         insert: typeof insert;
         select: typeof select;
-      }) => Promise<void>,
+      }) => Promise<unknown>,
     ) => {
-      await fn({ insert, select });
+      return fn({ insert, select });
     },
   } as unknown as Parameters<typeof createApp>[0]["db"];
 }
@@ -376,6 +514,7 @@ function createMockSidecarRouter(
     sendAgentDeploy: () => notImpl("sendAgentDeploy"),
     sendAgentUndeploy: () => notImpl("sendAgentUndeploy"),
     sendSourcesUpdate: () => notImpl("sendSourcesUpdate"),
+    sendCredentialsUpdate: () => notImpl("sendCredentialsUpdate"),
     sendPack: () => notImpl("sendPack"),
     sendProvisionStep: () => notImpl("sendProvisionStep"),
     bindStepRoute: () => notImpl("bindStepRoute"),
@@ -397,6 +536,7 @@ function createMockSidecarRouter(
 function createMockSessionService(
   deployCalls: DeployWorkflowDefinitionParams[],
   result?: DeployWorkflowDefinitionResult,
+  deployError?: Error,
 ): SessionService {
   function notImpl(name: string): never {
     throw new Error(`mock: sessionService.${name} not implemented`);
@@ -407,13 +547,108 @@ function createMockSessionService(
     deployWorkflowDefinition: (params) => {
       deployCalls.push(params);
       if (result === undefined) {
-        throw new Error("deploy failed");
+        throw deployError ?? new Error("deploy failed");
       }
       return Promise.resolve(result);
     },
     deploySingleStepAtHead: () => notImpl("deploySingleStepAtHead"),
     sendUserMessage: () => notImpl("sendUserMessage"),
     endSession: () => notImpl("endSession"),
+  };
+}
+
+function createMockWorkflowAllocationService(
+  prepareCalls: PrepareExclusiveWorkflowDeploymentArgs[],
+  prepareError?: Error,
+): WorkflowAllocationService {
+  return {
+    prepareExclusiveDeployment: (args) => {
+      prepareCalls.push(args);
+      if (prepareError !== undefined) throw prepareError;
+      return Promise.resolve({
+        deploymentId: DEPLOYMENT_ID,
+        deploymentAddress: `ins_${DEPLOYMENT_ID}@${DOMAIN}`,
+        allocationId: "sal_test",
+        status: "pending",
+      });
+    },
+    deployReadyAllocation: () => {
+      throw new Error("mock: deployReadyAllocation not implemented");
+    },
+  };
+}
+
+type WorkflowDispatchEnqueue = Parameters<
+  WorkflowDispatchService["enqueue"]
+>[0];
+type WorkflowSignalDispatchEnqueue = Parameters<
+  WorkflowDispatchService["enqueueSignal"]
+>[0];
+
+function createMockWorkflowDispatchService(
+  enqueues: WorkflowDispatchEnqueue[],
+  signalEnqueues: WorkflowSignalDispatchEnqueue[],
+  signalEnqueueError?: Error,
+): WorkflowDispatchService {
+  function notImpl(name: string): never {
+    throw new Error(`mock: workflowDispatchService.${name} not implemented`);
+  }
+  return {
+    async enqueue(args) {
+      enqueues.push(args);
+      return {
+        created: true,
+        dispatch: {
+          ...args,
+          kind: "mail",
+          status: "pending",
+          acknowledgedGeneration: null,
+          attemptCount: 0,
+          nextAttemptAt: args.now ?? new Date(),
+          deliveryLeaseId: null,
+          deliveryLeaseExpiresAt: null,
+          failureCode: null,
+          failureMessage: null,
+          createdAt: args.now ?? new Date(),
+          updatedAt: args.now ?? new Date(),
+          acknowledgedAt: null,
+          settledAt: null,
+        },
+      };
+    },
+    async enqueueSignal(args) {
+      signalEnqueues.push(args);
+      if (signalEnqueueError !== undefined) throw signalEnqueueError;
+      return {
+        created: true,
+        dispatch: {
+          id: args.id,
+          anchorRunId: args.anchorRunId,
+          messageId: args.signal.signalId,
+          kind: "signal",
+          rawMessage: new TextEncoder().encode(JSON.stringify(args.signal)),
+          stepGrants: [],
+          status: "pending",
+          acknowledgedGeneration: null,
+          attemptCount: 0,
+          nextAttemptAt: args.now ?? new Date(),
+          deliveryLeaseId: null,
+          deliveryLeaseExpiresAt: null,
+          failureCode: null,
+          failureMessage: null,
+          createdAt: args.now ?? new Date(),
+          updatedAt: args.now ?? new Date(),
+          acknowledgedAt: null,
+          settledAt: null,
+        },
+      };
+    },
+    acknowledge: async () => notImpl("acknowledge"),
+    settle: async () => notImpl("settle"),
+    requeueForReadyAllocation: async () => notImpl("requeueForReadyAllocation"),
+    reconcileNext: async () => notImpl("reconcileNext"),
+    reconcileUntilIdle: async () => notImpl("reconcileUntilIdle"),
+    wake: () => undefined,
   };
 }
 
@@ -424,8 +659,6 @@ function createMockAssetService(workflowJson: string | null): AssetService {
   return {
     createAsset: () => notImpl("createAsset"),
     populateAsset: () => notImpl("populateAsset"),
-    attachAsset: () => notImpl("attachAsset"),
-    listAgentAssets: () => notImpl("listAgentAssets"),
     readAssetBlob: async () => {
       if (workflowJson === null) {
         throw new Error("no blob");
@@ -436,12 +669,10 @@ function createMockAssetService(workflowJson: string | null): AssetService {
   };
 }
 
-function createStubRepoStore(repoDirById?: Map<string, string>): RepoStore {
-  // The deploy/signal/trigger routes never read the repoStore; only the
-  // run-observe routes do, via `getRepoDir`. Tests that exercise those
-  // routes pass a `repoDirById` map pointing at a constructed on-disk
-  // workflow-run repo. The remaining methods throw so any drift onto a
-  // substrate method these routes do not own fails loudly.
+function createStubRepoStore(
+  repoDirById?: Map<string, string>,
+  runLifecycle: WorkflowRunLifecycle | (() => WorkflowRunLifecycle) = "live",
+): RepoStore {
   const unused = () =>
     Promise.reject(new Error("stub repoStore is not wired in workflow tests"));
   return {
@@ -466,7 +697,37 @@ function createStubRepoStore(repoDirById?: Map<string, string>): RepoStore {
       }
       return dir;
     },
-    openCommittedReads: unused,
+    openCommittedReads: async () => {
+      const lifecycle =
+        typeof runLifecycle === "function" ? runLifecycle() : runLifecycle;
+      return {
+        async listDir(dirPath) {
+          const runPath = `runs/ins_${DEPLOYMENT_ID}@${DOMAIN}`;
+          if (dirPath === runPath) {
+            return lifecycle === "absent"
+              ? []
+              : [{ name: "events", oid: "events", type: "tree" as const }];
+          }
+          if (dirPath === `${runPath}/events`) {
+            if (lifecycle === "absent") return [];
+            return lifecycle === "terminal"
+              ? [
+                  { name: "0.json", oid: "started", type: "blob" as const },
+                  { name: "1.json", oid: "terminal", type: "blob" as const },
+                ]
+              : [{ name: "0.json", oid: "started", type: "blob" as const }];
+          }
+          return [];
+        },
+        async readBlobByOid(oid) {
+          const event =
+            oid === "terminal"
+              ? { type: "RunCompleted", seq: 1 }
+              : { type: "RunStarted", seq: 0 };
+          return new TextEncoder().encode(JSON.stringify(event));
+        },
+      };
+    },
     openCommittedReadsAtCommit: unused,
     subscribe: () => {
       throw new Error("stub repoStore is not wired in workflow tests");
@@ -501,8 +762,15 @@ type TestAppOpts = {
   runGrantsResult?: boolean;
   deployCalls?: DeployWorkflowDefinitionParams[];
   deployResult?: DeployWorkflowDefinitionResult;
+  deployError?: Error;
+  allocationPrepareCalls?: PrepareExclusiveWorkflowDeploymentArgs[];
+  allocationPrepareError?: Error;
+  workflowDispatchEnqueues?: WorkflowDispatchEnqueue[];
+  workflowSignalDispatchEnqueues?: WorkflowSignalDispatchEnqueue[];
+  workflowSignalDispatchError?: Error;
   workflowJson?: string | null;
   repoDirById?: Map<string, string>;
+  runLifecycle?: WorkflowRunLifecycle | (() => WorkflowRunLifecycle);
 };
 
 function createTestApp(opts: TestAppOpts = {}) {
@@ -525,12 +793,41 @@ function createTestApp(opts: TestAppOpts = {}) {
     sessionService: createMockSessionService(
       opts.deployCalls ?? [],
       opts.deployResult,
+      opts.deployError,
     ),
+    ...(opts.allocationPrepareCalls !== undefined
+      ? {
+          workflowAllocationService: createMockWorkflowAllocationService(
+            opts.allocationPrepareCalls,
+            opts.allocationPrepareError,
+          ),
+        }
+      : {}),
+    ...(opts.workflowDispatchEnqueues !== undefined
+      ? {
+          workflowDispatchService: createMockWorkflowDispatchService(
+            opts.workflowDispatchEnqueues,
+            opts.workflowSignalDispatchEnqueues ?? [],
+            opts.workflowSignalDispatchError,
+          ),
+        }
+      : opts.workflowSignalDispatchEnqueues !== undefined
+        ? {
+            workflowDispatchService: createMockWorkflowDispatchService(
+              [],
+              opts.workflowSignalDispatchEnqueues,
+              opts.workflowSignalDispatchError,
+            ),
+          }
+        : {}),
     eventCollectors: createMockEventCollectors(),
     assetService: createMockAssetService(
       opts.workflowJson === undefined ? WORKFLOW_JSON : opts.workflowJson,
     ),
-    repoStore: createStubRepoStore(opts.repoDirById),
+    repoStore: createStubRepoStore(
+      opts.repoDirById,
+      opts.runLifecycle ?? "live",
+    ),
     maxTarballBytes: 10_000_000,
   });
 }
@@ -632,6 +929,7 @@ describe("POST /workflows/instances", () => {
           },
         ],
         defaultSource: "src",
+        toolPackages: [{ name: "@intx/tools-posix", version: "^1.2.3" }],
       }),
     );
 
@@ -649,6 +947,82 @@ describe("POST /workflows/instances", () => {
     expect(call.definitionAssetId).toBe(ASSET_ID);
     expect(call.definition.id).toBe("wf_demo");
     expect(call.definition.stepOrder).toEqual(["plan", "wait"]);
+    expect(call.toolPackagePins).toEqual([
+      { name: "@intx/tools-posix", version: "^1.2.3" },
+    ]);
+  });
+
+  test("prepares exclusive placement without deploying on shared capacity", async () => {
+    const deployCalls: DeployWorkflowDefinitionParams[] = [];
+    const allocationPrepareCalls: PrepareExclusiveWorkflowDeploymentArgs[] = [];
+    const app = createTestApp({
+      grants: [makeGrant({ action: "create" })],
+      deployCalls,
+      allocationPrepareCalls,
+      workflowJson: EXCLUSIVE_WORKFLOW_JSON,
+    });
+
+    const res = await app.fetch(
+      authedPost(`${base()}/instances`, {
+        assetId: ASSET_ID,
+        sources: [
+          {
+            id: "offering-anthropic",
+            provider: "caller-value-is-not-persisted",
+            baseURL: "https://caller.example",
+            apiKey: "caller-secret-is-not-persisted",
+            model: "caller-model",
+          },
+        ],
+        defaultSource: "offering-anthropic",
+        toolPackages: [{ name: "@intx/tools-posix", version: "^1.2.3" }],
+      }),
+    );
+
+    expect(res.status).toBe(201);
+    expect(await res.json()).toMatchObject({
+      id: DEPLOYMENT_ID,
+      status: "pending",
+    });
+    expect(deployCalls).toHaveLength(0);
+    expect(allocationPrepareCalls).toHaveLength(1);
+    expect(allocationPrepareCalls[0]).toMatchObject({
+      tenantId: TENANT_ID,
+      definitionAssetId: ASSET_ID,
+      placement: { sharing: "exclusive", reuse: "same-deployment" },
+      sourceAuthorityPrincipalId: PRINCIPAL_ID,
+      sourceOfferingIds: ["offering-anthropic"],
+      defaultSourceOfferingId: "offering-anthropic",
+      toolPackagePins: [{ name: "@intx/tools-posix", version: "^1.2.3" }],
+    });
+  });
+
+  test("rejects invalid workflow tool package pins", async () => {
+    const deployCalls: DeployWorkflowDefinitionParams[] = [];
+    const app = createTestApp({
+      grants: [makeGrant({ action: "create" })],
+      deployCalls,
+    });
+
+    const res = await app.fetch(
+      authedPost(`${base()}/instances`, {
+        assetId: ASSET_ID,
+        sources: [
+          {
+            id: "src",
+            provider: "anthropic",
+            baseURL: "https://api.example",
+            apiKey: "secret",
+            model: "m",
+          },
+        ],
+        defaultSource: "src",
+        toolPackages: [{ name: "@intx/tools-posix", version: "invalid" }],
+      }),
+    );
+
+    expect(res.status).toBe(400);
+    expect(deployCalls).toHaveLength(0);
   });
 
   test("rejects a caller without the workflow create grant", async () => {
@@ -696,7 +1070,84 @@ describe("POST /workflows/instances", () => {
     expect(await errorCode(res)).toBe("sidecar_unavailable");
   });
 
-  test("reports a missing post-deploy projection row as 500, not 502", async () => {
+  test("reports an invalid single-step source chain as 409 invalid_workflow", async () => {
+    // A WorkflowDefinitionInvalidError from the single-step source-chain
+    // assertion (inverted or unapproved chain) is a client error, not a
+    // sidecar-reachability failure -- the route must classify it as 409.
+    const deployCalls: DeployWorkflowDefinitionParams[] = [];
+    const app = createTestApp({
+      grants: [makeGrant({ action: "create" })],
+      deployCalls,
+      deployError: new WorkflowDefinitionInvalidError(
+        "wf_x",
+        'config.sources[0] ("src-b") must be the default source "src-a"',
+      ),
+    });
+    const res = await app.fetch(
+      authedPost(`${base()}/instances`, {
+        assetId: ASSET_ID,
+        sources: [
+          {
+            id: "src",
+            provider: "anthropic",
+            baseURL: "https://api.example",
+            apiKey: "secret",
+            model: "m",
+          },
+        ],
+        defaultSource: "src",
+      }),
+    );
+    expect(res.status).toBe(409);
+    expect(await errorCode(res)).toBe("invalid_workflow");
+    // Pin the assertion to the deploy-catch branch: the hydrate-failure path
+    // also yields 409 invalid_workflow but never reaches the deploy call.
+    expect(deployCalls).toHaveLength(1);
+  });
+
+  test("rejects a single-step deploy whose default is not the chain head with 409, before deploying", async () => {
+    // The single-step chain gate lives at the route edge: a default source that
+    // is not the head of the pinned chain is contradictory request shape, so
+    // the route must reject it with a caller-facing invalid_workflow BEFORE
+    // handing anything to the deploy call -- not surface the orchestrator's
+    // internal invariant wording through the deploy-catch branch.
+    const deployCalls: DeployWorkflowDefinitionParams[] = [];
+    const app = createTestApp({
+      grants: [makeGrant({ action: "create" })],
+      deployCalls,
+      // stepOrder ["work"] -- single-step, so the chain-head rule applies.
+      workflowJson: WORKFLOW_JSON_WITH_TOOLS,
+    });
+    const res = await app.fetch(
+      authedPost(`${base()}/instances`, {
+        assetId: ASSET_ID,
+        sources: [
+          {
+            id: "src-b",
+            provider: "anthropic",
+            baseURL: "https://api.example",
+            apiKey: "secret",
+            model: "m",
+          },
+          {
+            id: "src-a",
+            provider: "anthropic",
+            baseURL: "https://api.example",
+            apiKey: "secret",
+            model: "m2",
+          },
+        ],
+        defaultSource: "src-a",
+      }),
+    );
+    expect(res.status).toBe(409);
+    expect(await errorCode(res)).toBe("invalid_workflow");
+    // The edge check pre-empts the deploy entirely -- an empty deployCalls
+    // proves the rejection did not come from the orchestrator assert.
+    expect(deployCalls).toHaveLength(0);
+  });
+
+  test("reports a missing post-deploy anchor run as 500, not 502", async () => {
     const app = createTestApp({
       grants: [makeGrant({ action: "create" })],
       db: { assetRow: workflowAssetRow, deploymentRow: undefined },
@@ -722,7 +1173,7 @@ describe("POST /workflows/instances", () => {
       }),
     );
     expect(res.status).toBe(500);
-    expect(await errorCode(res)).toBe("deployment_projection_missing");
+    expect(await errorCode(res)).toBe("anchor_run_missing");
   });
 
   test("returns 404 when the workflow asset is missing", async () => {
@@ -769,9 +1220,35 @@ describe("GET /workflows/instances", () => {
       },
     ]);
   });
+
+  test("reports an allocation replacement as recovering", async () => {
+    const app = createTestApp({
+      db: {
+        deploymentList: [
+          {
+            ...deploymentRow,
+            allocationStatus: "replacing",
+            allocationNextAttemptAt: new Date("2025-01-02T00:01:00.000Z"),
+          },
+        ],
+      },
+    });
+
+    const res = await app.fetch(
+      new Request(`http://localhost${base()}/instances`),
+    );
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual([
+      expect.objectContaining({ id: DEPLOYMENT_ID, status: "recovering" }),
+    ]);
+  });
 });
 
 describe("POST /workflows/:deploymentId/signals", () => {
+  // The single addressable run of a deployment is its stable run id, the
+  // deployment mail address (deriveWorkflowRunId returns the address verbatim).
+  const RUN_ID = `ins_${DEPLOYMENT_ID}@${DOMAIN}`;
+
   function manageGrant(): GrantRule {
     return makeGrant({
       resource: `workflow-run:${DEPLOYMENT_ID}`,
@@ -789,7 +1266,7 @@ describe("POST /workflows/:deploymentId/signals", () => {
 
     const res = await app.fetch(
       authedPost(`${base()}/${DEPLOYMENT_ID}/signals`, {
-        runId: "run-1",
+        runId: RUN_ID,
         signalName: "go",
         signalId: "sig-caller-1",
         payload: { ok: true },
@@ -801,12 +1278,184 @@ describe("POST /workflows/:deploymentId/signals", () => {
     const call = signalCalls[0];
     if (call === undefined) throw new Error("missing signal call");
     expect(call.agentAddress).toBe(`ins_${DEPLOYMENT_ID}@${DOMAIN}`);
-    expect(call.runId).toBe("run-1");
+    expect(call.runId).toBe(RUN_ID);
     expect(call.signalName).toBe("go");
     // The signalId is the caller-supplied stable id, never server-minted.
     expect(call.signalId).toBe("sig-caller-1");
     expect(call.payload).toEqual({ ok: true });
   });
+
+  test("durably queues a signal for an exclusive deployment", async () => {
+    const signalCalls: SignalCall[] = [];
+    const signalEnqueues: WorkflowSignalDispatchEnqueue[] = [];
+    const app = createTestApp({
+      grants: [manageGrant()],
+      signalCalls,
+      workflowSignalDispatchEnqueues: signalEnqueues,
+      db: { deploymentRow, allocationId: "allocation-1" },
+    });
+
+    const res = await app.fetch(
+      authedPost(`${base()}/${DEPLOYMENT_ID}/signals`, {
+        runId: RUN_ID,
+        signalName: "go",
+        signalId: "sig-durable-1",
+        payload: { ok: true },
+      }),
+    );
+
+    expect(res.status).toBe(202);
+    expect(signalCalls).toEqual([]);
+    expect(signalEnqueues).toEqual([
+      {
+        id: `dispatch:${DEPLOYMENT_ID}:sig-durable-1`,
+        anchorRunId: DEPLOYMENT_ID,
+        signal: {
+          agentAddress: RUN_ID,
+          runId: RUN_ID,
+          signalName: "go",
+          signalId: "sig-durable-1",
+          payload: { ok: true },
+        },
+      },
+    ]);
+  });
+
+  test("rejects a reused signalId with a different durable payload", async () => {
+    const signalEnqueues: WorkflowSignalDispatchEnqueue[] = [];
+    const app = createTestApp({
+      grants: [manageGrant()],
+      workflowSignalDispatchEnqueues: signalEnqueues,
+      workflowSignalDispatchError: new WorkflowRunDispatchPayloadConflictError(
+        "sig-durable-conflict",
+        "signal",
+        "enqueueSignal",
+      ),
+      db: { deploymentRow, allocationId: "allocation-1" },
+    });
+
+    const res = await app.fetch(
+      authedPost(`${base()}/${DEPLOYMENT_ID}/signals`, {
+        runId: RUN_ID,
+        signalName: "go",
+        signalId: "sig-durable-conflict",
+        payload: { ok: false },
+      }),
+    );
+
+    expect(res.status).toBe(409);
+    expect(await errorCode(res)).toBe("signal_id_conflict");
+    expect(signalEnqueues).toHaveLength(1);
+  });
+
+  test("rejects an exclusive signal if Git terminates while it waits for the allocation lock", async () => {
+    const signalEnqueues: WorkflowSignalDispatchEnqueue[] = [];
+    const lifecycles = ["live", "terminal"] as const;
+    let lifecycleRead = 0;
+    const app = createTestApp({
+      grants: [manageGrant()],
+      workflowSignalDispatchEnqueues: signalEnqueues,
+      db: { deploymentRow, allocationId: "allocation-1" },
+      runLifecycle: () => lifecycles[lifecycleRead++] ?? "terminal",
+    });
+
+    const res = await app.fetch(
+      authedPost(`${base()}/${DEPLOYMENT_ID}/signals`, {
+        runId: RUN_ID,
+        signalName: "go",
+        signalId: "sig-git-terminal-race",
+      }),
+    );
+
+    expect(res.status).toBe(409);
+    expect(await errorCode(res)).toBe("workflow_run_not_running");
+    expect(signalEnqueues).toEqual([]);
+    expect(lifecycleRead).toBe(2);
+  });
+
+  test("returns 503 when durable signal dispatch is unavailable", async () => {
+    const signalCalls: SignalCall[] = [];
+    const app = createTestApp({
+      grants: [manageGrant()],
+      signalCalls,
+      db: { deploymentRow, allocationId: "allocation-1" },
+    });
+
+    const res = await app.fetch(
+      authedPost(`${base()}/${DEPLOYMENT_ID}/signals`, {
+        runId: RUN_ID,
+        signalName: "go",
+        signalId: "sig-dispatch-unavailable",
+      }),
+    );
+
+    expect(res.status).toBe(503);
+    expect(await errorCode(res)).toBe("workflow_dispatch_unavailable");
+    expect(signalCalls).toEqual([]);
+  });
+
+  test("rejects a signal when the allocation becomes terminal before enqueue", async () => {
+    const signalCalls: SignalCall[] = [];
+    const signalEnqueues: WorkflowSignalDispatchEnqueue[] = [];
+    const app = createTestApp({
+      grants: [manageGrant()],
+      signalCalls,
+      workflowSignalDispatchEnqueues: signalEnqueues,
+      db: {
+        deploymentRow,
+        allocationId: "allocation-1",
+        allocationStatus: "provisioning",
+        lockedAllocationStatus: "failed",
+      },
+    });
+
+    const res = await app.fetch(
+      authedPost(`${base()}/${DEPLOYMENT_ID}/signals`, {
+        runId: RUN_ID,
+        signalName: "go",
+        signalId: "sig-terminal-race",
+      }),
+    );
+
+    expect(res.status).toBe(409);
+    expect(await errorCode(res)).toBe("deployment_unreachable");
+    expect(signalCalls).toEqual([]);
+    expect(signalEnqueues).toEqual([]);
+  });
+
+  for (const allocationStatus of [
+    "releasing",
+    "released",
+    "failed",
+  ] satisfies SidecarAllocationStatus[]) {
+    test(`rejects a signal for a ${allocationStatus} allocation`, async () => {
+      const signalCalls: SignalCall[] = [];
+      const signalEnqueues: WorkflowSignalDispatchEnqueue[] = [];
+      const app = createTestApp({
+        grants: [manageGrant()],
+        signalCalls,
+        workflowSignalDispatchEnqueues: signalEnqueues,
+        db: {
+          deploymentRow,
+          allocationId: "allocation-1",
+          allocationStatus,
+        },
+      });
+
+      const res = await app.fetch(
+        authedPost(`${base()}/${DEPLOYMENT_ID}/signals`, {
+          runId: RUN_ID,
+          signalName: "go",
+          signalId: `sig-${allocationStatus}`,
+        }),
+      );
+
+      expect(res.status).toBe(409);
+      expect(await errorCode(res)).toBe("deployment_unreachable");
+      expect(signalCalls).toEqual([]);
+      expect(signalEnqueues).toEqual([]);
+    });
+  }
 
   test("accepts a payload-less signal with 202", async () => {
     const signalCalls: SignalCall[] = [];
@@ -818,7 +1467,7 @@ describe("POST /workflows/:deploymentId/signals", () => {
 
     const res = await app.fetch(
       authedPost(`${base()}/${DEPLOYMENT_ID}/signals`, {
-        runId: "run-1",
+        runId: RUN_ID,
         signalName: "go",
         signalId: "sig-caller-2",
       }),
@@ -830,6 +1479,70 @@ describe("POST /workflows/:deploymentId/signals", () => {
     if (call === undefined) throw new Error("missing signal call");
     expect(call.signalId).toBe("sig-caller-2");
     expect(call.payload).toBeUndefined();
+  });
+
+  test("rejects a signal before the top-level run starts or after it terminates", async () => {
+    for (const topLevelRunStatus of [null, "completed"] as const) {
+      const signalCalls: SignalCall[] = [];
+      const app = createTestApp({
+        grants: [manageGrant()],
+        signalCalls,
+        db: { deploymentRow, topLevelRunStatus },
+        runLifecycle: topLevelRunStatus === null ? "absent" : "terminal",
+      });
+      const res = await app.fetch(
+        authedPost(`${base()}/${DEPLOYMENT_ID}/signals`, {
+          runId: RUN_ID,
+          signalName: "go",
+          signalId: `sig-${topLevelRunStatus ?? "absent"}`,
+        }),
+      );
+
+      expect(res.status).toBe(409);
+      expect(await errorCode(res)).toBe("workflow_run_not_running");
+      expect(signalCalls).toEqual([]);
+    }
+  });
+
+  test("rejects a reserved control-plane signalName with 400", async () => {
+    const signalCalls: SignalCall[] = [];
+    const app = createTestApp({
+      grants: [manageGrant()],
+      signalCalls,
+      db: { deploymentRow },
+    });
+
+    const res = await app.fetch(
+      authedPost(`${base()}/${DEPLOYMENT_ID}/signals`, {
+        runId: RUN_ID,
+        signalName: signalName("corr-1"),
+        signalId: "sig-caller-1",
+      }),
+    );
+
+    expect(res.status).toBe(400);
+    expect(signalCalls).toHaveLength(0);
+  });
+
+  test("rejects a runId that is not the deployment's addressable run with 400", async () => {
+    const signalCalls: SignalCall[] = [];
+    const app = createTestApp({
+      grants: [manageGrant()],
+      signalCalls,
+      db: { deploymentRow },
+    });
+
+    // A synthetic body-child id (or any non-address id) is not addressable.
+    const res = await app.fetch(
+      authedPost(`${base()}/${DEPLOYMENT_ID}/signals`, {
+        runId: "section__0",
+        signalName: "go",
+        signalId: "sig-caller-1",
+      }),
+    );
+
+    expect(res.status).toBe(400);
+    expect(signalCalls).toHaveLength(0);
   });
 
   test("rejects a caller without the workflow-run manage grant", async () => {
@@ -929,6 +1642,231 @@ describe("POST /workflows/:deploymentId/mail", () => {
     expect(decoded).not.toContain("References:");
   });
 
+  test("a later trigger occurrence reuses the live run's committed grants", async () => {
+    const runGrantsCalls: RunGrantsCall[] = [];
+    const inserts: InsertRecord[] = [];
+    const app = createTestApp({
+      grants: [manageGrant()],
+      runGrantsCalls,
+      db: { deploymentRow, assetRow: workflowAssetRow, inserts },
+      workflowJson: WORKFLOW_JSON_WITH_TOOLS,
+    });
+
+    const first = await app.fetch(
+      authedPost(`${base()}/${DEPLOYMENT_ID}/mail`, { content: "first" }),
+    );
+    const grantInsertCount = inserts.filter(
+      (record) => record.table === grantTable,
+    ).length;
+    const second = await app.fetch(
+      authedPost(`${base()}/${DEPLOYMENT_ID}/mail`, { content: "second" }),
+    );
+
+    expect(first.status).toBe(202);
+    expect(second.status).toBe(202);
+    expect(runGrantsCalls).toHaveLength(2);
+    expect(runGrantsCalls[1]?.stepGrants).toEqual(
+      runGrantsCalls[0]?.stepGrants,
+    );
+    expect(
+      inserts.filter((record) => record.table === grantTable),
+    ).toHaveLength(grantInsertCount);
+  });
+
+  test("rejects mail after the deployment's top-level run terminates", async () => {
+    const routeMailCalls: RouteMailCall[] = [];
+    const app = createTestApp({
+      grants: [manageGrant()],
+      routeMailCalls,
+      db: {
+        deploymentRow,
+        assetRow: workflowAssetRow,
+        topLevelRunStatus: "completed",
+      },
+    });
+
+    const res = await app.fetch(
+      authedPost(`${base()}/${DEPLOYMENT_ID}/mail`, { content: "again" }),
+    );
+
+    expect(res.status).toBe(409);
+    expect(await errorCode(res)).toBe("workflow_run_terminal");
+    expect(routeMailCalls).toEqual([]);
+  });
+
+  test("uses terminal Git history even if the SQL terminal projection lags", async () => {
+    const routeMailCalls: RouteMailCall[] = [];
+    const app = createTestApp({
+      grants: [manageGrant()],
+      routeMailCalls,
+      db: {
+        deploymentRow,
+        assetRow: workflowAssetRow,
+        topLevelRunStatus: "running",
+      },
+      runLifecycle: "terminal",
+    });
+
+    const res = await app.fetch(
+      authedPost(`${base()}/${DEPLOYMENT_ID}/mail`, { content: "again" }),
+    );
+
+    expect(res.status).toBe(409);
+    expect(await errorCode(res)).toBe("workflow_run_terminal");
+    expect(routeMailCalls).toEqual([]);
+  });
+
+  test("durably queues an exclusive trigger without routing it through shared capacity", async () => {
+    const routeMailCalls: RouteMailCall[] = [];
+    const runGrantsCalls: RunGrantsCall[] = [];
+    const enqueues: WorkflowDispatchEnqueue[] = [];
+    const app = createTestApp({
+      grants: [manageGrant()],
+      routeMailCalls,
+      runGrantsCalls,
+      workflowDispatchEnqueues: enqueues,
+      db: {
+        deploymentRow,
+        assetRow: workflowAssetRow,
+        allocationId: "allocation-1",
+      },
+    });
+
+    const res = await app.fetch(
+      authedPost(`${base()}/${DEPLOYMENT_ID}/mail`, { content: "kick off" }),
+    );
+
+    expect(res.status).toBe(202);
+    expect(routeMailCalls).toEqual([]);
+    expect(runGrantsCalls).toEqual([]);
+    expect(enqueues).toHaveLength(1);
+    const queued = enqueues[0];
+    if (queued === undefined) throw new Error("missing durable dispatch");
+    expect(queued.anchorRunId).toBe(DEPLOYMENT_ID);
+    expect(new TextDecoder().decode(queued.rawMessage)).toContain("kick off");
+  });
+
+  test("durably queues the first exclusive trigger while its Git run is absent", async () => {
+    const enqueues: WorkflowDispatchEnqueue[] = [];
+    const app = createTestApp({
+      grants: [manageGrant()],
+      workflowDispatchEnqueues: enqueues,
+      db: {
+        deploymentRow,
+        assetRow: workflowAssetRow,
+        allocationId: "allocation-1",
+        topLevelRunStatus: null,
+      },
+      runLifecycle: "absent",
+    });
+
+    const res = await app.fetch(
+      authedPost(`${base()}/${DEPLOYMENT_ID}/mail`, { content: "start" }),
+    );
+
+    expect(res.status).toBe(202);
+    expect(enqueues).toHaveLength(1);
+  });
+
+  test("rejects exclusive mail if Git terminates while it waits for the allocation lock", async () => {
+    const enqueues: WorkflowDispatchEnqueue[] = [];
+    const inserts: InsertRecord[] = [];
+    const lifecycles = ["live", "terminal"] as const;
+    let lifecycleRead = 0;
+    const app = createTestApp({
+      grants: [manageGrant()],
+      workflowDispatchEnqueues: enqueues,
+      db: {
+        deploymentRow,
+        assetRow: workflowAssetRow,
+        allocationId: "allocation-1",
+        inserts,
+      },
+      runLifecycle: () => lifecycles[lifecycleRead++] ?? "terminal",
+    });
+
+    const res = await app.fetch(
+      authedPost(`${base()}/${DEPLOYMENT_ID}/mail`, { content: "too late" }),
+    );
+
+    expect(res.status).toBe(409);
+    expect(await errorCode(res)).toBe("workflow_run_terminal");
+    expect(enqueues).toEqual([]);
+    expect(inserts).toEqual([]);
+    expect(lifecycleRead).toBe(2);
+  });
+
+  test("rejects mail when the allocation becomes terminal before commit", async () => {
+    const routeMailCalls: RouteMailCall[] = [];
+    const runGrantsCalls: RunGrantsCall[] = [];
+    const enqueues: WorkflowDispatchEnqueue[] = [];
+    const inserts: InsertRecord[] = [];
+    const app = createTestApp({
+      grants: [manageGrant()],
+      routeMailCalls,
+      runGrantsCalls,
+      workflowDispatchEnqueues: enqueues,
+      db: {
+        deploymentRow,
+        assetRow: workflowAssetRow,
+        allocationId: "allocation-1",
+        allocationStatus: "provisioning",
+        lockedAllocationStatus: "failed",
+        inserts,
+      },
+    });
+
+    const res = await app.fetch(
+      authedPost(`${base()}/${DEPLOYMENT_ID}/mail`, { content: "kick off" }),
+    );
+
+    expect(res.status).toBe(409);
+    expect(await errorCode(res)).toBe("deployment_unreachable");
+    expect(routeMailCalls).toEqual([]);
+    expect(runGrantsCalls).toEqual([]);
+    expect(enqueues).toEqual([]);
+    expect(inserts).toEqual([]);
+  });
+
+  for (const allocationStatus of [
+    "releasing",
+    "released",
+    "failed",
+  ] satisfies SidecarAllocationStatus[]) {
+    test(`rejects mail for a ${allocationStatus} allocation before staging state`, async () => {
+      const routeMailCalls: RouteMailCall[] = [];
+      const runGrantsCalls: RunGrantsCall[] = [];
+      const enqueues: WorkflowDispatchEnqueue[] = [];
+      const inserts: InsertRecord[] = [];
+      const app = createTestApp({
+        grants: [manageGrant()],
+        routeMailCalls,
+        runGrantsCalls,
+        workflowDispatchEnqueues: enqueues,
+        db: {
+          deploymentRow,
+          assetRow: workflowAssetRow,
+          allocationId: "allocation-1",
+          allocationStatus,
+          inserts,
+        },
+      });
+
+      const res = await app.fetch(
+        authedPost(`${base()}/${DEPLOYMENT_ID}/mail`, {
+          content: "kick off",
+        }),
+      );
+
+      expect(res.status).toBe(409);
+      expect(await errorCode(res)).toBe("deployment_unreachable");
+      expect(routeMailCalls).toEqual([]);
+      expect(runGrantsCalls).toEqual([]);
+      expect(enqueues).toEqual([]);
+      expect(inserts).toEqual([]);
+    });
+  }
+
   test("surfaces an unroutable deployment address as 409", async () => {
     const routeMailCalls: RouteMailCall[] = [];
     const app = createTestApp({
@@ -1004,13 +1942,13 @@ describe("POST /workflows/:deploymentId/mail", () => {
     // lands them at the sidecar before the run dispatches.
     expect(sendOrder.map((s) => s.kind)).toEqual(["run.grants", "mail"]);
 
-    // The run.grants frame carries the run id (= the mail's Message-ID) and
-    // the definition-pure tool grants the capability walk lifted.
+    // The run.grants frame carries the run id (= the deployment's mail
+    // address) and the definition-pure tool grants the capability walk lifted.
     expect(runGrantsCalls).toHaveLength(1);
     const grantsCall = runGrantsCalls[0];
     if (grantsCall === undefined) throw new Error("missing run.grants call");
     expect(grantsCall.address).toBe(`ins_${DEPLOYMENT_ID}@${DOMAIN}`);
-    expect(grantsCall.runId).toBe(json.messageId);
+    expect(grantsCall.runId).toBe(json.address);
 
     const byResource = new Map(
       grantsCall.stepGrants.map((g) => [g.resource, g]),
@@ -1039,7 +1977,7 @@ describe("POST /workflows/:deploymentId/mail", () => {
     );
     expect(principalRow).toMatchObject({
       kind: "workflow",
-      refId: json.messageId,
+      refId: json.address,
       tenantId: TENANT_ID,
       status: "active",
     });
@@ -1050,7 +1988,7 @@ describe("POST /workflows/:deploymentId/mail", () => {
     expect(runInserts).toHaveLength(1);
     const runRow = assertBody(WorkflowRunInsert, runInserts[0]?.values);
     expect(runRow).toMatchObject({
-      id: json.messageId,
+      id: json.address,
       deploymentId: DEPLOYMENT_ID,
       tenantId: TENANT_ID,
       principalId: principalRow.id,
@@ -1110,7 +2048,7 @@ describe("POST /workflows/:deploymentId/mail", () => {
     expect(committed.origin).toBe("creator");
   });
 
-  test("leaves no orphaned run principal or grants on a 409", async () => {
+  test("keeps the reserved grants after a routing failure so a retry reuses them", async () => {
     const runGrantsCalls: RunGrantsCall[] = [];
     const routeMailCalls: RouteMailCall[] = [];
     const inserts: InsertRecord[] = [];
@@ -1130,11 +2068,14 @@ describe("POST /workflows/:deploymentId/mail", () => {
     expect(res.status).toBe(409);
     expect(await errorCode(res)).toBe("deployment_unreachable");
 
-    // The run.grants frame was attempted, but the unroutable mail means the
-    // run never starts -- so no run principal and no grant rows are written.
+    // Reservation precedes delivery so concurrent attempts cannot send
+    // different grants. With no RunStarted in Git this remains an unfired run,
+    // and a later delivery retry reuses the same authorization snapshot.
     expect(routeMailCalls).toHaveLength(1);
-    expect(inserts.filter((i) => i.table === principalTable)).toHaveLength(0);
-    expect(inserts.filter((i) => i.table === grantTable)).toHaveLength(0);
+    expect(inserts.filter((i) => i.table === principalTable)).toHaveLength(1);
+    expect(
+      inserts.filter((i) => i.table === grantTable).length,
+    ).toBeGreaterThan(0);
   });
 
   test("triggerers of differing authority get different declared run grants", async () => {
@@ -1275,6 +2216,32 @@ describe("POST /workflows/:deploymentId/mail", () => {
     expect(await errorCode(res)).toBe("insufficient_grants");
     expect(runGrantsCalls).toHaveLength(0);
     expect(inserts.filter((i) => i.table === grantTable)).toHaveLength(0);
+  });
+
+  test("fails closed 409 when the anchor definition has a null asset", async () => {
+    const routeMailCalls: RouteMailCall[] = [];
+    // A native workflow definition names its asset; a null asset is a corrupt
+    // definition the trigger cannot hydrate from, so the route fails closed.
+    const app = createTestApp({
+      grants: [manageGrant()],
+      routeMailCalls,
+      db: {
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- drive the anchor join to return a null asset
+        deploymentRow: {
+          ...deploymentRow,
+          definitionAssetId: null,
+        } as unknown as typeof deploymentRow,
+        assetRow: workflowAssetRow,
+      },
+    });
+
+    const res = await app.fetch(
+      authedPost(`${base()}/${DEPLOYMENT_ID}/mail`, { content: "kick off" }),
+    );
+
+    expect(res.status).toBe(409);
+    expect(await errorCode(res)).toBe("invalid_workflow");
+    expect(routeMailCalls).toHaveLength(0);
   });
 });
 

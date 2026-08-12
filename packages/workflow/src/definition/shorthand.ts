@@ -23,7 +23,11 @@
 // compare definitions) see no spurious differences.
 
 import type { BaseEnv } from "@intx/agent";
-import type { GrantRequirement } from "@intx/types";
+import type {
+  CredentialBinding,
+  GrantRequirement,
+  SidecarPlacementRequirement,
+} from "@intx/types";
 
 import { step } from "./primitives";
 import type { Primitive } from "./primitives";
@@ -36,7 +40,9 @@ export interface SingularShorthand<EnvReq extends BaseEnv> {
   trigger?: Trigger;
   triggers?: readonly Trigger[];
   state?: { schema?: StateSchema };
+  sidecarPlacement?: SidecarPlacementRequirement;
   grantRequirements?: readonly GrantRequirement[];
+  credentialBindings?: readonly CredentialBinding[];
 }
 
 export interface PluralShape {
@@ -45,7 +51,9 @@ export interface PluralShape {
   triggers?: readonly Trigger[];
   steps: Record<string, Primitive>;
   state?: { schema?: StateSchema };
+  sidecarPlacement?: SidecarPlacementRequirement;
   grantRequirements?: readonly GrantRequirement[];
+  credentialBindings?: readonly CredentialBinding[];
 }
 
 export function normalizeSingularShorthand<EnvReq extends BaseEnv>(
@@ -57,8 +65,14 @@ export function normalizeSingularShorthand<EnvReq extends BaseEnv>(
     ...(config.triggers !== undefined ? { triggers: config.triggers } : {}),
     steps: { default: step({ agent: config.agent }) },
     ...(config.state !== undefined ? { state: config.state } : {}),
+    ...(config.sidecarPlacement !== undefined
+      ? { sidecarPlacement: config.sidecarPlacement }
+      : {}),
     ...(config.grantRequirements !== undefined
       ? { grantRequirements: config.grantRequirements }
+      : {}),
+    ...(config.credentialBindings !== undefined
+      ? { credentialBindings: config.credentialBindings }
       : {}),
   };
 }

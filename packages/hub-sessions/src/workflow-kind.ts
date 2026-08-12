@@ -23,7 +23,7 @@
 
 import { type } from "arktype";
 import { getLogger } from "@intx/log";
-import { GrantRequirement } from "@intx/types";
+import { CredentialBinding, GrantRequirement } from "@intx/types";
 import { glob, repoActionToGrantVerb } from "@intx/hub-common";
 import {
   UserPrincipal,
@@ -80,12 +80,18 @@ const StateObject = type("Record<string, unknown>").narrow((value, ctx) => {
   return true;
 });
 
+const SidecarPlacement = type({
+  sharing: "'exclusive'",
+  "reuse?": "'never' | 'same-deployment'",
+});
+
 export const workflowDefinitionEnvelopeSchema = type({
   id: "string > 0",
   triggers: "unknown[]",
   steps: StepsObject,
   stepOrder: "string[]",
   "state?": StateObject,
+  "sidecarPlacement?": SidecarPlacement,
   // `grantRequirements` passes through the envelope whether or not it is
   // declared here: arktype's `.onUndeclaredKey("ignore")` below is
   // passthrough, not stripping (only `"delete"` strips), so the hydrate read
@@ -96,6 +102,11 @@ export const workflowDefinitionEnvelopeSchema = type({
   // exported `GrantRequirement` arktype rather than restating its shape so the
   // envelope and the definition stay in lockstep.
   "grantRequirements?": GrantRequirement.array(),
+  // `credentialBindings` is validated here too -- same defense-in-depth
+  // rationale as grantRequirements above: a malformed binding (bad locator,
+  // authority, or handle) is rejected at the deploy boundary rather than
+  // passed through to launch-time resolution unchecked.
+  "credentialBindings?": CredentialBinding.array(),
 }).onUndeclaredKey("ignore");
 
 /**

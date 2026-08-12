@@ -7,16 +7,20 @@ import {
   test,
 } from "bun:test";
 
-import { resolveInstanceModelSources, resolveModelSources } from "@intx/db";
-import type { ModelRequirement } from "@intx/types";
-import type { GrantRule } from "@intx/types/authz";
+import {
+  resolveInferencePreferences,
+  resolveInstanceModelSources,
+  resolveModelSources,
+} from "@intx/db";
+import { workflowDefinition } from "@intx/db/schema";
+import { credentialAad, type ModelRequirement } from "@intx/types";
 import {
   createTestDb,
   harnessDbEnvAvailable,
   type TestDb,
 } from "@intx/test-harness/db-harness";
+import { createTestCredentialCipher } from "@intx/test-harness/crypto";
 import {
-  seedAgent,
   seedCredential,
   seedGrant,
   seedModel,
@@ -30,23 +34,11 @@ import {
 
 const REQ_OPUS: ModelRequirement[] = [{ model: "opus" }];
 
-// A creator grant list that authorizes use of every credential, mirroring a
-// tenant owner's `*` / `*`. These direct-call tests exercise catalog ordering
-// and credential resolution, not credential-use authorization, so they pass an
-// authorized creator; the authorization gate has its own dedicated suite.
-const AUTHORIZED_CREATOR_GRANTS: GrantRule[] = [
-  {
-    id: "grt_test_owner",
-    resource: "*",
-    action: "*",
-    effect: "allow",
-    origin: "role",
-    conditions: null,
-    expiresAt: null,
-    roleId: null,
-    principalId: "prn_owner",
-  },
-];
+// Credential use is authorized by tenant ownership within the hierarchy (see
+// buildSource), so these direct-call tests seed the credential on the resolving
+// tenant (or an ancestor) and pass no grants: a tenant-owned credential in the
+// chain is usable by ownership alone. The out-of-chain case below proves the
+// ownership boundary.
 
 describe.skipIf(!harnessDbEnvAvailable())(
   "model-source-resolution (real DB)",
@@ -137,23 +129,13 @@ describe.skipIf(!harnessDbEnvAvailable())(
     describe("resolveModelSources", () => {
       test("returns no_requirements for an empty requirement list", async () => {
         await seedBase();
-        const result = await resolveModelSources(
-          h.db,
-          "tnt_root",
-          [],
-          AUTHORIZED_CREATOR_GRANTS,
-        );
+        const result = await resolveModelSources(h.db, "tnt_root", []);
         expect(result).toEqual({ ok: false, reason: "no_requirements" });
       });
 
       test("builds a credential-backed source from the catalog", async () => {
         await seedBase();
-        const result = await resolveModelSources(
-          h.db,
-          "tnt_root",
-          REQ_OPUS,
-          AUTHORIZED_CREATOR_GRANTS,
-        );
+        const result = await resolveModelSources(h.db, "tnt_root", REQ_OPUS);
         expect(result.ok).toBe(true);
         if (!result.ok) return;
         expect(result.sources).toEqual([
@@ -168,16 +150,69 @@ describe.skipIf(!harnessDbEnvAvailable())(
         ]);
       });
 
+      test("decrypts an encrypted credential secret through the cipher", async () => {
+        const cipher = createTestCredentialCipher();
+        await seedTenants(h.db, [{ id: "tnt_root" }]);
+        await seedProvider(h.db, {
+          id: "prv_x",
+          tenantId: "tnt_root",
+          name: "prv-x",
+        });
+        await seedCredential(h.db, {
+          id: "cred_enc",
+          tenantId: "tnt_root",
+          providerId: "prv_x",
+          name: "cred-enc",
+          secret: await cipher.encrypt(
+            "sk-real",
+            credentialAad("cred_enc", "secret"),
+          ),
+        });
+        await seedModel(h.db, {
+          id: "mdl_opus",
+          tenantId: "tnt_root",
+          canonicalName: "opus",
+        });
+        await seedModelProvider(h.db, {
+          id: "mpv_anthropic",
+          tenantId: "tnt_root",
+          name: "anthropic",
+          credentialId: "cred_enc",
+        });
+        await seedModelOffering(h.db, {
+          id: "mof_a",
+          tenantId: "tnt_root",
+          modelId: "mdl_opus",
+          providerId: "mpv_anthropic",
+        });
+
+        const result = await resolveModelSources(h.db, "tnt_root", REQ_OPUS, {
+          credentialCipher: cipher,
+        });
+        expect(result.ok).toBe(true);
+        if (!result.ok) return;
+        // The delivered apiKey is the decrypted plaintext, not the stored blob.
+        expect(result.sources[0]?.apiKey).toBe("sk-real");
+      });
+
+      test("fails closed when a stored secret is not a ciphertext", async () => {
+        // seedBase stores a plaintext secret; a real cipher's strict decrypt
+        // rejects it rather than delivering a bad key -- the un-re-keyed-row
+        // guard.
+        await seedBase();
+        const cipher = createTestCredentialCipher();
+        await expect(
+          resolveModelSources(h.db, "tnt_root", REQ_OPUS, {
+            credentialCipher: cipher,
+          }),
+        ).rejects.toThrow(/not an enc:aead/);
+      });
+
       test("carries the offering row's quirks bag on the resolved source", async () => {
         await seedBase({
           offeringQuirks: { forceAssistantReasoningContent: true },
         });
-        const result = await resolveModelSources(
-          h.db,
-          "tnt_root",
-          REQ_OPUS,
-          AUTHORIZED_CREATOR_GRANTS,
-        );
+        const result = await resolveModelSources(h.db, "tnt_root", REQ_OPUS);
         expect(result.ok).toBe(true);
         if (!result.ok) return;
         const [source] = result.sources;
@@ -188,12 +223,7 @@ describe.skipIf(!harnessDbEnvAvailable())(
 
       test("omits quirks on the resolved source when the row has none", async () => {
         await seedBase();
-        const result = await resolveModelSources(
-          h.db,
-          "tnt_root",
-          REQ_OPUS,
-          AUTHORIZED_CREATOR_GRANTS,
-        );
+        const result = await resolveModelSources(h.db, "tnt_root", REQ_OPUS);
         expect(result.ok).toBe(true);
         if (!result.ok) return;
         const [source] = result.sources;
@@ -204,12 +234,7 @@ describe.skipIf(!harnessDbEnvAvailable())(
       test("orders sources by ascending priority", async () => {
         await seedBase();
         await addRelay(5);
-        const result = await resolveModelSources(
-          h.db,
-          "tnt_root",
-          REQ_OPUS,
-          AUTHORIZED_CREATOR_GRANTS,
-        );
+        const result = await resolveModelSources(h.db, "tnt_root", REQ_OPUS);
         expect(result.ok).toBe(true);
         if (!result.ok) return;
         expect(result.sources.map((s) => s.id)).toEqual(["mof_a", "mof_relay"]);
@@ -217,23 +242,17 @@ describe.skipIf(!harnessDbEnvAvailable())(
 
       test("matches when an offering carries the required capability", async () => {
         await seedBase({ offeringCapabilities: ["vision-input"] });
-        const result = await resolveModelSources(
-          h.db,
-          "tnt_root",
-          [{ model: "opus", capabilities: ["vision-input"] }],
-          AUTHORIZED_CREATOR_GRANTS,
-        );
+        const result = await resolveModelSources(h.db, "tnt_root", [
+          { model: "opus", capabilities: ["vision-input"] },
+        ]);
         expect(result.ok).toBe(true);
       });
 
       test("is unavailable when no offering carries the required capability", async () => {
         await seedBase();
-        const result = await resolveModelSources(
-          h.db,
-          "tnt_root",
-          [{ model: "opus", capabilities: ["vision-input"] }],
-          AUTHORIZED_CREATOR_GRANTS,
-        );
+        const result = await resolveModelSources(h.db, "tnt_root", [
+          { model: "opus", capabilities: ["vision-input"] },
+        ]);
         expect(result).toMatchObject({
           ok: false,
           reason: "model_unavailable",
@@ -243,12 +262,9 @@ describe.skipIf(!harnessDbEnvAvailable())(
       test("hard-pin restricts to the named providers in order", async () => {
         await seedBase();
         await addRelay(0);
-        const result = await resolveModelSources(
-          h.db,
-          "tnt_root",
-          [{ model: "opus", providers: { mode: "pin", order: ["relay"] } }],
-          AUTHORIZED_CREATOR_GRANTS,
-        );
+        const result = await resolveModelSources(h.db, "tnt_root", [
+          { model: "opus", providers: { mode: "pin", order: ["relay"] } },
+        ]);
         expect(result.ok).toBe(true);
         if (!result.ok) return;
         expect(result.sources.map((s) => s.id)).toEqual(["mof_relay"]);
@@ -259,17 +275,12 @@ describe.skipIf(!harnessDbEnvAvailable())(
         await addRelay(0);
         // relay has the better catalog priority, but the creator prefers
         // anthropic.
-        const result = await resolveModelSources(
-          h.db,
-          "tnt_root",
-          [
-            {
-              model: "opus",
-              providers: { mode: "prefer", order: ["anthropic"] },
-            },
-          ],
-          AUTHORIZED_CREATOR_GRANTS,
-        );
+        const result = await resolveModelSources(h.db, "tnt_root", [
+          {
+            model: "opus",
+            providers: { mode: "prefer", order: ["anthropic"] },
+          },
+        ]);
         expect(result.ok).toBe(true);
         if (!result.ok) return;
         expect(result.sources.map((s) => s.id)).toEqual(["mof_a", "mof_relay"]);
@@ -295,12 +306,7 @@ describe.skipIf(!harnessDbEnvAvailable())(
           modelId: "mdl_opus",
           providerId: "mpv_anthropic",
         });
-        const result = await resolveModelSources(
-          h.db,
-          "tnt_root",
-          REQ_OPUS,
-          AUTHORIZED_CREATOR_GRANTS,
-        );
+        const result = await resolveModelSources(h.db, "tnt_root", REQ_OPUS);
         expect(result).toMatchObject({
           ok: false,
           reason: "model_unavailable",
@@ -346,12 +352,7 @@ describe.skipIf(!harnessDbEnvAvailable())(
           modelId: "mdl_opus",
           providerId: "mpv_anthropic",
         });
-        const result = await resolveModelSources(
-          h.db,
-          "tnt_root",
-          REQ_OPUS,
-          AUTHORIZED_CREATOR_GRANTS,
-        );
+        const result = await resolveModelSources(h.db, "tnt_root", REQ_OPUS);
         expect(result).toMatchObject({
           ok: false,
           reason: "model_unavailable",
@@ -372,7 +373,6 @@ describe.skipIf(!harnessDbEnvAvailable())(
               providers: { mode: "prefer", order: ["anthropic"] },
             },
           ],
-          AUTHORIZED_CREATOR_GRANTS,
           { invokerPreferences: { opus: { mode: "pin", order: ["relay"] } } },
         );
         expect(result.ok).toBe(true);
@@ -383,8 +383,40 @@ describe.skipIf(!harnessDbEnvAvailable())(
       });
     });
 
+    describe("resolveInferencePreferences", () => {
+      test("projects resolved sources to credential-free provider/model preferences", async () => {
+        await seedBase();
+        const prefs = await resolveInferencePreferences(
+          h.db,
+          "tnt_root",
+          REQ_OPUS,
+        );
+        // The credential-free {provider, model} projection -- no apiKey/baseURL.
+        expect(prefs).toEqual([{ provider: "anthropic", model: "opus" }]);
+      });
+
+      test("throws when the requirements resolve to no source", async () => {
+        await seedBase();
+        await expect(
+          resolveInferencePreferences(h.db, "tnt_root", []),
+        ).rejects.toThrow();
+      });
+
+      test("throws when a required model is unavailable in the catalog", async () => {
+        await seedBase();
+        // The catalog offers only "opus"; a requirement for another model
+        // resolves model_unavailable, which must raise rather than yield an
+        // empty preference list.
+        await expect(
+          resolveInferencePreferences(h.db, "tnt_root", [
+            { model: "not-in-catalog" },
+          ]),
+        ).rejects.toThrow();
+      });
+    });
+
     describe("resolveInstanceModelSources", () => {
-      async function seedAgentWithRelay(
+      async function seedDefinitionWithRelay(
         modelRequirements: unknown,
       ): Promise<void> {
         await seedBase();
@@ -403,18 +435,23 @@ describe.skipIf(!harnessDbEnvAvailable())(
           resource: "credential:*",
           action: "use",
         });
-        await seedAgent(h.db, {
-          id: "agt_1",
+        // resolveInstanceModelSources reads the requirements off the
+        // definition -- so seed them there (mirroring the launch path, which
+        // also resolves off the definition, so reconnect reproduces the launch
+        // ordering).
+        await h.db.insert(workflowDefinition).values({
+          id: "wfd_1",
           tenantId: "tnt_root",
           creatorPrincipalId: "prn_creator",
+          name: "agent-1",
           modelRequirements,
         });
       }
 
-      test("resolves from the agent's persisted modelRequirements", async () => {
-        await seedAgentWithRelay([{ model: "opus" }]);
+      test("resolves from the folded definition's persisted modelRequirements", async () => {
+        await seedDefinitionWithRelay([{ model: "opus" }]);
         const result = await resolveInstanceModelSources(h.db, "tnt_root", {
-          agentId: "agt_1",
+          definitionId: "wfd_1",
           modelPreferences: null,
         });
         expect(result.ok).toBe(true);
@@ -424,9 +461,9 @@ describe.skipIf(!harnessDbEnvAvailable())(
       });
 
       test("applies the invoker preferences persisted on the instance", async () => {
-        await seedAgentWithRelay([{ model: "opus" }]);
+        await seedDefinitionWithRelay([{ model: "opus" }]);
         const result = await resolveInstanceModelSources(h.db, "tnt_root", {
-          agentId: "agt_1",
+          definitionId: "wfd_1",
           modelPreferences: [
             { model: "opus", providers: { mode: "pin", order: ["relay"] } },
           ],
@@ -437,29 +474,29 @@ describe.skipIf(!harnessDbEnvAvailable())(
         expect(result.sources.map((s) => s.id)).toEqual(["mof_relay"]);
       });
 
-      test("returns no_requirements when the agent has none", async () => {
-        await seedAgentWithRelay(null);
+      test("returns no_requirements when the definition has none", async () => {
+        await seedDefinitionWithRelay(null);
         const result = await resolveInstanceModelSources(h.db, "tnt_root", {
-          agentId: "agt_1",
+          definitionId: "wfd_1",
           modelPreferences: null,
         });
         expect(result).toEqual({ ok: false, reason: "no_requirements" });
       });
 
-      test("returns no_requirements when the agent is absent from the tenant", async () => {
-        await seedAgentWithRelay([{ model: "opus" }]);
+      test("returns no_requirements when no definition matches in the tenant", async () => {
+        await seedDefinitionWithRelay([{ model: "opus" }]);
         const result = await resolveInstanceModelSources(h.db, "tnt_root", {
-          agentId: "agt_missing",
+          definitionId: "wfd_missing",
           modelPreferences: null,
         });
         expect(result).toEqual({ ok: false, reason: "no_requirements" });
       });
 
       test("throws on malformed persisted modelPreferences", async () => {
-        await seedAgentWithRelay([{ model: "opus" }]);
+        await seedDefinitionWithRelay([{ model: "opus" }]);
         await expect(
           resolveInstanceModelSources(h.db, "tnt_root", {
-            agentId: "agt_1",
+            definitionId: "wfd_1",
             modelPreferences: [{ model: "opus", providers: { mode: "force" } }],
           }),
         ).rejects.toThrow();

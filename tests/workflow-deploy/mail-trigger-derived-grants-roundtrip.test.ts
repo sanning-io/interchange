@@ -20,8 +20,8 @@
 //     and `routeMail` therefore reach the SAME deployed sidecar the fixture
 //     stood up, so a 202 means the run was genuinely accepted for dispatch.
 //   - The committed rows insert under real foreign keys: `workflow_run`'s
-//     `deployment_id` references `workflow_deployment.id`, and the run
-//     principal is a real `principal` row. A broken derivation or a wrong
+//     `deployment_id` references its anchor run's `workflow_run.id`, and the
+//     run principal is a real `principal` row. A broken derivation or a wrong
 //     deployment id fails at the DB, not at a mock.
 //
 // SCOPE. This proves the route's grant DERIVATION + DB COMMIT under real
@@ -57,7 +57,7 @@ import {
   grant as grantTable,
   principal as principalTable,
   tenant as tenantTable,
-  workflowDeployment as workflowDeploymentTable,
+  workflowDefinition as workflowDefinitionTable,
   workflowRun as workflowRunTable,
 } from "@intx/db/schema";
 import { createSSHSignature, generateKeyPair } from "@intx/crypto";
@@ -69,6 +69,8 @@ import {
   createRepoStore,
   workflowAuthorize,
   workflowKindHandler,
+  workflowRunAuthorize,
+  workflowRunKindHandler,
   type AuthorizeFn,
   type EventCollectorRegistry,
   type RepoId,
@@ -206,9 +208,8 @@ function createMockEventCollectors(): EventCollectorRegistry {
   };
 }
 
-// A real RepoStore carrying the workflow kind handler, so a workflow asset
-// can be created and its `workflow.json` written and read back. The `/mail`
-// route's `hydrateDefinition` reads the definition through this store.
+// A real RepoStore carrying both kinds the `/mail` route reads: the workflow
+// asset's `workflow.json` and the deployment's workflow-run lifecycle.
 async function createWorkflowRepoStore(): Promise<RepoStore> {
   const dataDir = await fs.promises.mkdtemp(
     path.join(os.tmpdir(), "mail-trigger-derived-"),
@@ -220,12 +221,18 @@ async function createWorkflowRepoStore(): Promise<RepoStore> {
     if (repoId.kind === "workflow") {
       return workflowAuthorize(principal, repoId, ref, act);
     }
+    if (repoId.kind === "workflow-run") {
+      return workflowRunAuthorize(principal, repoId, ref, act);
+    }
     return { allowed: false, reason: `no authorize for ${repoId.kind}` };
   };
   return createRepoStore({
     dataDir,
     signingKey,
-    handlers: { workflow: workflowKindHandler },
+    handlers: {
+      workflow: workflowKindHandler,
+      "workflow-run": workflowRunKindHandler,
+    },
     authorize,
     signingCallback: () => signer,
   });
@@ -360,8 +367,9 @@ describe.skipIf(!harnessDbEnvAvailable())(
       const json = TriggerResponse.assert(rawJson);
       expect(json.deploymentId).toBe(DEPLOYMENT_ID);
       expect(json.address).toBe(deploymentMailAddress);
-      // The route mints runId = messageId verbatim.
-      const runId = json.messageId;
+      // The route keys the run on the deployment's mail address (the stable
+      // runId), not this message's Message-ID.
+      const runId = deploymentMailAddress;
 
       // ---- The run principal committed (kind workflow, refId = runId) ----
       const principals = await h.db
@@ -408,17 +416,23 @@ describe.skipIf(!harnessDbEnvAvailable())(
       expect(effectGrant.origin).toBe("creator");
     });
 
-    // Insert the deployment row directly so the address matches the
-    // fixture's deploy address (seedWorkflowDeployment defaults to a
-    // different domain).
+    // Seed the deployment's first-class definition and its anchor run at the
+    // fixture's deploy address: the trigger route reads the workflow asset and
+    // the run's definition off the anchor.
     async function seedDeploymentRow(): Promise<void> {
-      await h.db.insert(workflowDeploymentTable).values({
+      await h.db.insert(workflowDefinitionTable).values({
+        id: `wfd_${DEPLOYMENT_ID}`,
+        tenantId: TENANT_ID,
+        name: DEPLOYMENT_ID,
+        assetId: DEFINITION_ASSET_ID,
+      });
+      await h.db.insert(workflowRunTable).values({
         id: DEPLOYMENT_ID,
         tenantId: TENANT_ID,
-        definitionAssetId: DEFINITION_ASSET_ID,
+        deploymentId: DEPLOYMENT_ID,
+        definitionId: `wfd_${DEPLOYMENT_ID}`,
         address: deploymentMailAddress,
-        publicKey: null,
-        status: "deployed",
+        status: "running",
       });
     }
 

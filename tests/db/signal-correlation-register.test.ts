@@ -7,7 +7,7 @@ import {
   test,
 } from "bun:test";
 
-import { eq, sql } from "drizzle-orm";
+import { eq, ne, sql } from "drizzle-orm";
 
 import { generateKeyPair, signEd25519 } from "@intx/crypto";
 import { hexDecode, hexEncode, signalName } from "@intx/types";
@@ -19,7 +19,7 @@ import {
 import {
   approval,
   signalCorrelation,
-  workflowDeployment,
+  workflowDefinition,
   workflowRun,
 } from "@intx/db/schema";
 import { generateId } from "@intx/hub-common";
@@ -40,7 +40,6 @@ import { deriveWorkflowRunRepoId } from "@intx/workflow-deploy";
 import {
   seedAsset,
   seedTenants,
-  seedWorkflowDeployment,
   seedWorkflowRun,
 } from "@intx/test-harness/seed";
 
@@ -60,7 +59,7 @@ const stubRepoStore = new Proxy(
 ) as AgentRepoStore;
 
 const acceptAnySidecar: SidecarAuthenticator = async ({ sidecarId }) => ({
-  kind: "sidecar",
+  kind: "shared",
   sidecarId,
 });
 
@@ -111,11 +110,11 @@ async function backendPid(
 
 const TENANT = "t1";
 const ASSET = "asset1";
-// The raw `dep_...` id `deployWorkflowDefinition` stamps onto the
-// `workflow_deployment` row -- NOT the workflow-run repo slug. The
+// The raw `dep_...` id `deployWorkflowDefinition` stamps onto the deployment's
+// anchor run -- NOT the workflow-run repo slug. The
 // `signal_correlation.deployment_id` and `approval.deployment_id` FKs both
-// reference `workflow_deployment.id`, so this raw id is what the co-write
-// writes into those columns.
+// reference `workflow_run.id`, so this raw id is what the co-write writes into
+// those columns.
 const DEPLOYMENT = "dep_abc123";
 const WF_ADDR = "ins_dep_abc@wf.example";
 // The workflow-run repo slug the supervisor derives from the address and stamps
@@ -157,6 +156,25 @@ describe.skipIf(!harnessDbEnvAvailable())(
       await h.reset();
     });
 
+    // The deployment's anchor run: the row `lookupPublicKey` now reads the
+    // reconnect key off, keyed by the deployment address. A reconnect challenge
+    // against a workflow-derived address resolves its key here, so every test
+    // that reconnects needs one.
+    async function seedAnchorRun(
+      id: string,
+      address: string,
+      publicKeyHex: string | null,
+    ): Promise<void> {
+      await seedWorkflowRun(h.db, {
+        id,
+        tenantId: TENANT,
+        deploymentId: id,
+        address,
+        publicKey: publicKeyHex,
+        status: "running",
+      });
+    }
+
     // Seed a live deployment whose address resolves to `publicKeyHex`, so the
     // reconnect challenge that routes WF_ADDR onto the connection passes.
     async function seedDeployment(publicKeyHex: string): Promise<void> {
@@ -167,14 +185,7 @@ describe.skipIf(!harnessDbEnvAvailable())(
         kind: "workflow",
         name: "wf",
       });
-      await seedWorkflowDeployment(h.db, {
-        id: DEPLOYMENT,
-        tenantId: TENANT,
-        definitionAssetId: ASSET,
-        address: WF_ADDR,
-        publicKey: publicKeyHex,
-        status: "deployed",
-      });
+      await seedAnchorRun(DEPLOYMENT, WF_ADDR, publicKeyHex);
     }
 
     // Bring WF_ADDR up as an owned workflow address on `ws` through the real
@@ -344,8 +355,12 @@ describe.skipIf(!harnessDbEnvAvailable())(
       // The co-write lazily anchored the run: a workflow_run row keyed on the
       // frame's runId, on the same deployment and tenant. Its principal is null
       // -- an internal, workflow-spawned run inherits the deployment's grants
-      // and has no principal of its own.
-      const runs = await h.db.select().from(workflowRun);
+      // and has no principal of its own. Exclude the deployment's anchor run
+      // (id == DEPLOYMENT) to isolate the lazily-anchored child.
+      const runs = await h.db
+        .select()
+        .from(workflowRun)
+        .where(ne(workflowRun.id, DEPLOYMENT));
       expect(runs).toHaveLength(1);
       const run = runs[0];
       expect(run?.id).toBe("run-1");
@@ -353,10 +368,49 @@ describe.skipIf(!harnessDbEnvAvailable())(
       expect(run?.tenantId).toBe(TENANT);
       expect(run?.principalId).toBeNull();
       expect(run?.status).toBe("running");
+      // The lazily-anchored child inherits its deployment anchor run's
+      // definition, so it carries the anchor's definition_id.
+      const [anchor] = await h.db
+        .select()
+        .from(workflowRun)
+        .where(eq(workflowRun.id, DEPLOYMENT));
+      expect(run?.definitionId).toBe(anchor?.definitionId);
+    });
+
+    test("anchors the lazily-created run on its deployment's definition", async () => {
+      const kp = await generateKeyPair();
+      await seedDeployment(hexEncode(kp.publicKey));
+      // The anchor run carries a definition, so the lazily-anchored child run
+      // inherits it.
+      await h.db.insert(workflowDefinition).values({
+        id: "wfd_native",
+        tenantId: TENANT,
+        name: "native",
+        assetId: ASSET,
+      });
+      await h.db
+        .update(workflowRun)
+        .set({ definitionId: "wfd_native" })
+        .where(eq(workflowRun.id, DEPLOYMENT));
+      const router = buildRouter();
+      const ws = createMockWs();
+      await reconnectAndVerify(router, ws, kp.privateKey);
+
+      router.handleMessage(ws, registerFrame());
+      await drain();
+
+      const run = (
+        await h.db
+          .select()
+          .from(workflowRun)
+          .where(ne(workflowRun.id, DEPLOYMENT))
+      )[0];
+      expect(run?.id).toBe("run-1");
+      expect(run?.definitionId).toBe("wfd_native");
     });
 
     test("writes both rows for a real raw-id deployment addressed by a slug frame", async () => {
-      // Regression: a real deployment's `workflow_deployment.id` is the raw
+      // Regression: a real deployment's anchor-run id is the raw
       // `dep_...` id `deployWorkflowDefinition` stamps, while the frame's
       // `deploymentId` is the workflow-run repo slug the supervisor derives from
       // the address. seedDeployment seeds exactly that shape (raw id
@@ -422,7 +476,12 @@ describe.skipIf(!harnessDbEnvAvailable())(
 
       const firstCorr = await h.db.select().from(signalCorrelation);
       const firstAppr = await h.db.select().from(approval);
-      const firstRun = await h.db.select().from(workflowRun);
+      // Exclude the deployment's anchor run so only the lazily-anchored child
+      // run is counted for the idempotency check.
+      const firstRun = await h.db
+        .select()
+        .from(workflowRun)
+        .where(ne(workflowRun.id, DEPLOYMENT));
       expect(firstCorr).toHaveLength(1);
       expect(firstAppr).toHaveLength(1);
       expect(firstRun).toHaveLength(1);
@@ -436,7 +495,10 @@ describe.skipIf(!harnessDbEnvAvailable())(
 
       const secondCorr = await h.db.select().from(signalCorrelation);
       const secondAppr = await h.db.select().from(approval);
-      const secondRun = await h.db.select().from(workflowRun);
+      const secondRun = await h.db
+        .select()
+        .from(workflowRun)
+        .where(ne(workflowRun.id, DEPLOYMENT));
       expect(secondCorr).toHaveLength(1);
       expect(secondAppr).toHaveLength(1);
       // The lazy run-row ensure is redelivery-safe: the run row is not
@@ -456,16 +518,9 @@ describe.skipIf(!harnessDbEnvAvailable())(
       const kp = await generateKeyPair();
       await seedDeployment(hexEncode(kp.publicKey));
       // seedDeployment already seeded the tenant and asset; add a second
-      // deployment on them so the connection can own WF_ADDR_2.
+      // anchor run on them so the connection can own WF_ADDR_2.
       const kp2 = await generateKeyPair();
-      await seedWorkflowDeployment(h.db, {
-        id: DEPLOYMENT_2,
-        tenantId: TENANT,
-        definitionAssetId: ASSET,
-        address: WF_ADDR_2,
-        publicKey: hexEncode(kp2.publicKey),
-        status: "deployed",
-      });
+      await seedAnchorRun(DEPLOYMENT_2, WF_ADDR_2, hexEncode(kp2.publicKey));
 
       const router = buildRouter();
       const ws = createMockWs();
@@ -498,14 +553,7 @@ describe.skipIf(!harnessDbEnvAvailable())(
       // handler swallows the throw, so no rows are written.
       const kp = await generateKeyPair();
       await seedDeployment(hexEncode(kp.publicKey));
-      await seedWorkflowDeployment(h.db, {
-        id: DEPLOYMENT_2,
-        tenantId: TENANT,
-        definitionAssetId: ASSET,
-        address: WF_ADDR_2,
-        publicKey: null,
-        status: "deployed",
-      });
+      await seedAnchorRun(DEPLOYMENT_2, WF_ADDR_2, null);
 
       const router = buildRouter();
       const ws = createMockWs();
@@ -534,11 +582,11 @@ describe.skipIf(!harnessDbEnvAvailable())(
       expect(approvals).toHaveLength(0);
     });
 
-    test("rejects a frame whose deployment is no longer deployed", async () => {
-      // Bring WF_ADDR up while its deployment is live, then tear the deployment
-      // down (status flips off "deployed") with the connection still owning the
-      // address. registerSignalCorrelation filters to a deployed deployment, so
-      // the now-torn-down address resolves no row and it throws; the handler
+    test("rejects a frame whose anchor run is no longer running", async () => {
+      // Bring WF_ADDR up while its anchor run is live, then flip the anchor run
+      // terminal with the connection still owning the address.
+      // registerSignalCorrelation gates on a running anchor run, so the
+      // now-terminal address resolves no row and it throws; the handler
       // swallows the throw and writes nothing.
       const kp = await generateKeyPair();
       await seedDeployment(hexEncode(kp.publicKey));
@@ -548,12 +596,12 @@ describe.skipIf(!harnessDbEnvAvailable())(
       await reconnectAndVerify(router, ws, kp.privateKey);
       expect(router.getRoutableAddresses()).toContain(WF_ADDR);
 
-      // Tear the deployment down after the address is already routed, so the
-      // ownership gate still passes but the deployed-only resolution misses.
+      // Flip the anchor run terminal after the address is already routed, so the
+      // ownership gate still passes but the running-only resolution misses.
       await h.db
-        .update(workflowDeployment)
-        .set({ status: "error" })
-        .where(eq(workflowDeployment.id, DEPLOYMENT));
+        .update(workflowRun)
+        .set({ status: "cancelled" })
+        .where(eq(workflowRun.id, DEPLOYMENT));
 
       router.handleMessage(ws, registerFrame());
       await drain();
@@ -565,13 +613,13 @@ describe.skipIf(!harnessDbEnvAvailable())(
     });
 
     test("a teardown interleaved mid-register never orphans a correlation pair", async () => {
-      // The window the row lock closes: a deployment teardown that flips the
-      // row off "deployed" while a register is in flight. The register resolves
-      // the deployment and co-writes both rows in one transaction, taking a
-      // `SELECT ... FOR UPDATE` on the deployment row; a concurrent teardown
+      // The window the row lock closes: an anchor-run teardown that flips the
+      // run off "running" while a register is in flight. The register resolves
+      // the anchor run and co-writes both rows in one transaction, taking a
+      // `SELECT ... FOR UPDATE` on the anchor run row; a concurrent teardown
       // that has locked the same row makes the register block, and once the
       // teardown commits the register's in-transaction re-check finds no
-      // deployed row and throws -- so the pair is never written against a
+      // running row and throws -- so the pair is never written against a
       // torn-down deployment.
       //
       // Two dedicated single-connection handles drive the interleave
@@ -599,12 +647,12 @@ describe.skipIf(!harnessDbEnvAvailable())(
         let registerPromise: Promise<unknown> = Promise.resolve();
 
         await teardownHandle.transaction(async (txT) => {
-          // Lock the deployment row and flip it off "deployed", held
-          // uncommitted for the duration of the register attempt.
+          // Lock the anchor run row and flip it terminal, held uncommitted for
+          // the duration of the register attempt.
           await txT
-            .update(workflowDeployment)
-            .set({ status: "error" })
-            .where(eq(workflowDeployment.id, DEPLOYMENT));
+            .update(workflowRun)
+            .set({ status: "cancelled" })
+            .where(eq(workflowRun.id, DEPLOYMENT));
 
           // Fire the register on its own backend without awaiting: it blocks on
           // the row lock, and awaiting it here would deadlock against the
@@ -640,18 +688,19 @@ describe.skipIf(!harnessDbEnvAvailable())(
             }
             await new Promise((res) => setTimeout(res, 12));
           }
-          // Returning commits the teardown (status = "error") and releases the
-          // lock; a blocked register then re-checks and finds no deployed row.
+          // Returning commits the teardown (status = "cancelled") and releases
+          // the lock; a blocked register then re-checks and finds no running
+          // row.
         });
 
         await registerPromise;
 
         // The register waited on the teardown rather than racing past it, then
-        // threw once the deployment was no longer deployed.
+        // threw once the anchor run was no longer running.
         expect(sawBlock).toBe(true);
         expect(outcome).toBeInstanceOf(Error);
         if (outcome instanceof Error) {
-          expect(outcome.message).toContain("No deployed workflow deployment");
+          expect(outcome.message).toContain("No running workflow run");
         }
 
         // The invariant: no orphaned pair pointing at the torn-down deployment.
@@ -660,12 +709,13 @@ describe.skipIf(!harnessDbEnvAvailable())(
         ).toHaveLength(0);
         expect(await registerHandle.db.select().from(approval)).toHaveLength(0);
 
-        // The deployment row survived the teardown (flipped, not deleted).
-        const deployments = await registerHandle.db
+        // The anchor run survived the teardown (flipped, not deleted).
+        const anchorRuns = await registerHandle.db
           .select()
-          .from(workflowDeployment);
-        expect(deployments).toHaveLength(1);
-        expect(deployments[0]?.status).toBe("error");
+          .from(workflowRun)
+          .where(eq(workflowRun.id, DEPLOYMENT));
+        expect(anchorRuns).toHaveLength(1);
+        expect(anchorRuns[0]?.status).toBe("cancelled");
       } finally {
         await registerHandle.close();
         await teardownHandle.close();
@@ -686,14 +736,7 @@ describe.skipIf(!harnessDbEnvAvailable())(
         kind: "workflow",
         name: "wf",
       });
-      await seedWorkflowDeployment(h.db, {
-        id: DEPLOYMENT,
-        tenantId: TENANT,
-        definitionAssetId: ASSET,
-        address: WF_ADDR,
-        publicKey: null,
-        status: "deployed",
-      });
+      await seedAnchorRun(DEPLOYMENT, WF_ADDR, null);
       // The direct store inserts carry a runId; anchor its run row so the FK
       // to workflow_run resolves. The co-write path seeds this itself, but this
       // test bypasses it to exercise the stores directly.

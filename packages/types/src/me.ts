@@ -23,21 +23,12 @@ export const PrincipalSummary = type({
   }).array(),
 });
 
-export const AgentSummary = type({
+export const WorkflowRunSummary = type({
   id: "string",
   tenantId: "string",
   tenantName: "string",
-  name: "string",
-  "description?": "string | null",
-  status: "'deployed' | 'stopped' | 'updating' | 'error'",
-});
-
-export const InstanceSummary = type({
-  id: "string",
-  tenantId: "string",
-  tenantName: "string",
-  agentId: "string",
-  agentName: "string",
+  definitionId: "string",
+  definitionName: "string",
   address: "string",
   status: "'deployed' | 'running' | 'updating' | 'error' | 'stopped'",
   createdAt: "string",
@@ -47,8 +38,8 @@ export const SessionSummary = type({
   id: "string",
   tenantId: "string",
   tenantName: "string",
-  agentId: "string",
-  agentName: "string",
+  definitionId: "string",
+  definitionName: "string",
   status: "'idle' | 'ending' | 'ended'",
   createdAt: "string",
   "lastActivityAt?": "string | null",
@@ -58,10 +49,10 @@ export const ApprovalSummary = type({
   id: "string",
   tenantId: "string",
   tenantName: "string",
-  agentId: "string",
-  agentName: "string",
+  definitionId: "string",
+  definitionName: "string",
   sessionId: type("string").describe(
-    "Internal FK to the session channel. The instance ID can be resolved via the session relationship.",
+    "Internal FK to the session channel. The run ID can be resolved via the session relationship.",
   ),
   resource: "string",
   action: "string",

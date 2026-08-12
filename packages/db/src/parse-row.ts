@@ -2,22 +2,25 @@ import { type } from "arktype";
 
 import {
   Capability,
-  CredentialRequirement,
+  CredentialBinding,
   GrantRequirement,
   grantEffects,
   grantOrigins,
+  InvokerModelPreferences,
   ModelProviderPlugin,
   ModelRequirements,
   principalKinds,
   principalStatuses,
   signalKinds,
+  TenantConfig,
+  workflowDefinitionStatuses,
+  workflowDefinitionVersionStatuses,
 } from "@intx/types";
+import { WireGrantRule } from "@intx/types/grant-wire";
 import { RepoAction } from "@intx/types/sidecar";
 import { ToolPackagePinArray } from "@intx/types/tool-packages";
 
 import type {
-  agent,
-  agentVersion,
   approval,
   credential,
   gitToken,
@@ -33,10 +36,16 @@ import type {
   transaction,
   turnPart,
   wallet,
+  workflowDefinition,
+  workflowDefinitionVersion,
   workflowRun,
+  workflowRunDispatch,
+  workflowRunLaunchSpec,
 } from "./schema";
 
 const JSONObject = type("Record<string, unknown>");
+const StringArray = type("string[]");
+const WireGrantRuleArray = WireGrantRule.array();
 
 const GrantEffectValidator = type.enumerated(...grantEffects);
 const GrantOriginValidator = type.enumerated(...grantOrigins);
@@ -62,12 +71,23 @@ const workflowRunStatuses = [
   "cancelled",
 ] as const;
 const WorkflowRunStatusValidator = type.enumerated(...workflowRunStatuses);
+const WorkflowRunDispatchStatusValidator = type.enumerated(
+  "pending",
+  "acknowledged",
+  "settled",
+  "failed",
+);
+const WorkflowRunDispatchKindValidator = type.enumerated("mail", "signal");
+
+const WorkflowDefinitionStatusValidator = type.enumerated(
+  ...workflowDefinitionStatuses,
+);
+const WorkflowDefinitionVersionStatusValidator = type.enumerated(
+  ...workflowDefinitionVersionStatuses,
+);
 
 const PrincipalKindValidator = type.enumerated(...principalKinds);
 const PrincipalStatusValidator = type.enumerated(...principalStatuses);
-
-const agentVersionStatuses = ["active", "inactive", "failed"] as const;
-const AgentVersionStatusValidator = type.enumerated(...agentVersionStatuses);
 
 const credentialTypes = [
   "api_key",
@@ -99,6 +119,7 @@ const turnPartTypes = [
   "file",
   "error",
   "refusal",
+  "safety_rating",
   "step-start",
   "step-finish",
   "snapshot",
@@ -106,37 +127,37 @@ const turnPartTypes = [
 ] as const;
 const TurnPartTypeValidator = type.enumerated(...turnPartTypes);
 
-export function parseAgentRow(row: typeof agent.$inferSelect) {
+export function parseWorkflowDefinitionRow(
+  row: typeof workflowDefinition.$inferSelect,
+) {
   return {
     ...row,
-    contextConfig:
-      row.contextConfig !== null ? JSONObject.assert(row.contextConfig) : null,
-    initialState:
-      row.initialState !== null ? JSONObject.assert(row.initialState) : null,
-    modelConfig:
-      row.modelConfig !== null ? JSONObject.assert(row.modelConfig) : null,
-    capabilities:
-      row.capabilities !== null ? JSONObject.assert(row.capabilities) : null,
-    credentialRequirements:
-      row.credentialRequirements !== null
-        ? CredentialRequirement.array().assert(row.credentialRequirements)
+    status: WorkflowDefinitionStatusValidator.assert(row.status),
+    grantRequirements:
+      row.grantRequirements !== null
+        ? GrantRequirement.array().assert(row.grantRequirements)
         : null,
     modelRequirements:
       row.modelRequirements !== null
         ? ModelRequirements.assert(row.modelRequirements)
         : null,
-    grantRequirements:
-      row.grantRequirements !== null
-        ? GrantRequirement.array().assert(row.grantRequirements)
-        : null,
-    toolPackages: ToolPackagePinArray.assert(row.toolPackages),
+    // Nullable jsonb: `null` on a real drizzle row, `undefined` only on a
+    // partial row-shaped test stub that predates the column. Both mean "no
+    // bindings" -- treat them alike rather than asserting `undefined` as an
+    // array.
+    credentialBindings:
+      row.credentialBindings === null || row.credentialBindings === undefined
+        ? null
+        : CredentialBinding.array().assert(row.credentialBindings),
   };
 }
 
-export function parseAgentVersionRow(row: typeof agentVersion.$inferSelect) {
+export function parseWorkflowDefinitionVersionRow(
+  row: typeof workflowDefinitionVersion.$inferSelect,
+) {
   return {
     ...row,
-    status: AgentVersionStatusValidator.assert(row.status),
+    status: WorkflowDefinitionVersionStatusValidator.assert(row.status),
   };
 }
 
@@ -181,7 +202,58 @@ export function parseWorkflowRunRow(row: typeof workflowRun.$inferSelect) {
   return {
     ...row,
     status: WorkflowRunStatusValidator.assert(row.status),
+    modelPreferences:
+      row.modelPreferences !== null
+        ? InvokerModelPreferences.assert(row.modelPreferences)
+        : null,
   };
+}
+
+export function parseWorkflowRunLaunchSpecRow(
+  row: typeof workflowRunLaunchSpec.$inferSelect,
+) {
+  const sourceOfferingIds = StringArray.assert(row.sourceOfferingIds);
+  assertLaunchSpecSources(sourceOfferingIds, row.defaultSourceOfferingId);
+  return {
+    ...row,
+    definitionSnapshot: JSONObject.assert(row.definitionSnapshot),
+    sourceOfferingIds,
+    deployContent: JSONObject.assert(row.deployContent),
+    toolPackagePins:
+      row.toolPackagePins !== null
+        ? ToolPackagePinArray.assert(row.toolPackagePins)
+        : null,
+  };
+}
+
+export function parseWorkflowRunDispatchRow(
+  row: typeof workflowRunDispatch.$inferSelect,
+) {
+  return {
+    ...row,
+    kind: WorkflowRunDispatchKindValidator.assert(row.kind),
+    status: WorkflowRunDispatchStatusValidator.assert(row.status),
+    stepGrants: WireGrantRuleArray.assert(row.stepGrants),
+  };
+}
+
+function assertLaunchSpecSources(
+  sourceOfferingIds: readonly string[],
+  defaultSourceOfferingId: string,
+): void {
+  if (sourceOfferingIds.length === 0) {
+    throw new Error(
+      "workflow launch spec requires at least one source offering",
+    );
+  }
+  if (new Set(sourceOfferingIds).size !== sourceOfferingIds.length) {
+    throw new Error("workflow launch spec source offering ids must be unique");
+  }
+  if (!sourceOfferingIds.includes(defaultSourceOfferingId)) {
+    throw new Error(
+      `workflow launch spec default source ${defaultSourceOfferingId} is not in its source offering ids`,
+    );
+  }
 }
 
 export function parseOfferingRow(row: typeof offering.$inferSelect) {
@@ -226,7 +298,7 @@ export function parseModelOfferingRow(row: typeof modelOffering.$inferSelect) {
 export function parseTenantRow(row: typeof tenant.$inferSelect) {
   return {
     ...row,
-    config: row.config !== null ? JSONObject.assert(row.config) : null,
+    config: row.config !== null ? TenantConfig.assert(row.config) : null,
   };
 }
 

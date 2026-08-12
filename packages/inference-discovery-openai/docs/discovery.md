@@ -19,7 +19,7 @@ captures were taken on 2026-05-20 using `Authorization: Bearer <key>`
 authentication against the relay's `chat/completions` surface.
 
 The capture corpus lives at
-`packages/inference-discovery-openai/wire/opencode-zen/`. The
+`packages/inference-discovery-openai/sessions/opencode-zen/`. The
 model-to-capability matrix is authoritatively defined in the
 `SUPPORT_MATRIX` export of `@intx/inference-discovery/catalog`
 (`packages/inference-discovery/src/catalog/support-matrix.ts`).
@@ -27,20 +27,14 @@ The fixtures are the ground truth: where the docs and the wire
 disagree, the wire wins. This document is the narrative companion
 to those bytes.
 
-The originally-committed corpus held thirty-three capture
-directories spanning text (streaming and non-streaming), function
-calling (single-turn and multi-turn), reasoning (streaming and
-non-streaming), and vision input across five models: `kimi-k2.6`,
-`glm-5.1`, `deepseek-v4-pro`, `qwen3.6-plus`, and `mimo-v2-omni`.
-Vision input was captured for the three models that `SUPPORT_MATRIX`
-marks as vision-capable; the other two have non-captured outcomes
-recorded for vision-input and the discover CLI filters them out of
-its run set. Subsequent work added structured-output coverage on
-the `/zen/v1` tier for `gpt-5.4-mini`, `kimi-k2.6`, `glm-5.1`, and
-`qwen3.6-plus` (`deepseek-v4-pro` and `mimo-v2-omni` are not routed
-on the v1 tier and carry `http-error` rows). The current matrix is
-the authoritative inventory; this narrative is provenance for the
-original campaign and does not enumerate later additions.
+The originally-committed corpus held captures across five models
+(`kimi-k2.6`, `glm-5.1`, `deepseek-v4-pro`, `qwen3.6-plus`,
+`mimo-v2-omni`). Later inventory expansions added structured-output
+coverage, kimi-k3 / kimi-k2.7-code / gpt-5.4-mini, and replaced the
+retired glm-5.1 / qwen3.6-plus / mimo-v2-omni line with glm-5.2 /
+qwen3.7-plus / mimo-v2.5 plus deepseek-v4-flash. The current matrix
+is the authoritative inventory; sections below for retired model ids
+remain as provenance for the original campaign.
 The companion taxonomy document at
 `docs/INFERENCE.md` (the "Generalized Multimodal Taxonomy" section)
 generalises these observations into the cross-provider abstractions
@@ -53,36 +47,32 @@ The per-(model, capability) behaviors documented below are the
 _narrative_ layer. The _canonical_ representation is the typed
 `SUPPORT_MATRIX` exported from `@intx/inference-discovery/catalog`
 (`packages/inference-discovery/src/catalog/support-matrix.ts`).
-Tooling — the discovery rig, INTR-79's compat-replay layer, and any
+Tooling — the discovery rig, the session parser-regression, and any
 future readers — must consume the matrix programmatically, not parse
 this prose. When this document and the matrix disagree, the matrix
 wins.
 
 ## Models in scope
 
-The five models in scope and the capability classes captured for
-each, derived from the `SUPPORT_MATRIX` export of
-`@intx/inference-discovery/catalog`
-(`packages/inference-discovery/src/catalog/support-matrix.ts`):
+Current inventory is defined by `SUPPORT_MATRIX` (not this table).
+Representative fixture-bearing models after the INTR-384 expansion:
 
-| Model             | Vendor         | text | functionCalling | reasoning | vision |
-| ----------------- | -------------- | ---- | --------------- | --------- | ------ |
-| `kimi-k2.6`       | Moonshot       | yes  | yes             | yes       | yes    |
-| `glm-5.1`         | Z.AI (zhipuai) | yes  | yes             | yes       | no     |
-| `deepseek-v4-pro` | DeepSeek       | yes  | yes             | yes       | no     |
-| `qwen3.6-plus`    | Alibaba        | yes  | yes             | yes       | yes    |
-| `mimo-v2-omni`    | Xiaomi MiMo    | yes  | yes             | yes       | yes    |
+| Model               | Notes                                   |
+| ------------------- | --------------------------------------- |
+| `kimi-k2.6`         | Full + structured-output                |
+| `kimi-k3`           | Full + structured-output                |
+| `kimi-k2.7-code`    | Full + structured-output                |
+| `qwen3.7-plus`      | Full + structured-output                |
+| `mimo-v2.5`         | Full + structured-output                |
+| `glm-5.2`           | Non-vision core + structured-output     |
+| `deepseek-v4-pro`   | Non-vision core; SO/vision `http-error` |
+| `deepseek-v4-flash` | Non-vision core; SO `http-error`        |
+| `gpt-5.4-mini`      | Structured-output only                  |
 
-The `vision: false` entries for `glm-5.1` and `deepseek-v4-pro` are
-recorded in `SUPPORT_MATRIX` as deliberate non-captures: `glm-5.1`
-carries `outcome: "refused"` because the model's probe returned
-HTTP 200 with a textual refusal ("Please provide an image so I can
-describe it for you") rather than a real description, and
-`deepseek-v4-pro` carries `outcome: "http-error"` because
-submitting an OpenAI-style multimodal `messages[].content` array
-elicits HTTP 400 `invalid_request_error: unknown variant
-'image_url'`. The discover CLI filters non-captured entries out of
-its run set, so no HTTP request is dispatched for either pair.
+`deepseek-v4-pro` vision remains `http-error` (unknown `image_url`
+variant). Structured-output probes for deepseek models on the
+configured tier return provider routing/upstream errors and stay
+`http-error` with notes.
 
 ## kimi-k2.6 (Moonshot)
 
@@ -110,14 +100,14 @@ the request.
 
 Text and vision captures route through what the response identifies
 as the Moonshot AI backend. The non-streaming text response
-(`packages/inference-discovery-openai/wire/opencode-zen/kimi-k2.6/plain-text/response.json`)
+(`packages/inference-discovery-openai/sessions/opencode-zen/kimi-k2.6/plain-text/exchanges/0/response.json`)
 carries `model: "moonshotai/kimi-k2.6-20260420"`, `provider:
 "Moonshot AI"`, a `system_fingerprint`, a `native_finish_reason`
 mirroring `finish_reason`, and a message envelope with `refusal:
 null`, `reasoning: "..."` (no `_content` suffix), and a parallel
 `reasoning_details: [{type: "reasoning.text", text, format: "unknown",
 index: 0}]` array. The vision capture
-(`packages/inference-discovery-openai/wire/opencode-zen/kimi-k2.6/vision-input/response.json`)
+(`packages/inference-discovery-openai/sessions/opencode-zen/kimi-k2.6/vision-input/exchanges/0/response.json`)
 has the same shape, with the relay flattening the multimodal
 response back to a plain string in `choices[0].message.content`
 rather than a content-parts array. Vision token cost surfaces as
@@ -129,7 +119,7 @@ Function-calling and reasoning captures route through what the
 response identifies as the Fireworks backend
 (`accounts/fireworks/models/kimi-k2p6`). The single-turn
 function-calling response
-(`packages/inference-discovery-openai/wire/opencode-zen/kimi-k2.6/function-calling/response.json`)
+(`packages/inference-discovery-openai/sessions/opencode-zen/kimi-k2.6/function-calling/exchanges/0/response.json`)
 uses `reasoning_content` rather than `reasoning`, omits `provider`
 and `system_fingerprint`, adds `prompt_token_ids` at the top level
 and `token_ids` per choice, and each `tool_calls[]` entry carries
@@ -138,10 +128,10 @@ nested `function.name`. The `tool_calls[].id` follows a
 function-name-keyed scheme (`functions.getCurrentWeather:0`) rather
 than the `call_<hash>` convention seen elsewhere. The reasoning
 non-streaming response
-(`packages/inference-discovery-openai/wire/opencode-zen/kimi-k2.6/reasoning-content/response.json`)
+(`packages/inference-discovery-openai/sessions/opencode-zen/kimi-k2.6/reasoning-content/exchanges/0/response.json`)
 similarly carries `reasoning_content` on the message and is shaped
 like the function-calling response. The streaming counterpart at
-`packages/inference-discovery-openai/wire/opencode-zen/kimi-k2.6/reasoning-content-streaming/response.sse`
+`packages/inference-discovery-openai/sessions/opencode-zen/kimi-k2.6/reasoning-content-streaming/exchanges/0/response.sse`
 emits `choices[0].delta.reasoning_content` deltas (no `content` key
 during the reasoning phase), then transitions to
 `choices[0].delta.content` deltas for the visible answer, terminates
@@ -151,11 +141,11 @@ trailing `data: {"choices":[],"cost":"0"}` follows the `[DONE]`
 sentinel.
 
 The streaming text response
-(`packages/inference-discovery-openai/wire/opencode-zen/kimi-k2.6/plain-text-streaming/response.sse`)
+(`packages/inference-discovery-openai/sessions/opencode-zen/kimi-k2.6/plain-text-streaming/exchanges/0/response.sse`)
 routes through the Fireworks backend and ends with the same
 `data: [DONE]\n\ndata: {"choices":[],"cost":"0"}` trailer. The
 multi-turn function-calling capture
-(`packages/inference-discovery-openai/wire/opencode-zen/kimi-k2.6/function-calling-multi-turn/turn-2/request.json`)
+(`packages/inference-discovery-openai/sessions/opencode-zen/kimi-k2.6/function-calling-multi-turn/exchanges/1/request.json`)
 echoes the turn-1 assistant message verbatim, including
 `reasoning_content`, before appending the `role: "tool"` response
 and re-sending the tool definitions; turn 2 succeeds and returns a
@@ -210,7 +200,7 @@ output.
 The relay surfaces `glm-5.1` consistently across all four captured
 capabilities: every response carries `model: "frank/GLM-5.1"` and
 the same message envelope. The non-streaming text response
-(`packages/inference-discovery-openai/wire/opencode-zen/glm-5.1/plain-text/response.json`)
+((historical fixture path for `glm-5.1`, since retired from the matrix))
 returns a single choice with
 `message: {role, content, reasoning_content, name: null,
 tool_calls: []}`. `usage` includes an `estimated_cost: 0` field that
@@ -218,21 +208,21 @@ no other vendor in this corpus emits, plus
 `prompt_tokens_details.cache_write_tokens: null`.
 
 The function-calling single-turn response
-(`packages/inference-discovery-openai/wire/opencode-zen/glm-5.1/function-calling/response.json`)
+((historical fixture path for `glm-5.1`, since retired from the matrix))
 keeps the `message.name: null` slot and adds a non-empty
 `tool_calls` array. Each `tool_calls[]` entry omits the `index` key
 that the other tool-calling vendors include, and the `id` follows a
 short `call_<4-hex>` form (`call_6b0b`) rather than the longer
 opaque IDs the other vendors emit. The multi-turn turn-2 request
-(`packages/inference-discovery-openai/wire/opencode-zen/glm-5.1/function-calling-multi-turn/turn-2/request.json`)
+((historical fixture path for `glm-5.1`, since retired from the matrix))
 echoes the assistant message verbatim, including the spurious
 `name: null` slot, and turn 2 succeeds with `finish_reason: "stop"`.
 
 The reasoning non-streaming response
-(`packages/inference-discovery-openai/wire/opencode-zen/glm-5.1/reasoning-content/response.json`)
+((historical fixture path for `glm-5.1`, since retired from the matrix))
 carries `message.reasoning_content` matching the documented thinking
 mode. The streaming counterpart
-(`packages/inference-discovery-openai/wire/opencode-zen/glm-5.1/reasoning-content-streaming/response.sse`)
+((historical fixture path for `glm-5.1`, since retired from the matrix))
 emits `delta.reasoning_content` deltas without a `content` key
 during the reasoning phase, then transitions to `delta.content`
 deltas, and terminates with the same `data: [DONE]` plus trailing
@@ -263,13 +253,11 @@ non-streaming responses.
   identifiers (`frank/GLM-5.1` for non-streaming,
   `accounts/fireworks/models/glm-5p1` for streaming). The shape is
   the same, but the upstream-identifier metadata is not.
-- The `SUPPORT_MATRIX` entry for `glm-5.1` vision-input carries
-  `outcome: "refused"` because the model's probe returned an HTTP
-  200 textual refusal rather than describing the image. The
-  discover CLI filters non-captured entries out of its run set, so
-  no HTTP request is dispatched. No fixture under
-  `packages/inference-discovery-openai/wire/opencode-zen/glm-5.1/` exists
-  for vision-input.
+- A historical `SUPPORT_MATRIX` entry for `glm-5.1` vision-input
+  carried `outcome: "refused"` because the model's probe returned an
+  HTTP 200 textual refusal rather than describing the image. That
+  model id has since been retired from the matrix; no current fixture
+  exists for that pair.
 
 ## deepseek-v4-pro (DeepSeek)
 
@@ -293,18 +281,18 @@ captured capabilities: every response carries
 `model: "deepseek-v4-pro"`, the same `system_fingerprint`
 (`fp_9954b31ca7_prod0820_fp8_kvcache_20260402`), and the same
 message envelope shape. The non-streaming text response
-(`packages/inference-discovery-openai/wire/opencode-zen/deepseek-v4-pro/plain-text/response.json`)
+(`packages/inference-discovery-openai/sessions/opencode-zen/deepseek-v4-pro/plain-text/exchanges/0/response.json`)
 returns `message: {role, content, reasoning_content}` plus a `logprobs:
 null` slot at the choice level. `usage` carries DeepSeek-specific
 fields `prompt_cache_hit_tokens` and `prompt_cache_miss_tokens`
 alongside `completion_tokens_details.reasoning_tokens`.
 
 The function-calling single-turn response
-(`packages/inference-discovery-openai/wire/opencode-zen/deepseek-v4-pro/function-calling/response.json`)
+(`packages/inference-discovery-openai/sessions/opencode-zen/deepseek-v4-pro/function-calling/exchanges/0/response.json`)
 adds `tool_calls` to the message envelope; each `tool_calls[]` entry
 includes an `index` integer and the `id` follows a long opaque form
 (`call_00_KR3pk4MS8NfIg90cJ3997058`). The multi-turn turn-2 request
-(`packages/inference-discovery-openai/wire/opencode-zen/deepseek-v4-pro/function-calling-multi-turn/turn-2/request.json`)
+(`packages/inference-discovery-openai/sessions/opencode-zen/deepseek-v4-pro/function-calling-multi-turn/exchanges/1/request.json`)
 forwards the verbatim turn-1 assistant message — including
 `reasoning_content`, which the DeepSeek docs mandate — and turn 2
 returns a natural-language answer with `finish_reason: "stop"`. The
@@ -319,10 +307,10 @@ assistant message into turn-2 for every model so the same code path
 handles every vendor's contract.
 
 The reasoning non-streaming response
-(`packages/inference-discovery-openai/wire/opencode-zen/deepseek-v4-pro/reasoning-content/response.json`)
+(`packages/inference-discovery-openai/sessions/opencode-zen/deepseek-v4-pro/reasoning-content/exchanges/0/response.json`)
 matches the documented `message.reasoning_content` shape. The
 streaming counterpart
-(`packages/inference-discovery-openai/wire/opencode-zen/deepseek-v4-pro/reasoning-content-streaming/response.sse`)
+(`packages/inference-discovery-openai/sessions/opencode-zen/deepseek-v4-pro/reasoning-content-streaming/exchanges/0/response.sse`)
 emits `delta: {content: null, reasoning_content: "..."}` chunks
 during the reasoning phase (the explicit `content: null` is always
 present alongside reasoning) and `delta: {content: "...",
@@ -355,7 +343,7 @@ ends with `data: [DONE]\n\ndata: {"choices":[],"cost":"0"}`.
   `invalid_request_error: "unknown variant 'image_url', expected
 'text'"`. The model's content path validates that user content
   must be a string. No vision fixture exists under
-  `packages/inference-discovery-openai/wire/opencode-zen/deepseek-v4-pro/`.
+  `packages/inference-discovery-openai/sessions/opencode-zen/deepseek-v4-pro/`.
 - The `data: {"choices":[],"cost":"0"}` post-`[DONE]` trailer
   applies here as it does for every other model in the corpus.
 
@@ -383,7 +371,7 @@ differs from the OpenAI convention — `choices` appears before
 `id`, `cost` — but the field set is OpenAI-compatible.
 
 The non-streaming text response
-(`packages/inference-discovery-openai/wire/opencode-zen/qwen3.6-plus/plain-text/response.json`)
+((historical fixture path for `qwen3.6-plus`, since retired from the matrix))
 returns `message: {content, reasoning_content, role}` with
 `reasoning_content` populated even on a single-word reply.
 `usage.completion_tokens_details` carries both
@@ -392,18 +380,18 @@ returns `message: {content, reasoning_content, role}` with
 breakdown (echoed as `image_tokens` in the vision capture).
 
 The function-calling single-turn response
-(`packages/inference-discovery-openai/wire/opencode-zen/qwen3.6-plus/function-calling/response.json`)
+((historical fixture path for `qwen3.6-plus`, since retired from the matrix))
 adds a `tool_calls` array whose entries carry `index`, `id` (long
 opaque `call_<24-hex>`), `type`, and `function`. The multi-turn
 turn-2 request
-(`packages/inference-discovery-openai/wire/opencode-zen/qwen3.6-plus/function-calling-multi-turn/turn-2/request.json`)
+((historical fixture path for `qwen3.6-plus`, since retired from the matrix))
 forwards the verbatim turn-1 assistant message, and turn 2 returns
 a natural-language answer with `finish_reason: "stop"`.
 
 The reasoning non-streaming response
-(`packages/inference-discovery-openai/wire/opencode-zen/qwen3.6-plus/reasoning-content/response.json`)
+((historical fixture path for `qwen3.6-plus`, since retired from the matrix))
 matches the documented shape. The streaming counterpart
-(`packages/inference-discovery-openai/wire/opencode-zen/qwen3.6-plus/reasoning-content-streaming/response.sse`)
+((historical fixture path for `qwen3.6-plus`, since retired from the matrix))
 emits `delta: {content: null, reasoning_content: "...", role:
 "assistant"}` for the first chunk, then varies between including
 `content: null` and omitting it across the rest of the reasoning
@@ -413,7 +401,7 @@ phase. The terminal chunk records
 `data: [DONE]\n\ndata: {"choices":[],"cost":"0"}`.
 
 The vision input response
-(`packages/inference-discovery-openai/wire/opencode-zen/qwen3.6-plus/vision-input/response.json`)
+((historical fixture path for `qwen3.6-plus`, since retired from the matrix))
 accepts the OpenAI multimodal request shape — a `content` array
 with a `{type: "text"}` part and a `{type: "image_url", image_url:
 {url}}` part where the URL is a `data:image/jpeg;base64,...`
@@ -462,14 +450,14 @@ and `cost`. There is no `system_fingerprint` and no `provider`
 field.
 
 The non-streaming text response
-(`packages/inference-discovery-openai/wire/opencode-zen/mimo-v2-omni/plain-text/response.json`)
+((historical fixture path for `mimo-v2-omni`, since retired from the matrix))
 returns `message: {content, role, tool_calls, reasoning_content}`
 where `tool_calls` is explicitly `null` on a plain text turn.
 `usage.completion_tokens_details.reasoning_tokens` is reported
 alongside `prompt_tokens_details.cached_tokens`.
 
 The function-calling single-turn response
-(`packages/inference-discovery-openai/wire/opencode-zen/mimo-v2-omni/function-calling/response.json`)
+((historical fixture path for `mimo-v2-omni`, since retired from the matrix))
 is the only capture in the corpus where
 `choices[0].message.content` is `null` rather than the empty string
 the other four vendors emit. Each `tool_calls[]` entry omits the
@@ -478,15 +466,15 @@ the other four vendors emit. Each `tool_calls[]` entry omits the
 follows a long opaque form (`call_125d361901104aea96ee1d44`).
 `reasoning_content` is emitted alongside the tool call. The
 multi-turn turn-2 request
-(`packages/inference-discovery-openai/wire/opencode-zen/mimo-v2-omni/function-calling-multi-turn/turn-2/request.json`)
+((historical fixture path for `mimo-v2-omni`, since retired from the matrix))
 forwards the verbatim turn-1 assistant message, and turn 2 returns
 a natural-language answer with `finish_reason: "stop"`.
 
 The reasoning non-streaming response
-(`packages/inference-discovery-openai/wire/opencode-zen/mimo-v2-omni/reasoning-content/response.json`)
+((historical fixture path for `mimo-v2-omni`, since retired from the matrix))
 matches the documented `reasoning_content` shape, with
 `tool_calls: null` slotted alongside it. The streaming counterpart
-(`packages/inference-discovery-openai/wire/opencode-zen/mimo-v2-omni/reasoning-content-streaming/response.sse`)
+((historical fixture path for `mimo-v2-omni`, since retired from the matrix))
 emits the most verbose delta shape of any model in the corpus —
 every delta carries `content`, `role`, `tool_calls`, and
 `reasoning_content` keys, with `content: null`, `role: null`,
@@ -496,7 +484,7 @@ The terminal usage chunk records
 with `data: [DONE]\n\ndata: {"choices":[],"cost":"0"}`.
 
 The vision input response
-(`packages/inference-discovery-openai/wire/opencode-zen/mimo-v2-omni/vision-input/response.json`)
+((historical fixture path for `mimo-v2-omni`, since retired from the matrix))
 accepts the OpenAI multimodal request shape and returns a
 single-string `message.content` plus `reasoning_content`. Image
 cost is reported in `usage.prompt_tokens_details.image_tokens` and
@@ -618,11 +606,11 @@ capture; the relay flattens any multimodal response back to plain
 text on the way out, and consumers will not see content-parts
 arrays in the response. Image cost is reported in
 `usage.prompt_tokens_details.image_tokens` (or vendor-specific
-sibling fields). `glm-5.1` and `deepseek-v4-pro` are not
-vision-capable on this relay; their `SUPPORT_MATRIX` entries for
-vision-input carry non-captured outcomes (`refused` and
-`http-error` respectively) and the discover CLI filters them out
-of its run set, so no capture is attempted against them.
+sibling fields). `deepseek-v4-pro` is not vision-capable on this relay; its
+`SUPPORT_MATRIX` entry for vision-input is `http-error` and the
+discover CLI filters it out of the run set. `glm-5.1` historically
+carried a vision `refused` row and has since been retired from the
+matrix.
 
 **Authentication is `Authorization: Bearer <key>`.** Every
 captured request carries this header; in the fixtures the value is

@@ -13,7 +13,9 @@ import {
   dequeueToProcessing,
   markConsumed,
   parseEventSeq,
+  readCommittedWorkflowRunLifecycle,
   readOwnedMessageIds,
+  readWorkflowRunLifecycle,
   replayProcessingToInbox,
   WORKFLOW_RUN_GITIGNORE_PATH,
   WORKFLOW_RUN_RUNS_PREFIX,
@@ -1033,6 +1035,74 @@ describe("workflowRunKindHandler.validatePush — CancelRequested principal-vs-o
     });
     expect(r.ok).toBe(true);
   });
+
+  test("accepts a workflow-process write that carries a supervisor-signed CancelRequested forward unchanged", async () => {
+    // The origin-vs-signer rule is a WRITE-TIME check on the commit that
+    // authors the CancelRequested. A run's own cascade write of RunCancelled
+    // is signed workflow-process and re-lists the whole events prefix, carrying
+    // the earlier supervisor-signed CancelRequested forward byte-for-byte. The
+    // handler must accept that; re-checking the carried-forward cancel's origin
+    // against the cascade write's signer would reject a legitimate terminal.
+    const cancel = eventBody(1, "CancelRequested", {
+      origin: "supervisor-operator",
+      reason: "cancel",
+    });
+    const prior = {
+      [`${WORKFLOW_RUN_RUNS_PREFIX}/run-a/events/0.json`]: eventBody(
+        0,
+        "RunStarted",
+      ),
+      [`${WORKFLOW_RUN_RUNS_PREFIX}/run-a/events/1.json`]: cancel,
+    };
+    const r = await validate(
+      {
+        [WORKFLOW_RUN_GITIGNORE_PATH]: "",
+        ...prior,
+        [`${WORKFLOW_RUN_RUNS_PREFIX}/run-a/events/2.json`]: eventBody(
+          2,
+          "RunCancelled",
+        ),
+      },
+      { principal: WORKFLOW_PROCESS_PRINCIPAL, priorFiles: prior },
+    );
+    expect(r.ok).toBe(true);
+  });
+
+  test("still rejects a workflow-process write that mutates a carried-forward CancelRequested", async () => {
+    // The carry-forward exemption is gated strictly on the blob being absent
+    // from the prior tree; a byte-DIVERGED carried-forward CancelRequested is
+    // not a carry-forward, so the append-only byte-equality check rejects it
+    // before the origin exemption is even reached.
+    const prior = {
+      [`${WORKFLOW_RUN_RUNS_PREFIX}/run-a/events/0.json`]: eventBody(
+        0,
+        "RunStarted",
+      ),
+      [`${WORKFLOW_RUN_RUNS_PREFIX}/run-a/events/1.json`]: eventBody(
+        1,
+        "CancelRequested",
+        { origin: "supervisor-operator", reason: "cancel" },
+      ),
+    };
+    const r = await validate(
+      {
+        [WORKFLOW_RUN_GITIGNORE_PATH]: "",
+        [`${WORKFLOW_RUN_RUNS_PREFIX}/run-a/events/0.json`]: eventBody(
+          0,
+          "RunStarted",
+        ),
+        [`${WORKFLOW_RUN_RUNS_PREFIX}/run-a/events/1.json`]: eventBody(
+          1,
+          "CancelRequested",
+          { origin: "supervisor-operator", reason: "tampered" },
+        ),
+      },
+      { principal: WORKFLOW_PROCESS_PRINCIPAL, priorFiles: prior },
+    );
+    expect(r.ok).toBe(false);
+    if (r.ok) throw new Error("unreachable");
+    expect(r.reason).toMatch(/append-only/);
+  });
 });
 
 describe("workflowRunKindHandler.validatePush — append-only via prior-tree", () => {
@@ -1938,6 +2008,8 @@ describe("claim-check API — enqueueInbox", () => {
       receivedAt: 100,
       mailAuditRef: { store: "audit", path: "mail/msg-1" },
     });
+    expect(result.outcome).toBe("enqueued");
+    if (result.outcome !== "enqueued") throw new Error("expected enqueued");
     expect(result.inboxKey).toBe("100-msg-1");
     expect(result.envelope.messageId).toBe("msg-1");
 
@@ -1984,7 +2056,7 @@ describe("claim-check API — enqueueInbox", () => {
     expect(entries.sort()).toEqual(["100-msg-1.json", "200-msg-2.json"]);
   });
 
-  test("rejects an enqueue against a messageId already in processing", async () => {
+  test("returns already-present for a messageId already in processing", async () => {
     const { store, repoId, principal } =
       await makeClaimCheckStore("cc-enq-dup-");
     await enqueueInbox(store, principal, repoId, {
@@ -1994,14 +2066,16 @@ describe("claim-check API — enqueueInbox", () => {
       mailAuditRef: { store: "audit", path: "mail/msg-1" },
     });
     await dequeueToProcessing(store, principal, repoId, ADDRESS);
-    await expect(
-      enqueueInbox(store, principal, repoId, {
-        address: ADDRESS,
-        messageId: "msg-1",
-        receivedAt: 300,
-        mailAuditRef: { store: "audit", path: "mail/msg-1" },
-      }),
-    ).rejects.toThrow(/claim_check_already_processing/);
+    const outcome = await enqueueInbox(store, principal, repoId, {
+      address: ADDRESS,
+      messageId: "msg-1",
+      receivedAt: 300,
+      mailAuditRef: { store: "audit", path: "mail/msg-1" },
+    });
+    expect(outcome).toEqual({
+      outcome: "already-present",
+      reason: "processing",
+    });
   });
 });
 
@@ -2243,6 +2317,70 @@ describe("claim-check API — resume-owned processing entries survive replay", (
     expect(owned.has("done")).toBe(false);
   });
 
+  test("readWorkflowRunLifecycle distinguishes grants-only, live, and terminal logs", async () => {
+    const { store, repoId, principal } =
+      await makeClaimCheckStore("cc-lifecycle-");
+    await store.writeTree(principal, repoId, "refs/heads/main", {
+      files: {
+        [`${WORKFLOW_RUN_RUNS_PREFIX}/staged/grants.json`]: JSON.stringify({
+          stepGrants: [],
+        }),
+        [`${WORKFLOW_RUN_RUNS_PREFIX}/live/events/0.json`]:
+          runStartedBody("live-message"),
+        [`${WORKFLOW_RUN_RUNS_PREFIX}/done/events/0.json`]:
+          runStartedBody("done-message"),
+        [`${WORKFLOW_RUN_RUNS_PREFIX}/done/events/1.json`]: runCompletedBody(1),
+      },
+      message: "seed lifecycle states",
+    });
+
+    await expect(
+      readWorkflowRunLifecycle(store, repoId, "missing"),
+    ).resolves.toBe("absent");
+    await expect(
+      readWorkflowRunLifecycle(store, repoId, "staged"),
+    ).resolves.toBe("absent");
+    await expect(readWorkflowRunLifecycle(store, repoId, "live")).resolves.toBe(
+      "live",
+    );
+    await expect(readWorkflowRunLifecycle(store, repoId, "done")).resolves.toBe(
+      "terminal",
+    );
+  });
+
+  test("readCommittedWorkflowRunLifecycle reads the Git ref without a checkout", async () => {
+    const reads = {
+      async listDir(dirPath: string) {
+        if (dirPath === "runs/stable") {
+          return [{ name: "events", oid: "events", type: "tree" as const }];
+        }
+        if (dirPath === "runs/stable/events") {
+          return [
+            { name: "0.json", oid: "started", type: "blob" as const },
+            { name: "1.json", oid: "terminal", type: "blob" as const },
+          ];
+        }
+        return [];
+      },
+      async readBlobByOid(oid: string) {
+        return new TextEncoder().encode(
+          JSON.stringify(
+            oid === "terminal"
+              ? { type: "RunCompleted", seq: 1 }
+              : { type: "RunStarted", seq: 0 },
+          ),
+        );
+      },
+    };
+
+    await expect(
+      readCommittedWorkflowRunLifecycle(reads, "stable"),
+    ).resolves.toBe("terminal");
+    await expect(
+      readCommittedWorkflowRunLifecycle(reads, "missing"),
+    ).resolves.toBe("absent");
+  });
+
   test("a CancelRequested-without-finalizer run is still owned (its message stays suppressed)", async () => {
     const { store, repoId, principal } = await makeClaimCheckStore(
       "cc-owned-cancelling-",
@@ -2423,11 +2561,11 @@ describe("claim-check API — resume-owned processing entries survive replay", (
 // The validatePush atomicity Set was keyed by kind, so two inbox
 // entries with the same messageId and different receivedAt produced
 // a single-element {"inbox"} Set and did not trip the check.
-// After the fix, the second enqueue throws claim_check_already_inbox
-// and the inbox directory holds exactly one entry.
+// After the fix, the second enqueue is caught as already-present
+// (reason "already_inbox") and the inbox directory holds exactly one entry.
 
 describe("claim-check API — enqueueInbox per-messageId atomicity in inbox", () => {
-  test("rejects a second enqueue for the same messageId at a different receivedAt", async () => {
+  test("returns already-present for a second enqueue of the same messageId at a different receivedAt", async () => {
     const { store, repoId, principal } =
       await makeClaimCheckStore("cc-enq-dup-inbox-");
     await enqueueInbox(store, principal, repoId, {
@@ -2436,14 +2574,16 @@ describe("claim-check API — enqueueInbox per-messageId atomicity in inbox", ()
       receivedAt: 100,
       mailAuditRef: { store: "audit", path: "mail/X" },
     });
-    await expect(
-      enqueueInbox(store, principal, repoId, {
-        address: ADDRESS,
-        messageId: "msg-X",
-        receivedAt: 200,
-        mailAuditRef: { store: "audit", path: "mail/X" },
-      }),
-    ).rejects.toThrow(/claim_check_already_inbox/);
+    const outcome = await enqueueInbox(store, principal, repoId, {
+      address: ADDRESS,
+      messageId: "msg-X",
+      receivedAt: 200,
+      mailAuditRef: { store: "audit", path: "mail/X" },
+    });
+    expect(outcome).toEqual({
+      outcome: "already-present",
+      reason: "already_inbox",
+    });
     const repoDir = store.getRepoDir(repoId);
     const inboxDir = path.join(
       repoDir,
@@ -2453,7 +2593,7 @@ describe("claim-check API — enqueueInbox per-messageId atomicity in inbox", ()
     expect(entries.sort()).toEqual(["100-msg-X.json"]);
   });
 
-  test("rejects a duplicate enqueue for the same messageId at the same receivedAt", async () => {
+  test("returns already-present for a duplicate enqueue of the same messageId at the same receivedAt", async () => {
     const { store, repoId, principal } =
       await makeClaimCheckStore("cc-enq-dup-key-");
     await enqueueInbox(store, principal, repoId, {
@@ -2462,14 +2602,16 @@ describe("claim-check API — enqueueInbox per-messageId atomicity in inbox", ()
       receivedAt: 100,
       mailAuditRef: { store: "audit", path: "mail/D" },
     });
-    await expect(
-      enqueueInbox(store, principal, repoId, {
-        address: ADDRESS,
-        messageId: "msg-D",
-        receivedAt: 100,
-        mailAuditRef: { store: "audit", path: "mail/D" },
-      }),
-    ).rejects.toThrow(/claim_check_duplicate_inbox/);
+    const outcome = await enqueueInbox(store, principal, repoId, {
+      address: ADDRESS,
+      messageId: "msg-D",
+      receivedAt: 100,
+      mailAuditRef: { store: "audit", path: "mail/D" },
+    });
+    expect(outcome).toEqual({
+      outcome: "already-present",
+      reason: "duplicate",
+    });
   });
 });
 
@@ -2598,6 +2740,9 @@ describe("workflow-run substrate — per-commit pack validation", () => {
         mailAuditRef: { store: "audit", path: "mail/msg-1" },
       },
     );
+    if (enqueueResult.outcome !== "enqueued") {
+      throw new Error("expected enqueued outcome");
+    }
     const dequeued = await dequeueToProcessing(
       sourceStore,
       HUB_PRINCIPAL,
@@ -3632,15 +3777,14 @@ describe("claim-check API — retention watermark exactly-once + bounded", () =>
     // Re-submit the same messageId still within the window (its
     // consumed/ entry is retained). receivedAt is a fresh, later value
     // but >= watermark, so the stale-reject does NOT fire; the
-    // consumed-dedup does.
-    await expect(
-      enqueueInbox(store, principal, repoId, {
-        address: ADDRESS,
-        messageId: "msg-1",
-        receivedAt: 3000,
-        mailAuditRef: { store: "audit", path: "mail/msg-1" },
-      }),
-    ).rejects.toThrow(/claim_check_already_consumed/);
+    // consumed-dedup does, surfacing as an already-present outcome.
+    const outcome = await enqueueInbox(store, principal, repoId, {
+      address: ADDRESS,
+      messageId: "msg-1",
+      receivedAt: 3000,
+      mailAuditRef: { store: "audit", path: "mail/msg-1" },
+    });
+    expect(outcome).toEqual({ outcome: "already-present", reason: "consumed" });
   });
 
   // Gate 1(b): a message whose receivedAt is below the watermark (its
@@ -3705,6 +3849,8 @@ describe("claim-check API — retention watermark exactly-once + bounded", () =>
       receivedAt: 100_500,
       mailAuditRef: { store: "audit", path: "mail/msg-fresh" },
     });
+    expect(r.outcome).toBe("enqueued");
+    if (r.outcome !== "enqueued") throw new Error("expected enqueued");
     expect(r.inboxKey).toBe("100500-msg-fresh");
   });
 
@@ -3901,7 +4047,8 @@ describe("claim-check API — retention watermark exactly-once + bounded", () =>
 
     // 5. No double-process: nothing remains to dequeue, and a
     //    re-enqueue of the same content (fresh receivedAt >= watermark)
-    //    is now deduped by the retained consumed entry.
+    //    is now deduped by the retained consumed entry, surfacing as an
+    //    already-present outcome.
     const drained = await dequeueToProcessing(
       store,
       principal,
@@ -3909,14 +4056,13 @@ describe("claim-check API — retention watermark exactly-once + bounded", () =>
       ADDRESS,
     );
     expect(drained).toBeNull();
-    await expect(
-      enqueueInbox(store, principal, repoId, {
-        address: ADDRESS,
-        messageId: "inflight",
-        receivedAt: 102_000,
-        mailAuditRef: { store: "audit", path: "mail/inflight" },
-      }),
-    ).rejects.toThrow(/claim_check_already_consumed/);
+    const outcome = await enqueueInbox(store, principal, repoId, {
+      address: ADDRESS,
+      messageId: "inflight",
+      receivedAt: 102_000,
+      mailAuditRef: { store: "audit", path: "mail/inflight" },
+    });
+    expect(outcome).toEqual({ outcome: "already-present", reason: "consumed" });
   });
 });
 

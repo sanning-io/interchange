@@ -51,7 +51,7 @@ const SNAPSHOT: ApprovalSnapshot = {
 type ParkedEntry = {
   runId: string;
   correlationId: string;
-  kind: "approval";
+  parkKind: "approval";
   snapshot: ApprovalSnapshot;
 };
 
@@ -59,7 +59,7 @@ function registrationFor(entry: ParkedEntry): SuspensionRegistration {
   return {
     runId: entry.runId,
     correlationId: entry.correlationId,
-    kind: entry.kind,
+    kind: entry.parkKind,
     deploymentId: DEPLOYMENT_ID,
     agentAddress: AGENT_ADDRESS,
     approvalSnapshot: entry.snapshot,
@@ -368,6 +368,7 @@ async function setup(opts: {
     stepOrder: ["step-1"],
     definitionHash: "def-hash",
     warmKeep: false,
+
     onInferenceEvent: () => undefined,
   });
 
@@ -409,13 +410,13 @@ describe("supervisor reEmitParkedCorrelations", () => {
       {
         runId: "run-a",
         correlationId: "corr-a",
-        kind: "approval",
+        parkKind: "approval",
         snapshot: SNAPSHOT,
       },
       {
         runId: "run-b",
         correlationId: "corr-b",
-        kind: "approval",
+        parkKind: "approval",
         snapshot: SNAPSHOT,
       },
     ];
@@ -439,7 +440,7 @@ describe("supervisor reEmitParkedCorrelations", () => {
     const recycled: ParkedEntry = {
       runId: "run-c",
       correlationId: "corr-c",
-      kind: "approval",
+      parkKind: "approval",
       snapshot: SNAPSHOT,
     };
     harness.nextReply.current = [recycled];
@@ -473,7 +474,7 @@ describe("supervisor reEmitParkedCorrelations", () => {
     const parked: ParkedEntry = {
       runId: "run-x",
       correlationId: "corr-x",
-      kind: "approval",
+      parkKind: "approval",
       snapshot: SNAPSHOT,
     };
     harness.nextReply.current = [parked];
@@ -522,7 +523,7 @@ describe("supervisor reEmitParkedCorrelations", () => {
       {
         runId: "run-x",
         correlationId: "corr-x",
-        kind: "approval",
+        parkKind: "approval",
         snapshot: SNAPSHOT,
       },
     ];

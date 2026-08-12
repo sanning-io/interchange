@@ -111,7 +111,18 @@ describe("step suspend retry crash-resume", () => {
     const invokeStep: StepInvoker = async (req) => {
       invocations.push(req);
       if (req.resume === undefined) {
-        return { suspend: { correlationId: "corr-1" } };
+        return {
+          suspend: {
+            correlationId: "corr-1",
+            kind: "approval",
+            approvalSnapshot: {
+              name: "gate",
+              description: "gate",
+              inputSchema: { type: "object" },
+              arguments: {},
+            },
+          },
+        };
       }
       return { output: { reply: "done", turn: replyTurn } };
     };
@@ -220,6 +231,7 @@ describe("step suspend retry crash-resume", () => {
     expect(resumeInvocation.resume).toEqual({
       correlationId: "corr-1",
       decision: { outcome: "approved" },
+      kind: "approval",
     });
 
     // The step completes with the resume re-invocation reply.

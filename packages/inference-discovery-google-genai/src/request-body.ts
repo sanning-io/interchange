@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import {
+  CapabilityNotBuildableError,
   resolveMediaPath,
   type Capability,
   type CapabilityIntent,
@@ -7,14 +8,21 @@ import {
   type ToolDecl,
 } from "@intx/inference-discovery/catalog";
 
-// gemini-2.5-pro shares gemini-2.5-flash's text capability surface, so both are
-// recognized as text models; only their thinking-budget handling differs (pro
-// cannot disable thinking — see minimalThinkingBudget).
-const TEXT_MODELS: ReadonlySet<string> = new Set([
+// Text models share the full multimodal text capability surface; only
+// thinking-budget handling differs for models that cannot disable thinking
+// (see minimalThinkingBudget). Image models are output-only.
+export const TEXT_MODELS: ReadonlySet<string> = new Set([
   "gemini-2.5-flash",
   "gemini-2.5-pro",
+  "gemini-3.6-flash",
+  "gemini-3.5-flash",
+  "gemini-3-flash-preview",
+  "gemini-3.1-pro-preview",
 ]);
-const IMAGE_MODEL = "gemini-2.5-flash-image";
+export const IMAGE_MODELS: ReadonlySet<string> = new Set([
+  "gemini-2.5-flash-image",
+  "gemini-3.1-flash-image",
+]);
 
 const TEXT_MODEL_CAPABILITIES: ReadonlySet<Capability> = new Set<Capability>([
   "plain-text",
@@ -139,24 +147,47 @@ interface GeminiRequestBody {
   generationConfig?: GeminiGenerationConfig;
 }
 
-function modelSupportsCapability(model: string, capability: Capability): void {
-  if (TEXT_MODELS.has(model)) {
-    if (!TEXT_MODEL_CAPABILITIES.has(capability)) {
-      throw new Error(
-        `google-genai: model ${model} does not support capability ${capability}`,
-      );
-    }
-    return;
+// The two request shapes google-genai builds. A model's class selects its
+// capability surface (text is multimodal-in/text-out; image is output-only) and
+// its request body. Known models classify by set membership; a model absent
+// from both sets is classified by the caller-supplied override, defaulting to
+// text so an unknown chat model is probeable without being pre-registered. This
+// is deliberately not a gate: discovery must reach models the sets do not yet
+// list. An unknown image model needs its class declared, because its request
+// shape cannot be inferred from identity.
+export type GeminiModelClass = "text" | "image";
+
+function classifyModel(
+  model: string,
+  override: GeminiModelClass | undefined,
+): GeminiModelClass {
+  if (TEXT_MODELS.has(model)) return "text";
+  if (IMAGE_MODELS.has(model)) return "image";
+  return override ?? "text";
+}
+
+// True when the model's class is known from set membership, so its request
+// shape is not a guess. A caller (the probe) uses this to tell an operator when
+// it is defaulting an unknown model to the text class rather than classifying a
+// known one — the default is deliberate, but it should never be silent.
+export function isKnownModel(model: string): boolean {
+  return TEXT_MODELS.has(model) || IMAGE_MODELS.has(model);
+}
+
+function assertCapabilityBuildable(
+  model: string,
+  capability: Capability,
+  modelClass: GeminiModelClass | undefined,
+): void {
+  const resolved = classifyModel(model, modelClass);
+  const supported =
+    resolved === "image" ? IMAGE_MODEL_CAPABILITIES : TEXT_MODEL_CAPABILITIES;
+  if (!supported.has(capability)) {
+    throw new CapabilityNotBuildableError(
+      capability,
+      `google-genai: ${resolved}-class model ${model} does not support capability ${capability}`,
+    );
   }
-  if (model === IMAGE_MODEL) {
-    if (!IMAGE_MODEL_CAPABILITIES.has(capability)) {
-      throw new Error(
-        `google-genai: model ${model} does not support capability ${capability}`,
-      );
-    }
-    return;
-  }
-  throw new Error(`google-genai: unknown model ${model}`);
 }
 
 function extensionFor(path: string): string {
@@ -244,6 +275,8 @@ const DYNAMIC_THINKING_BUDGET = -1;
 // API rejects a zero thinking budget.
 const THINKING_MANDATORY_MODELS: ReadonlySet<string> = new Set([
   "gemini-2.5-pro",
+  "gemini-3.6-flash",
+  "gemini-3.1-pro-preview",
 ]);
 
 // The thinking budget to request when a probe wants thinking suppressed: 0
@@ -399,8 +432,9 @@ export function buildRequestBody(opts: {
   model: string;
   capability: Capability;
   intent: CapabilityIntent;
+  modelClass?: GeminiModelClass | undefined;
 }): GeminiRequestBody {
-  modelSupportsCapability(opts.model, opts.capability);
+  assertCapabilityBuildable(opts.model, opts.capability, opts.modelClass);
 
   switch (opts.capability) {
     case "plain-text":
@@ -453,7 +487,9 @@ export function buildRequestBody(opts: {
     case "reasoning-content-streaming":
     case "redacted-thinking":
     case "redacted-thinking-streaming":
-      throw new Error(
+    case "structured-output-refusal-streaming":
+      throw new CapabilityNotBuildableError(
+        opts.capability,
         `google-genai: capability ${opts.capability} is not supported by any google-genai model`,
       );
     default: {

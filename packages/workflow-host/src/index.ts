@@ -13,9 +13,12 @@ export {
 } from "./adapters/step-invoker";
 export {
   createWorkflowSpawnChild,
+  createWorkflowSpawnSuspendableChild,
   type ChildTerminalStatus,
   type RunChildWorkflow,
+  type RunSuspendableChild,
   type WorkflowSpawnChildOpts,
+  type WorkflowSpawnSuspendableChildOpts,
 } from "./adapters/spawn-child";
 export {
   createWorkflowSupervisor,
@@ -30,7 +33,6 @@ export {
   DEFAULT_DRAIN_TIMEOUT_MS,
   DEFAULT_KILL_TIMEOUT_MS,
   DEFAULT_POLICY_INTERVAL_MS,
-  DEFAULT_TERMINAL_WRITE_WATCHDOG_MS,
   MAX_BUFFERED_MAIL,
   STEP_GRANTS_PATH,
   STEP_GRANTS_REF,
@@ -144,6 +146,7 @@ export {
   type CreateChildSubstrateWriteBridgeOpts,
   type CreateProxyWorkflowRunRepoStoreOpts,
   type CredentialsSnapshotRef,
+  type CredentialWiring,
   type DiscoverRunsOpts,
   type DiscoveredRun,
   type DrainController,

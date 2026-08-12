@@ -8,6 +8,7 @@ import {
 } from "bun:test";
 
 import {
+  AmbiguousCredentialError,
   resolveCredentialById,
   resolveCredentialByName,
   resolveCredentialRequirement,
@@ -309,6 +310,7 @@ describe.skipIf(!harnessDbEnvAvailable())(
           id: "prv_1",
           tenantId: "tnt_leaf",
           name: "github",
+          apiBaseUrl: "https://api.github.com",
         });
         await seedPrincipal(h.db, { id: "prn_user", tenantId: "tnt_leaf" });
         await seedCredential(h.db, {
@@ -332,7 +334,11 @@ describe.skipIf(!harnessDbEnvAvailable())(
           null,
           null,
         );
-        expect(got?.id).toBe("cred_tenant");
+        expect(got?.credential.id).toBe("cred_tenant");
+        // The resolved provider is surfaced alongside the credential, including
+        // the API origin an origin-pinned credential authenticates to.
+        expect(got?.provider.id).toBe("prv_1");
+        expect(got?.provider.apiBaseUrl).toBe("https://api.github.com");
       });
 
       test("source creator matches the creator's credential", async () => {
@@ -358,7 +364,7 @@ describe.skipIf(!harnessDbEnvAvailable())(
           "prn_creator",
           "prn_invoker",
         );
-        expect(got?.id).toBe("cred_creator");
+        expect(got?.credential.id).toBe("cred_creator");
       });
 
       test("source invoker matches the invoker's credential", async () => {
@@ -384,7 +390,7 @@ describe.skipIf(!harnessDbEnvAvailable())(
           "prn_creator",
           "prn_invoker",
         );
-        expect(got?.id).toBe("cred_invoker");
+        expect(got?.credential.id).toBe("cred_invoker");
       });
 
       test("matches when the credential covers every required scope", async () => {
@@ -409,7 +415,7 @@ describe.skipIf(!harnessDbEnvAvailable())(
           null,
           null,
         );
-        expect(got?.id).toBe("cred_1");
+        expect(got?.credential.id).toBe("cred_1");
       });
 
       test("returns null when the credential lacks a required scope", async () => {
@@ -483,15 +489,26 @@ describe.skipIf(!harnessDbEnvAvailable())(
           name: "cred-b",
           principalId: null,
         });
-        await expect(
-          resolveCredentialRequirement(
+        // The throw is a typed AmbiguousCredentialError, not a bare Error, so a
+        // caller can catch *this* condition without also swallowing the DB
+        // faults the resolver can raise first.
+        let caught: unknown;
+        try {
+          await resolveCredentialRequirement(
             h.db,
             "tnt_leaf",
             { providerName: "github", source: "tenant" },
             null,
             null,
-          ),
-        ).rejects.toThrow(/Ambiguous credential match/);
+          );
+        } catch (e) {
+          caught = e;
+        }
+        expect(caught).toBeInstanceOf(AmbiguousCredentialError);
+        if (!(caught instanceof Error)) {
+          throw new Error("expected the ambiguity rejection to be an Error");
+        }
+        expect(caught.message).toMatch(/Ambiguous credential match/);
       });
 
       test("disambiguates by name when supplied", async () => {
@@ -522,7 +539,7 @@ describe.skipIf(!harnessDbEnvAvailable())(
           null,
           null,
         );
-        expect(got?.id).toBe("cred_b");
+        expect(got?.credential.id).toBe("cred_b");
       });
 
       test("inherits a matching credential from an ancestor tenant", async () => {
@@ -549,7 +566,7 @@ describe.skipIf(!harnessDbEnvAvailable())(
           null,
           null,
         );
-        expect(got?.id).toBe("cred_root");
+        expect(got?.credential.id).toBe("cred_root");
       });
     });
   },

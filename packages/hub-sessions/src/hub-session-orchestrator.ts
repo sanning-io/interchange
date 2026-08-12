@@ -13,7 +13,7 @@
 import { eq } from "drizzle-orm";
 import { type } from "arktype";
 import type { DB } from "@intx/db";
-import { agentInstance, workflowDeployment } from "@intx/db/schema";
+import { workflowRun } from "@intx/db/schema";
 import { parseMailToEmail } from "@intx/mime";
 import { parseInferenceEvent } from "@intx/types/runtime";
 import { getLogger } from "@intx/log";
@@ -22,11 +22,7 @@ import { isWorkflowDerivedAddress } from "@intx/workflow-deploy";
 import type { AgentRepoStore } from "./agent-repo";
 import type { EventCollectorRegistry } from "./event-collector-registry";
 import type { SidecarEventEmitter } from "./ws/sidecar-events";
-import {
-  findInstance,
-  parseAgentId,
-  requireInstance,
-} from "./hub-session-lookups";
+import { parseAgentId, resolveRoutableAddress } from "./hub-session-lookups";
 
 const log = getLogger(["hub", "orchestrator"]);
 
@@ -99,67 +95,84 @@ export function createHubSessionOrchestrator(
   );
 
   unsubscribers.push(
-    events.on("agent.deploy.ack", async ({ agentAddress, publicKey }) => {
+    events.on("agent.deploy.ack", async (event) => {
+      const { agentAddress, publicKey, allocated } = event;
+      // Exclusive initialization publishes its key only after every deploy
+      // and asset pack succeeds under the allocation generation fence.
+      if (allocated !== undefined) return;
+
       // Workflow-derived addresses (the deployment-level
       // `ins_<deploymentId>@<domain>` and the per-step
       // `ins_<deploymentId>-<stepId>@<domain>`) have no agent_instance row;
-      // their public key lives on the workflow_deployment projection row,
+      // their public key lives on the deployment's anchor workflow_run row,
       // keyed by address. Persist it there so the reconnect ownership
-      // challenge can verify the deployment address. Only the
-      // deployment-level address has a row, so a stray per-step ack updates
-      // nothing. (This was previously a no-op, which is what left
-      // workflow-deployment addresses un-verifiable on reconnect.)
+      // challenge can verify the deployment address off the same row
+      // `lookupPublicKey` reads. Only the deployment-level address has an
+      // anchor run, so a stray per-step ack updates nothing.
       if (isWorkflowDerivedAddress(agentAddress)) {
         await db
-          .update(workflowDeployment)
+          .update(workflowRun)
           .set({ publicKey })
-          .where(eq(workflowDeployment.address, agentAddress));
+          .where(eq(workflowRun.address, agentAddress));
         return;
       }
-      // A launched agent has an agent_instance row; a missing one is a bug
-      // to surface, not to drop silently.
-      const instance = await findInstance(db, agentAddress);
-      if (instance === undefined) {
+      // A plain address is backed by a folded workflow_run; persist the acked
+      // key on it. A missing endpoint is a bug to surface, not to drop.
+      const endpoint = await resolveRoutableAddress(db, agentAddress);
+      if (endpoint === undefined) {
         throw new Error(
-          `No active instance found for deploy ack on address "${agentAddress}"`,
+          `No active endpoint found for deploy ack on address "${agentAddress}"`,
         );
       }
       await db
-        .update(agentInstance)
+        .update(workflowRun)
         .set({ publicKey })
-        .where(eq(agentInstance.id, instance.id));
+        .where(eq(workflowRun.id, endpoint.id));
     }),
   );
 
   unsubscribers.push(
     events.on("agent.reconnected", async ({ agentAddress }) => {
-      const instance = await requireInstance(db, agentAddress);
-
-      if (!instance.sessionId) {
+      // A plain address is backed by a folded workflow_run; resolve it. A
+      // missing endpoint is a bug to surface, not to drop.
+      const endpoint = await resolveRoutableAddress(db, agentAddress);
+      if (endpoint === undefined) {
+        throw new Error(
+          `No active endpoint found for reconnect on address "${agentAddress}"`,
+        );
+      }
+      // A leaked or terminal folded run is deliberately kept routable (terminal
+      // status, null endedAt) so it stays reachable to inspect or clean up. A
+      // run resolves its session live-only, so once that session has ended it
+      // has no session to collect into. Keep the address routable (return
+      // rather than throw, which would roll the just-verified address back out
+      // of routing) and restore no collector; no status flip either, since a
+      // folded run is born running and a failed -> running flip would claim a
+      // running session that does not exist.
+      if (endpoint.status !== "running") {
+        return;
+      }
+      if (endpoint.sessionId === null) {
         throw new Error(
           `Agent "${agentAddress}" reconnected but has no active session`,
         );
       }
-      const sessionId = instance.sessionId;
+      const sessionId = endpoint.sessionId;
 
       // A supervised deployment carries its grants and sources in the
       // deploy pack and refreshes them over the supervisor's IPC
       // credentials snapshot at spawn and recycle, so reconnect does not
       // re-push them over the wire.
 
-      const now = new Date();
-      if (instance.status !== "running") {
-        await db
-          .update(agentInstance)
-          .set({ status: "running", updatedAt: now })
-          .where(eq(agentInstance.id, instance.id));
-      }
+      // Restore the inference-turn collector. It records turns under endpoint.id
+      // -- a folded run id -- which inference_turn.instanceId stores without a
+      // foreign key.
       if (!eventCollectors.has(agentAddress)) {
         eventCollectors.create(
           agentAddress,
-          instance.tenantId,
+          endpoint.tenantId,
           sessionId,
-          instance.id,
+          endpoint.id,
         );
         log.info(
           "Restored event collector for reconnected agent {agentAddress}",

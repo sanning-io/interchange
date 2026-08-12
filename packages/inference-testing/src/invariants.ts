@@ -1,7 +1,7 @@
 // Invariant checks over a computed `InferenceEvent[]` produced by replaying
 // a captured fixture through `runInference`. Each invariant is a property
 // that must hold for any well-formed call, regardless of provider; the
-// compat-replay layer applies the full list uniformly.
+// session parser regression applies the full list uniformly.
 //
 // Invariants are ordered foundational-first: schema validity comes before
 // everything else, since the higher-level checks build on the assumption
@@ -39,7 +39,7 @@ export type InvariantViolation = {
  * A property check over a computed `InferenceEvent[]`. Returns an array
  * of violations (empty when the property holds). Implementations should
  * surface every violation they find, not stop at the first, so a single
- * compat-replay pass reveals everything wrong with a fixture rather than
+ * parser-regression pass reveals everything wrong with a fixture rather than
  * forcing fix-and-rerun cycles.
  */
 export type Invariant = {
@@ -80,7 +80,7 @@ export function formatEventBrief(event: InferenceEvent): string {
     case "inference.thinking.delta":
     case "inference.refusal.delta":
       return `${head} { token: ${abbreviateString(event.data.token)} }`;
-    case "inference.thinking.signature":
+    case "inference.block.signature":
       return `${head} { signature: ${abbreviateString(event.data.signature)} }`;
     case "inference.thinking.redacted":
       return `${head} { redactedThinking: <${String(event.data.redactedThinking.data.length)} chars> }`;
@@ -117,6 +117,8 @@ export function formatEventBrief(event: InferenceEvent): string {
     }
     case "inference.citation":
       return `${head} { citation: { citedText: ${abbreviateString(event.data.citation.citedText)} } }`;
+    case "inference.safety_rating":
+      return `${head} { safetyRating: { blockReason: ${JSON.stringify(event.data.safetyRating.blockReason)} } }`;
     case "inference.tool_call.start":
       return `${head} { callId: ${JSON.stringify(event.data.callId)}, name: ${JSON.stringify(event.data.name)} }`;
     case "inference.tool_call.delta":
@@ -129,46 +131,34 @@ export function formatEventBrief(event: InferenceEvent): string {
 }
 
 // ---------------------------------------------------------------------------
-// clusterKeyFor — groups events for the index-density check
+// blockOpenerIndex — the block-opener status and index of an event
 //
-// "Block-type cluster" is the set of events that route to the same logical
-// content block. Different content kinds get separate clusters; tool calls
-// are correlated by `callId` since the wire emits one block per call but
-// each call's deltas should land contiguously.
+// A content block is opened at a wire index by exactly one event kind: a
+// text/thinking/refusal/redacted delta, a tool_call.start, an image_output,
+// or a code_execution start/result. Each carries the block's index (or none,
+// in single-block streams that omit indices). Events that do NOT open a
+// block return `{ opener: false }`: block.signature (a zero-width attribution
+// marker validated by signature_precedence), tool_call.delta/end (they extend
+// an already-open call), and the terminal/usage/citation events.
 // ---------------------------------------------------------------------------
 
-function clusterKeyFor(event: InferenceEvent): string | null {
-  switch (event.type) {
-    case "inference.text.delta":
-      return "text";
-    case "inference.refusal.delta":
-      return "refusal";
-    case "inference.thinking.delta":
-    case "inference.thinking.signature":
-    case "inference.thinking.redacted":
-      return "thinking";
-    case "inference.tool_call.start":
-    case "inference.tool_call.delta":
-    case "inference.tool_call.end":
-      return `tool_call:${event.data.callId}`;
-    default:
-      return null;
-  }
-}
+type BlockOpener =
+  | { opener: true; index: number | undefined }
+  | { opener: false };
 
-function eventIndex(event: InferenceEvent): number | undefined {
+function blockOpenerIndex(event: InferenceEvent): BlockOpener {
   switch (event.type) {
     case "inference.text.delta":
-    case "inference.refusal.delta":
     case "inference.thinking.delta":
-    case "inference.thinking.signature":
+    case "inference.refusal.delta":
     case "inference.thinking.redacted":
     case "inference.tool_call.start":
-    case "inference.tool_call.delta":
-    case "inference.tool_call.end":
-      return event.data.index;
+    case "inference.image_output":
+    case "inference.code_execution.start":
+    case "inference.code_execution.result":
+      return { opener: true, index: event.data.index };
     default:
-      return undefined;
+      return { opener: false };
   }
 }
 
@@ -391,6 +381,7 @@ const recognizedContentBlocks: Invariant = {
       "video",
       "document",
       "citation",
+      "safety_rating",
       "code_execution_request",
       "code_execution_result",
       "tool_call",
@@ -483,84 +474,85 @@ const redactedThinkingDataNonEmpty: Invariant = {
 };
 
 const indexDensity: Invariant = {
-  // For each block-type cluster, if any event in the cluster carries an
-  // `index`, all events in that cluster must carry one and the index set
-  // must be dense from 0 (no gaps). Streams that omit `index` entirely
-  // are legal (single-block scenarios) and skip the check for that
-  // cluster.
+  // Block openers must be consistently indexed across the whole turn: if
+  // any block opener carries an `index`, they all must. Single-block
+  // streams that omit indices entirely are legal; a stream that indexes
+  // some block openers but not others is a mixed-mode wire violation.
+  //
+  // Whether the indexed set is gap-free (dense from 0) is deliberately NOT
+  // checked here: block indices are provider-assigned, and an adapter that
+  // echoes wire content-block indices can legitimately skip indices for
+  // block kinds it does not decode, so density-from-0 is not a universal
+  // property.
   name: "index_density",
   check(events) {
-    const clusters = new Map<
-      string,
-      { withIndex: Set<number>; missingIndexAt: number[] }
-    >();
+    const withIndex = new Set<number>();
+    const missingIndexAt: number[] = [];
     events.forEach((event, idx) => {
-      const cluster = clusterKeyFor(event);
-      if (cluster === null) return;
-      const eIdx = eventIndex(event);
-      const entry = clusters.get(cluster) ?? {
-        withIndex: new Set<number>(),
-        missingIndexAt: [],
-      };
-      if (eIdx === undefined) {
-        entry.missingIndexAt.push(idx);
+      const opener = blockOpenerIndex(event);
+      if (!opener.opener) return;
+      if (opener.index === undefined) {
+        missingIndexAt.push(idx);
       } else {
-        entry.withIndex.add(eIdx);
+        withIndex.add(opener.index);
       }
-      clusters.set(cluster, entry);
     });
     const violations: InvariantViolation[] = [];
-    for (const [cluster, entry] of clusters) {
-      if (entry.withIndex.size === 0) continue; // no indices used in this cluster
-      // Some events carry index, others don't — mixed-mode failure.
-      if (entry.missingIndexAt.length > 0) {
-        violations.push({
-          invariant: "index_density",
-          message: `cluster "${cluster}" mixes events with and without index (events without index at indices ${entry.missingIndexAt.join(", ")})`,
-          events: entry.missingIndexAt,
-        });
-        continue;
-      }
-      // All events have index — check density.
-      const sorted = [...entry.withIndex].sort((a, b) => a - b);
-      for (let i = 0; i < sorted.length; i++) {
-        if (sorted[i] !== i) {
-          violations.push({
-            invariant: "index_density",
-            message: `cluster "${cluster}" indices are not dense from 0: observed ${sorted.join(", ")}`,
-            events: [],
-          });
-          break;
-        }
-      }
+    if (withIndex.size === 0) return violations; // single-block: no indices
+    if (missingIndexAt.length > 0) {
+      violations.push({
+        invariant: "index_density",
+        message: `block openers mix events with and without index (events without index at positions ${missingIndexAt.join(", ")})`,
+        events: missingIndexAt,
+      });
     }
     return violations;
   },
 };
 
+// A signature authenticates the block at its index. The block must
+// have been opened earlier in the stream by one of the signable-block
+// openers: a thinking/text delta, or one of the atomic starts
+// (tool_call, image, code_execution).
+function opensSignableBlockAt(
+  event: InferenceEvent,
+  index: number | undefined,
+): boolean {
+  switch (event.type) {
+    case "inference.thinking.delta":
+    case "inference.text.delta":
+    case "inference.tool_call.start":
+    case "inference.image_output":
+    case "inference.code_execution.start":
+      return event.data.index === index;
+    default:
+      return false;
+  }
+}
+
 const signaturePrecedence: Invariant = {
   name: "signature_precedence",
   check(events) {
     const violations: InvariantViolation[] = [];
-    // For each thinking signature, scan backwards for a thinking.delta
-    // with the same index (or undefined index, single-block scenarios).
+    // For each block signature, scan backwards for the event that
+    // opened a signable block at the same index (single-block scenarios
+    // pair an undefined index against an undefined-index opener).
     events.forEach((event, sigIdx) => {
-      if (event.type !== "inference.thinking.signature") return;
+      if (event.type !== "inference.block.signature") return;
       const sigIndex = event.data.index;
-      let foundDelta = false;
+      let foundOpener = false;
       for (let j = sigIdx - 1; j >= 0; j--) {
         const e = events[j];
         if (e === undefined) continue;
-        if (e.type !== "inference.thinking.delta") continue;
-        if (e.data.index === sigIndex) {
-          foundDelta = true;
+        if (opensSignableBlockAt(e, sigIndex)) {
+          foundOpener = true;
           break;
         }
       }
-      if (!foundDelta) {
+      if (!foundOpener) {
         violations.push({
           invariant: "signature_precedence",
-          message: `inference.thinking.signature at index ${String(sigIdx)} (index=${String(sigIndex)}) has no preceding inference.thinking.delta with the same index`,
+          message: `inference.block.signature at position ${String(sigIdx)} (index=${String(sigIndex)}) has no preceding block-opening event at the same index`,
           events: [sigIdx],
         });
       }
@@ -570,7 +562,7 @@ const signaturePrecedence: Invariant = {
 };
 
 /**
- * The canonical list applied by the compat-replay layer. Ordered
+ * The canonical list applied by the session parser regression. Ordered
  * foundational-first: schema_validity catches structural problems before
  * the higher-level checks build on potentially-garbage events.
  */

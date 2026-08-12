@@ -98,7 +98,18 @@ describe("step suspend crash-resume", () => {
     const invokeStep: StepInvoker = async (req) => {
       invocations.push(req);
       if (req.resume === undefined) {
-        return { suspend: { correlationId: "corr-1" } };
+        return {
+          suspend: {
+            correlationId: "corr-1",
+            kind: "approval",
+            approvalSnapshot: {
+              name: "gate",
+              description: "gate",
+              inputSchema: { type: "object" },
+              arguments: {},
+            },
+          },
+        };
       }
       return { output: { reply: "done", turn: replyTurn } };
     };
@@ -162,6 +173,7 @@ describe("step suspend crash-resume", () => {
     expect(invocations[0]?.resume).toEqual({
       correlationId: "corr-1",
       decision: { outcome: "approved" },
+      kind: "approval",
     });
 
     // The step completes with the RE-INVOCATION reply, not the raw payload.

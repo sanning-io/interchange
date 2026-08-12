@@ -1,15 +1,14 @@
-import { type SQL, eq, and } from "drizzle-orm";
+import { type SQL, eq, and, inArray, isNotNull, isNull } from "drizzle-orm";
 import { Hono } from "hono";
 import { describeRoute, resolver } from "hono-openapi";
 
-import { agent, agentInstance, principal } from "@intx/db/schema";
+import { principal, workflowDefinition, workflowRun } from "@intx/db/schema";
 import { parsePrincipalRow } from "@intx/db";
 import type { DB } from "@intx/db";
 import {
   UserProfile,
   PrincipalSummary,
-  AgentSummary,
-  InstanceSummary,
+  WorkflowRunSummary,
   SessionSummary,
   ApprovalSummary,
   ErrorResponse,
@@ -188,19 +187,19 @@ export function createMeRoutes({ db }: CreateMeRoutesDeps): Hono<AppEnv> {
   );
 
   app.get(
-    "/agents",
+    "/workflows/runs",
     describeRoute({
       tags: ["User"],
-      summary: "List agents across all tenants",
+      summary: "List running workflow runs across all tenants",
       description:
-        "Aggregates agents from all tenants the user belongs to. Each result is tagged with tenantId.",
+        "Aggregates running workflow runs from all tenants the user belongs to. Each result is tagged with tenantId.",
       parameters: [...pageParameters],
       responses: {
         200: {
-          description: "Agents across tenants",
+          description: "Runs across tenants",
           content: {
             "application/json": {
-              schema: resolver(paginatedSchema(AgentSummary)),
+              schema: resolver(paginatedSchema(WorkflowRunSummary)),
             },
           },
         },
@@ -231,121 +230,62 @@ export function createMeRoutes({ db }: CreateMeRoutesDeps): Hono<AppEnv> {
       }
 
       const tenants = await db.query.tenant.findMany({
-        where: (t, { inArray }) => inArray(t.id, tenantIds),
+        where: (t) => inArray(t.id, tenantIds),
       });
       const tenantMap = new Map(tenants.map((t) => [t.id, t]));
 
-      const conditions: SQL[] = [];
-      if (cursor) {
-        conditions.push(cursorCondition(agent.createdAt, agent.id, cursor));
-      }
-
-      const rows = await db.query.agent.findMany({
-        where: (a, { inArray }) =>
-          and(inArray(a.tenantId, tenantIds), ...conditions),
-        orderBy: pageOrder(agent.createdAt, agent.id),
-        limit,
-      });
-
-      const items = rows.map((a) => ({
-        id: a.id,
-        tenantId: a.tenantId,
-        tenantName: tenantMap.get(a.tenantId)?.name ?? "Unknown",
-        name: a.name,
-        description: a.description ?? null,
-        status: a.status as "deployed" | "stopped" | "updating" | "error",
-      }));
-
-      return c.json(paginatedResponse(items, rows, limit));
-    },
-  );
-
-  app.get(
-    "/instances",
-    describeRoute({
-      tags: ["User"],
-      summary: "List running agent instances across all tenants",
-      description:
-        "Aggregates running agent instances from all tenants the user belongs to. Each result is tagged with tenantId.",
-      parameters: [...pageParameters],
-      responses: {
-        200: {
-          description: "Instances across tenants",
-          content: {
-            "application/json": {
-              schema: resolver(paginatedSchema(InstanceSummary)),
-            },
-          },
-        },
-      },
-    }),
-    async (c) => {
-      const user = c.get("user");
-      if (!user) {
-        return c.json(
-          {
-            error: { code: "unauthorized", message: "Authentication required" },
-          },
-          401,
-        );
-      }
-      const { limit, cursor } = parsePageParams({
-        cursor: c.req.query("cursor"),
-        limit: c.req.query("limit"),
-      });
-
-      const principals = await db.query.principal.findMany({
-        where: and(eq(principal.kind, "user"), eq(principal.refId, user.id)),
-      });
-
-      const tenantIds = principals.map((p) => p.tenantId);
-      if (tenantIds.length === 0) {
-        return c.json({ data: [], nextCursor: null });
-      }
-
-      const tenants = await db.query.tenant.findMany({
-        where: (t, { inArray }) => inArray(t.id, tenantIds),
-      });
-      const tenantMap = new Map(tenants.map((t) => [t.id, t]));
-
-      const conditions: SQL[] = [eq(agentInstance.status, "running")];
+      // The runs a launch produces directly: born running, with a routable
+      // address and no deployment. Deployment-anchor runs (which own a
+      // deployment id) and address-less child runs belong to the
+      // workflow-deploy surface, not this view.
+      const conditions: SQL[] = [
+        eq(workflowRun.status, "running"),
+        isNotNull(workflowRun.address),
+        isNull(workflowRun.deploymentId),
+      ];
       if (cursor) {
         conditions.push(
-          cursorCondition(agentInstance.createdAt, agentInstance.id, cursor),
+          cursorCondition(workflowRun.createdAt, workflowRun.id, cursor),
         );
       }
 
-      const rows = await db.query.agentInstance.findMany({
-        where: (ai, { inArray }) =>
-          and(inArray(ai.tenantId, tenantIds), ...conditions),
-        orderBy: pageOrder(agentInstance.createdAt, agentInstance.id),
-        limit,
+      const rows = await db
+        .select({
+          id: workflowRun.id,
+          tenantId: workflowRun.tenantId,
+          definitionId: workflowRun.definitionId,
+          address: workflowRun.address,
+          createdAt: workflowRun.createdAt,
+          definitionName: workflowDefinition.name,
+        })
+        .from(workflowRun)
+        .innerJoin(
+          workflowDefinition,
+          eq(workflowRun.definitionId, workflowDefinition.id),
+        )
+        .where(and(inArray(workflowRun.tenantId, tenantIds), ...conditions))
+        .orderBy(...pageOrder(workflowRun.createdAt, workflowRun.id))
+        .limit(limit);
+
+      const items = rows.map((r) => {
+        // The address filter above guarantees a value; a null here is a broken
+        // invariant, so surface it rather than emit a run with no address.
+        if (r.address === null) {
+          throw new Error(
+            `running run ${r.id} matched the non-null-address filter but has a null address`,
+          );
+        }
+        return {
+          id: r.id,
+          tenantId: r.tenantId,
+          tenantName: tenantMap.get(r.tenantId)?.name ?? "Unknown",
+          definitionId: r.definitionId,
+          definitionName: r.definitionName,
+          address: r.address,
+          status: "running" as const,
+          createdAt: ts(r.createdAt),
+        };
       });
-
-      const agentIds = [...new Set(rows.map((r) => r.agentId))];
-      const agents =
-        agentIds.length > 0
-          ? await db.query.agent.findMany({
-              where: (a, { inArray }) => inArray(a.id, agentIds),
-            })
-          : [];
-      const agentMap = new Map(agents.map((a) => [a.id, a]));
-
-      const items = rows.map((r) => ({
-        id: r.id,
-        tenantId: r.tenantId,
-        tenantName: tenantMap.get(r.tenantId)?.name ?? "Unknown",
-        agentId: r.agentId,
-        agentName: agentMap.get(r.agentId)?.name ?? "Unknown",
-        address: r.address,
-        status: r.status as
-          | "deployed"
-          | "running"
-          | "updating"
-          | "error"
-          | "stopped",
-        createdAt: ts(r.createdAt),
-      }));
 
       return c.json(paginatedResponse(items, rows, limit));
     },

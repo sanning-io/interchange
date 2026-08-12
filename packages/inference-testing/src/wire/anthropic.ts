@@ -226,7 +226,7 @@ export function raw(rawSSE: string): Uint8Array {
  * optional signature_delta + stop). The adapter forwards each
  * `thinking_delta` as an `inference.thinking.delta`; when `signature`
  * is supplied, the trailing `signature_delta` becomes an
- * `inference.thinking.signature` and the harness attaches it to the
+ * `inference.block.signature` and the harness attaches it to the
  * final ThinkingBlock.
  *
  * `index` defaults to 0; supply a higher index when interleaving thinking
@@ -318,10 +318,13 @@ export function unknownDelta(index = 0): Uint8Array {
 }
 
 /**
- * Convenience: emit a complete redacted_thinking content block. Anthropic
- * delivers redacted thinking as a one-shot inside `content_block_start`
- * carrying an opaque `data` blob — no delta stream. The block must echo
- * back verbatim on follow-up turns or the API rejects the request.
+ * Convenience: emit a complete redacted_thinking content block. Captured
+ * Anthropic streams deliver each redacted block as a one-shot inside
+ * `content_block_start` carrying an opaque `data` blob — no thinking_delta
+ * stream for redacted blocks. Real streams may open multiple redacted
+ * blocks before text; call this helper once per block with distinct
+ * `index` values. The block must echo back verbatim on follow-up turns
+ * or the API rejects the request.
  *
  * `index` defaults to 0; supply a higher index when interleaving with
  * other content blocks.
@@ -370,7 +373,7 @@ export function serverToolUseBlock(
 /**
  * Inner result shape for `codeExecutionToolResultBlock`. Mirrors
  * Anthropic's `code_execution_result` payload as captured in
- * `wire/anthropic/.../code-execution/response.json`.
+ * `sessions/anthropic/.../code-execution/exchanges/0/response.json`.
  */
 export type AnthropicCodeExecutionResult = {
   stdout?: string;

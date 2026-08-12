@@ -217,6 +217,42 @@ function createStubRepoStore(baseDir: string): RepoStore {
       }
       return { commitSha: "deadbeefcafef00d", newlyTerminalRuns: [] };
     },
+    async openCommittedReads(_principal, repoId, _ref) {
+      // The fake substrate persists commits to the working tree, so back
+      // committed reads with those same files (oid = repo-relative path).
+      // This test drives a single writer with no concurrent flush, so
+      // there is no torn-read window to model -- the adapter's read just
+      // needs a committed-tree view that round-trips what
+      // writeTreePreservingPrefix persisted.
+      const repoDir = path.join(baseDir, repoId.kind, repoId.id);
+      return {
+        async listDir(relPath: string) {
+          let dirents;
+          try {
+            dirents = await fs.readdir(path.join(repoDir, relPath), {
+              withFileTypes: true,
+            });
+          } catch (cause) {
+            if (
+              cause instanceof Error &&
+              "code" in cause &&
+              cause.code === "ENOENT"
+            ) {
+              return [];
+            }
+            throw cause;
+          }
+          return dirents.map((d) => ({
+            name: d.name,
+            oid: path.join(relPath, d.name),
+            type: d.isDirectory() ? "tree" : "blob",
+          }));
+        },
+        async readBlobByOid(oid: string) {
+          return fs.readFile(path.join(repoDir, oid));
+        },
+      };
+    },
   };
   // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- test stub; missing methods surface as a precise failure via the proxy
   return new Proxy(stub as RepoStore, {
@@ -585,6 +621,89 @@ describe("runWorkflowChild", () => {
     expect(result.triggeredRunIds).toEqual(["run-1"]);
     expect(result.finalCredentialsSnapshot).not.toBeNull();
     expect(result.finalCredentialsSnapshot?.steps).toHaveLength(1);
+  });
+
+  test("drops a signal.deliver for a run this child is not driving", async () => {
+    const baseDir = await makeTempDir("child-signal-drop-");
+    const supervisorKeyPair = await generateKeyPair();
+    const childKeyPair = await generateKeyPair();
+    const channelId = generateChannelId();
+    const hmacKey = generateHmacKey();
+    await seedWorkflowDefinition(baseDir, {
+      kind: "workflow",
+      id: "workflow-asset",
+    });
+
+    const supervisorToChild = createMemoryNdjsonStream();
+    const childToSupervisor = createMemoryNdjsonStream();
+    const eventStream = createMemoryFrameStream();
+
+    const env = parseSpawnTimeEnv(
+      makeSpawnEnv({
+        channelId,
+        hmacKeyHex: hexEncode(hmacKey),
+        hostPubKeyHex: hexEncode(supervisorKeyPair.publicKey),
+      }),
+    );
+    const bindings = buildBindings({ baseDir, childKeyPair });
+    const supervisorSender = createControlChannelSender({
+      privateKeySeed: supervisorKeyPair.privateKey,
+      channelId,
+      writer: supervisorToChild.writer,
+    });
+
+    const runPromise = runWorkflowChild({
+      env,
+      controlReader: supervisorToChild.reader,
+      controlWriter: childToSupervisor.writer,
+      eventWriter: eventStream.writer,
+      bindings,
+    });
+
+    let readyLine: string | undefined;
+    for (let i = 0; i < 200 && readyLine === undefined; i += 1) {
+      const flushed = childToSupervisor.flushed();
+      if (flushed.length > 0) readyLine = flushed[0];
+      else await new Promise((r) => setTimeout(r, 5));
+    }
+    expect(readyLine).toBeDefined();
+
+    // No trigger.fire was sent, so "ghost-run" is not in `runsInFlight`.
+    await supervisorSender.send({
+      type: "signal.deliver",
+      data: {
+        runId: "ghost-run",
+        signalName: "go",
+        signalId: "sig-1",
+        payload: { x: 1 },
+      },
+    });
+    // Give a hypothetical non-dropped fire-and-forget deliver time to commit.
+    await new Promise((r) => setTimeout(r, 50));
+    await supervisorSender.send({
+      type: "shutdown",
+      data: { reason: "test done" },
+    });
+    supervisorToChild.close();
+
+    const result = await runPromise;
+    expect(result.triggeredRunIds).toEqual([]);
+
+    // The guard dropped the delivery: no events subtree was written for the
+    // unknown run.
+    const ghostEventsDir = path.join(
+      baseDir,
+      "workflow-run",
+      "deployment-x",
+      "runs",
+      "ghost-run",
+      "events",
+    );
+    const ghostExists = await fs
+      .access(ghostEventsDir)
+      .then(() => true)
+      .catch(() => false);
+    expect(ghostExists).toBe(false);
   });
 
   test("cold path fires cleanupRunStorage once per run at run granularity, never before terminal", async () => {
@@ -2262,7 +2381,7 @@ describe("emitParkNotify", () => {
     const park: WorkflowPark = {
       runId: "run-park",
       correlationId: "corr-42",
-      kind: "approval",
+      parkKind: "approval",
       approvalSnapshot: parkSnapshot,
     };
     await emitParkNotify(sender, park);
@@ -2272,7 +2391,7 @@ describe("emitParkNotify", () => {
         data: {
           runId: "run-park",
           correlationId: "corr-42",
-          kind: "approval",
+          parkKind: "approval",
           snapshot: parkSnapshot,
         },
       },
@@ -2290,7 +2409,7 @@ describe("emitParkNotify", () => {
     await emitParkNotify(sender, {
       runId: "run-park",
       correlationId: "corr-42",
-      kind: "approval",
+      parkKind: "approval",
       approvalSnapshot: parkSnapshot,
     });
   });

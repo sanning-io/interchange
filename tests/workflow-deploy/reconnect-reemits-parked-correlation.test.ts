@@ -84,7 +84,8 @@ import {
 import {
   approval,
   signalCorrelation,
-  workflowDeployment,
+  workflowDefinition,
+  workflowRun,
 } from "@intx/db/schema";
 import { createApp, type GetSession } from "@intx/hub-api";
 import { generateId } from "@intx/hub-common";
@@ -108,7 +109,7 @@ import {
   seedAsset,
   seedPrincipal,
   seedTenants,
-  seedWorkflowDeployment,
+  seedWorkflowRun,
 } from "@intx/test-harness/seed";
 import { defineWorkflow, step, type WorkflowDefinition } from "@intx/workflow";
 import {
@@ -180,6 +181,7 @@ const ASK_GRANT: WireGrantRule = {
 
 const TENANT_ID = "tnt_reconnect_reemit";
 const DEFINITION_ASSET_ID = "ast_reconnect_wf";
+const DEFINITION_ID = "wfd_reconnect_reemit";
 const APPROVER_USER_ID = "usr_reconnect_approver";
 const APPROVER_PRINCIPAL_ID = "prn_reconnect_approver";
 
@@ -189,7 +191,7 @@ let h: TestDb;
 // The deployment mail address and the workflow-run repo slug the supervisor
 // stamps onto the register frame's `deploymentId`. The co-write resolves
 // tenancy by the address and cross-checks the slug, so the seeded
-// `workflow_deployment` row is keyed by the slug with this address.
+// anchor run is keyed by the slug with this address.
 const deploymentMailAddress = deriveDeploymentAddress({
   deploymentId: DEPLOYMENT_ID,
   deploymentDomain: DEPLOYMENT_DOMAIN,
@@ -265,13 +267,14 @@ const approverGrant: GrantRule = {
 
 /**
  * The real hub co-write, mirroring `createHubSessionLookups`'s
- * `registerSignalCorrelation`: resolve tenancy from the deployed
- * `workflow_deployment` the address names, cross-check the frame's
- * `deploymentId` against it, and co-write the `signal_correlation` + `approval`
- * rows in one transaction through the real stores. Wired into the fixture hub's
- * sidecar router so both the suspend-time register and the reconnect re-emit
- * land durable rows on the same schema this test reads. Idempotent via
- * `registerIfAbsent` / `createIfAbsent`, so a re-emit after a delete re-inserts.
+ * `registerSignalCorrelation`: resolve tenancy from the deployment's anchor run
+ * -- the `workflow_run` whose id is the deployment id -- the address names,
+ * cross-check the frame's `deploymentId` against it, and co-write the
+ * `signal_correlation` + `approval` rows in one transaction through the real
+ * stores. Wired into the fixture hub's sidecar router so both the suspend-time
+ * register and the reconnect re-emit land durable rows on the same schema this
+ * test reads. Idempotent via `registerIfAbsent` / `createIfAbsent`, so a re-emit
+ * after a delete re-inserts.
  */
 function createRegisterSignalCorrelation(db: TestDb["db"]) {
   const signalCorrelationStore = createSignalCorrelationStore(db);
@@ -292,31 +295,31 @@ function createRegisterSignalCorrelation(db: TestDb["db"]) {
     kind: "approval";
     approvalSnapshot: ApprovalSnapshot;
   }): Promise<void> => {
-    const deployment = await db
+    const anchor = await db
       .select({
-        id: workflowDeployment.id,
-        tenantId: workflowDeployment.tenantId,
+        id: workflowRun.id,
+        tenantId: workflowRun.tenantId,
       })
-      .from(workflowDeployment)
+      .from(workflowRun)
       .where(
         and(
-          eq(workflowDeployment.address, agentAddress),
-          eq(workflowDeployment.status, "deployed"),
+          eq(workflowRun.address, agentAddress),
+          eq(workflowRun.status, "running"),
         ),
       )
       .limit(1)
       .then((rows) => rows[0]);
-    if (deployment === undefined) {
+    if (anchor === undefined) {
       throw new Error(
-        `No deployed workflow deployment for address "${agentAddress}"; cannot register signal correlation ${correlationId}`,
+        `No running workflow run for address "${agentAddress}"; cannot register signal correlation ${correlationId}`,
       );
     }
-    if (deployment.id !== deploymentId) {
+    if (anchor.id !== deploymentId) {
       throw new Error(
-        `Deployment id mismatch registering signal correlation ${correlationId}: frame claims "${deploymentId}" but address "${agentAddress}" resolves to "${deployment.id}"`,
+        `Deployment id mismatch registering signal correlation ${correlationId}: frame claims "${deploymentId}" but address "${agentAddress}" resolves to "${anchor.id}"`,
       );
     }
-    const tenantId = deployment.tenantId;
+    const tenantId = anchor.tenantId;
     await db.transaction(async (tx) => {
       // Mirror the production co-write: lazily anchor the run before the
       // correlation and approval reference it, so their runId FK resolves.
@@ -325,6 +328,7 @@ function createRegisterSignalCorrelation(db: TestDb["db"]) {
           id: runId,
           deploymentId,
           tenantId,
+          definitionId: DEFINITION_ID,
           principalId: null,
           status: "running",
         },
@@ -420,9 +424,11 @@ describe.skipIf(!harnessDbEnvAvailable())(
       expect(isWorkflowDerivedAddress(deploymentMailAddress)).toBe(false);
 
       // Seed the tenancy the co-write resolves against: a tenant, the workflow
-      // definition asset the deployment references, the deployment row itself
-      // (keyed by the run-repo slug, addressed by the deployment mail address),
-      // and an active approver principal.
+      // definition asset the deployment references, the deployment's anchor run
+      // -- the workflow_run whose id is the deployment slug, addressed by the
+      // deployment mail address, which the co-write resolves tenancy from and
+      // whose id the approval/correlation deployment_id FKs reference -- and an
+      // active approver principal.
       await seedTenants(h.db, [{ id: TENANT_ID }]);
       await seedAsset(h.db, {
         id: DEFINITION_ASSET_ID,
@@ -430,13 +436,20 @@ describe.skipIf(!harnessDbEnvAvailable())(
         kind: "workflow",
         name: "reconnect-reemit-wf",
       });
-      await seedWorkflowDeployment(h.db, {
+      await h.db.insert(workflowDefinition).values({
+        id: DEFINITION_ID,
+        tenantId: TENANT_ID,
+        name: "reconnect-reemit-wf",
+        assetId: DEFINITION_ASSET_ID,
+      });
+      await seedWorkflowRun(h.db, {
         id: deploymentSlug,
         tenantId: TENANT_ID,
-        definitionAssetId: DEFINITION_ASSET_ID,
+        deploymentId: deploymentSlug,
+        definitionId: DEFINITION_ID,
         address: deploymentMailAddress,
         publicKey: null,
-        status: "deployed",
+        status: "running",
       });
       await seedPrincipal(h.db, {
         id: APPROVER_PRINCIPAL_ID,

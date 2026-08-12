@@ -93,6 +93,7 @@ describe("step suspend/resume bridge", () => {
         return {
           suspend: {
             correlationId: "corr-1",
+            kind: "approval",
             approvalSnapshot: suspendSnapshot,
           },
         };
@@ -134,6 +135,7 @@ describe("step suspend/resume bridge", () => {
     expect(invocations[1]?.resume).toEqual({
       correlationId: "corr-1",
       decision: { outcome: "approved" },
+      kind: "approval",
     });
 
     // (iv) The step completes with the REPLY output, not the raw payload.
@@ -163,6 +165,7 @@ describe("step suspend/resume bridge", () => {
         return {
           suspend: {
             correlationId: "corr-A",
+            kind: "approval",
             approvalSnapshot: suspendSnapshot,
           },
         };
@@ -173,6 +176,7 @@ describe("step suspend/resume bridge", () => {
         return {
           suspend: {
             correlationId: "corr-B",
+            kind: "approval",
             approvalSnapshot: suspendSnapshot,
           },
         };

@@ -36,12 +36,14 @@
 
 import { type } from "arktype";
 
-import { hexDecode, hexEncode, SignalKind } from "@intx/types";
+import { hexDecode, hexEncode } from "@intx/types";
 import {
   BoundedApprovalSnapshot,
+  ControlParkKind,
   InferenceSource,
   InterchangeType,
 } from "@intx/types/runtime";
+import { CredentialDelivery } from "@intx/types/sidecar";
 
 import {
   decodeEnvelope,
@@ -177,6 +179,12 @@ export const ControlPayload = type(
       runId: "string",
       signalName: "string",
       signalId: "string",
+      // The resume decision in FINAL form -- the child commits it as the
+      // SignalReceived payload verbatim. Each sender owns any
+      // provenance-specific preparation BEFORE this frame: the dispatch loop
+      // resolves an inbound mail to conversation text (like the turn-1
+      // trigger), while `deliverSignal` ships a structured signal payload
+      // unchanged. Do NOT ship raw inbound mail bytes through here.
       payload: "unknown",
     },
   },
@@ -219,6 +227,18 @@ export const ControlPayload = type(
   .or({
     type: "'sources-updated'",
     data: SourcesUpdatedData,
+  })
+  .or({
+    // Refreshed credential material for the deployment's tools. The child
+    // replaces its in-memory material cell wholesale on receive; a revoked
+    // credential arrives by omission (its material entry is absent) so the
+    // swap evicts it. Carried inline like the grants and sources snapshots --
+    // single-producer supervisor, single-consumer child. The secret rides
+    // this frame and the in-memory cell only; it is never persisted.
+    type: "'credentials-updated'",
+    data: {
+      delivery: CredentialDelivery,
+    },
   })
   .or({
     type: "'ready'",
@@ -437,7 +457,7 @@ export const ControlPayload = type(
     data: {
       runId: "string > 0",
       correlationId: "string > 0",
-      kind: SignalKind,
+      parkKind: ControlParkKind,
       // Approver-facing snapshot of the parked tool call, size-capped at this
       // process boundary. Optional: only an ask-rail suspension carries one.
       "snapshot?": BoundedApprovalSnapshot,
@@ -476,9 +496,20 @@ export const ControlPayload = type(
       parked: type({
         runId: "string > 0",
         correlationId: "string > 0",
-        kind: SignalKind,
-        snapshot: BoundedApprovalSnapshot,
+        parkKind: ControlParkKind,
+        // Snapshot is required for approval parks and absent for input parks.
+        "snapshot?": BoundedApprovalSnapshot,
       }).array(),
+    },
+  })
+  .or({
+    // Child reports self-discovered runs after reconnect or recycle.
+    // The supervisor seeds its cohort tracking from these runIds so
+    // drain accumulators and dispatch routing account for runs the
+    // supervisor did not personally trigger.fire.
+    type: "'resumed.runs'",
+    data: {
+      runIds: type("string > 0").array(),
     },
   });
 

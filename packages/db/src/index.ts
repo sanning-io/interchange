@@ -1,4 +1,4 @@
-export { createDB, type DB } from "./client";
+export { createDB, type DB, type DBExecutor } from "./client";
 export {
   pgErrorCode,
   PG_UNIQUE_VIOLATION,
@@ -6,6 +6,10 @@ export {
 } from "./pg-error";
 export type { DBConfig } from "./config";
 export { runMigrations, dropSchema } from "./migrate";
+export {
+  rekeyCredentialSecrets,
+  type RekeyReport,
+} from "./rekey-credential-secrets";
 export { createGrantStore } from "./grant-store";
 export {
   createApprovalStore,
@@ -20,6 +24,44 @@ export {
   createWorkflowRunStore,
   type WorkflowRunStore,
 } from "./workflow-run-store";
+export {
+  createWorkflowRunLaunchSpecStore,
+  type WorkflowRunLaunchSpecStore,
+} from "./workflow-run-launch-spec-store";
+export {
+  createWorkflowRunDispatchStore,
+  WorkflowRunDispatchPayloadConflictError,
+  type AcknowledgeWorkflowRunDispatchArgs,
+  type ClaimWorkflowRunDispatchArgs,
+  type EnqueueWorkflowRunDispatchArgs,
+  type EnqueueWorkflowRunDispatchResult,
+  type EnqueueWorkflowSignalDispatchArgs,
+  type RetryWorkflowRunDispatchArgs,
+  type WorkflowRunDispatchStore,
+} from "./workflow-run-dispatch-store";
+export {
+  createSidecarAllocationStore,
+  type BeginSidecarReleaseArgs,
+  type BeginSidecarReplacementArgs,
+  type BindInitialSidecarArgs,
+  type BindReplacementSidecarArgs,
+  type ClaimSidecarAllocationArgs,
+  type CreatePendingSidecarAllocationArgs,
+  type FailSidecarAllocationArgs,
+  type MarkSidecarAllocatedArgs,
+  type MarkSidecarConnectionLostArgs,
+  type MarkSidecarConnectionReadyArgs,
+  type MarkSidecarReleasedArgs,
+  type ParkSidecarReconciliationPolicy,
+  type ScheduleSidecarAllocationRetryArgs,
+  type SidecarAllocation,
+  type SidecarAllocationStore,
+} from "./sidecar-allocation-store";
+export {
+  createWorkflowDefinitionStore,
+  resolveDefinitionIdForAsset,
+  type WorkflowDefinitionRollbackResult,
+} from "./workflow-definition-store";
 export { getAncestorChain, getDescendantTenants } from "./tenant-hierarchy";
 export { resolveActivePrice, type ModelPricingRow } from "./pricing";
 export {
@@ -28,6 +70,14 @@ export {
   resolveCredentialByName,
   resolveCredentialById,
   resolveCredentialRequirement,
+  resolveTenantOwnedCredentialById,
+  AmbiguousCredentialError,
+  buildCredentialDelivery,
+} from "./credential-resolution";
+export type {
+  BuildCredentialDeliveryResult,
+  BindingCredentialGrant,
+  CredentialDeliveryFailure,
 } from "./credential-resolution";
 export {
   resolveAssetByName,
@@ -50,18 +100,23 @@ export {
 } from "./catalog-resolution";
 export {
   resolveModelSources,
+  resolveInferencePreferences,
   resolveInstanceModelSources,
+  resolveSourcesByOfferingIds,
   type CatalogSourceResolution,
+  type OfferingSourceResolution,
   type SourceSkip,
 } from "./model-source-resolution";
 export {
-  parseAgentRow,
-  parseAgentVersionRow,
   parseGrantRow,
   parseApprovalRow,
   parsePrincipalRow,
   parseSignalCorrelationRow,
   parseWorkflowRunRow,
+  parseWorkflowRunDispatchRow,
+  parseWorkflowRunLaunchSpecRow,
+  parseWorkflowDefinitionRow,
+  parseWorkflowDefinitionVersionRow,
   parseOfferingRow,
   parseModelOfferingRow,
   parseCredentialRow,

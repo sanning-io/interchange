@@ -9,19 +9,16 @@
 
 import { spawn } from "node:child_process";
 import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
-import { readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 
 import { type, type Type } from "arktype";
 import {
   TenantResponse,
-  AgentResponse,
   AssetResponse,
   AssetWithOriginResponse,
   PrincipalResponse,
   PrincipalSummary,
-  AgentSummary,
   RoleResponse,
   ProviderResponse,
   ModelResponse,
@@ -30,11 +27,17 @@ import {
   GrantResponse,
   paginatedSchema,
 } from "@intx/types";
+import { eq } from "drizzle-orm";
+import { createDB } from "@intx/db";
+import { asset } from "@intx/db/schema";
 import {
   WORKSPACE_BUILTINS_REGISTRY,
   WORKFLOW_JSON_PATH,
+  ensureWorkflowDefinitionForAsset,
 } from "@intx/hub-sessions";
-import { extractTarballPackageJSON } from "@intx/tool-packaging";
+import { catalogModels, catalogProviders } from "@intx/inference-catalog";
+
+import { resolveDbConfig } from "./lib/db-config";
 
 import {
   buildWorkflowJson,
@@ -43,56 +46,13 @@ import {
   WORKFLOW_RUN_GRANT_ACTION,
   WORKFLOW_RUN_GRANT_RESOURCE,
 } from "./workflow-fixture";
-import { catalogModels, catalogProviders } from "./lib/catalog-seed-data";
-import { offeringCapabilities } from "./lib/offering-capabilities";
+import {
+  credentialFixtures,
+  priceFixtures,
+  unpricedOfferings,
+} from "./lib/catalog-dev-fixtures";
 
 const AuthResponse = type({ "user?": { id: "string" } });
-
-const SEED_ROOT = resolve(import.meta.dirname ?? ".", "..");
-const BUILTINS_DIR = resolve(SEED_ROOT, "dist", "builtins");
-
-// Read every tarball under `dist/builtins/` and pin `(name, version)`
-// using the bytes the publisher will actually upload. Reading the
-// source packages' `package.json` instead would silently desynchronize
-// from the on-disk tarballs whenever a version is bumped without
-// re-running `make builtins`: the publish step would upload a tarball
-// whose filename still encodes the old version, but the seed would
-// pin the new version and the sidecar would fail with `tarball.missing`
-// at launch time. Going through the artifacts directly keeps the seed
-// honest about what was built.
-async function readBuiltinPins(): Promise<{ name: string; version: string }[]> {
-  let entries: string[];
-  try {
-    entries = readdirSync(BUILTINS_DIR);
-  } catch (cause) {
-    throw new Error(
-      `seed: cannot read ${BUILTINS_DIR}; run \`make builtins\` first`,
-      { cause },
-    );
-  }
-  const tarballs = entries.filter((f) => f.endsWith(".tgz")).sort();
-  if (tarballs.length === 0) {
-    throw new Error(
-      `seed: ${BUILTINS_DIR} contains no *.tgz files; run \`make builtins\` first`,
-    );
-  }
-  const pins: { name: string; version: string }[] = [];
-  for (const filename of tarballs) {
-    const abs = resolve(BUILTINS_DIR, filename);
-    const bytes = readFileSync(abs);
-    const outcome = await extractTarballPackageJSON(new Uint8Array(bytes));
-    if (outcome.kind !== "ok") {
-      throw new Error(
-        `seed: ${abs} did not yield a usable package.json (${outcome.kind})`,
-      );
-    }
-    pins.push({
-      name: outcome.parsed.name,
-      version: outcome.parsed.version,
-    });
-  }
-  return pins;
-}
 
 function parse<T extends Type>(
   schema: T,
@@ -108,17 +68,6 @@ function parse<T extends Type>(
 }
 
 const BASE = process.env["HUB_URL"] ?? "http://localhost:3000";
-
-// Built-in tool-package pins shared by the three workspace agents. The
-// matching tarballs are published into the `workspace-builtins`
-// package-registry asset by `bin/publish-tool-packages.ts`; the hub's
-// session-service scope-routing config maps the `@intx` scope onto
-// that asset. Pins are read directly from the artifacts under
-// `dist/builtins/` so the seed cannot pin a version that the build
-// step never produced — the previous behavior (consulting each
-// source package.json) silently desynchronized whenever a version
-// was bumped without re-running `make builtins`.
-const BUILTIN_TOOL_PACKAGES = await readBuiltinPins();
 
 type CookieJar = string[];
 
@@ -545,7 +494,7 @@ async function ensureRole(
   return roleId;
 }
 
-const researchRoleId = await ensureRole(
+await ensureRole(
   acmeTenantId,
   "research-bot",
   "Grants for the Research Bot agent",
@@ -557,7 +506,7 @@ const researchRoleId = await ensureRole(
   aliceCookies,
 );
 
-const codeReviewRoleId = await ensureRole(
+await ensureRole(
   acmeTenantId,
   "code-review-bot",
   "Grants for the Code Review Bot agent",
@@ -569,65 +518,7 @@ const codeReviewRoleId = await ensureRole(
   aliceCookies,
 );
 
-// -- Create agents in Acme --
-
-log("Creating agents in Acme...");
-
-const { status: a1Status, data: a1Data } = await api(
-  "POST",
-  `/api/tenants/${acmeTenantId}/agents/definitions`,
-  {
-    name: "Research Bot",
-    description: "Researches topics and summarizes findings",
-    systemPrompt:
-      "You are a research assistant. Find and summarize information. When you receive a mail message, reply to it immediately with a helpful response. Do not wait for further instructions.",
-    modelConfig: { defaultModel: "kimi-k2.7-code" },
-    modelRequirements: [
-      { model: "claude-sonnet-5", capabilities: ["long-context"] },
-    ],
-    toolPackages: BUILTIN_TOOL_PACKAGES,
-    capabilities: { research: true, summarize: true },
-    credentialRequirements: [
-      { providerName: "OpenCode Go", source: "tenant", scopes: ["chat"] },
-    ],
-    roleIds: [researchRoleId],
-  },
-  aliceCookies,
-);
-checkOrSkip("create research bot", a1Status, 201, a1Data);
-const researchBotId =
-  a1Status === 201
-    ? parse(AgentResponse, a1Data, "research bot response").id
-    : null;
-if (researchBotId) log(`  Research Bot ID: ${researchBotId}`);
-
-const { status: a2Status, data: a2Data } = await api(
-  "POST",
-  `/api/tenants/${acmeTenantId}/agents/definitions`,
-  {
-    name: "Code Review Bot",
-    description: "Reviews pull requests and suggests improvements",
-    systemPrompt:
-      "You are a code reviewer. Analyze code for bugs and improvements.",
-    modelConfig: { defaultModel: "kimi-k2.7-code" },
-    toolPackages: BUILTIN_TOOL_PACKAGES,
-    capabilities: { codeReview: true },
-    credentialRequirements: [
-      { providerName: "OpenCode Go", source: "tenant", scopes: ["chat"] },
-      { providerName: "GitHub", source: "tenant", scopes: ["repo"] },
-    ],
-    roleIds: [codeReviewRoleId],
-  },
-  aliceCookies,
-);
-checkOrSkip("create code review bot", a2Status, 201, a2Data);
-const codeReviewBotId =
-  a2Status === 201
-    ? parse(AgentResponse, a2Data, "code review bot response").id
-    : null;
-if (codeReviewBotId) log(`  Code Review Bot ID: ${codeReviewBotId}`);
-
-const codingRoleId = await ensureRole(
+await ensureRole(
   acmeTenantId,
   "coding-agent",
   "Grants for the Coding Agent with full filesystem and LSP access",
@@ -644,42 +535,11 @@ const codingRoleId = await ensureRole(
   aliceCookies,
 );
 
-const { status: a4Status, data: a4Data } = await api(
-  "POST",
-  `/api/tenants/${acmeTenantId}/agents/definitions`,
-  {
-    name: "Coding Agent",
-    description:
-      "Software engineering agent with filesystem, shell, and language server access",
-    systemPrompt: `You are a software engineering agent. You have access to the filesystem, a shell, and a language server for code navigation and diagnostics.
+// -- Create role in Widgets --
 
-Use the file tools (read_file, write_file, edit_file, search_files, grep) to explore and modify code. Use run_shell to execute build commands, run tests, and interact with version control. Use the lsp tool for code intelligence operations like go-to-definition, find-references, hover information, and symbol search.
+log("Creating role in Widgets...");
 
-When you edit or write files, the language server will automatically report type errors and diagnostics. Pay attention to these diagnostics and fix any issues before declaring your work complete.
-
-When you receive a task via mail, work through it methodically: understand the codebase, plan your approach, implement the changes, verify they build and pass tests, then report back with what you did.`,
-    modelConfig: { defaultModel: "kimi-k2.7-code" },
-    toolPackages: BUILTIN_TOOL_PACKAGES,
-    capabilities: { coding: true, fileSystem: true, languageServer: true },
-    credentialRequirements: [
-      { providerName: "OpenCode Go", source: "tenant", scopes: ["chat"] },
-    ],
-    roleIds: [codingRoleId],
-  },
-  aliceCookies,
-);
-checkOrSkip("create coding agent", a4Status, 201, a4Data);
-const codingAgentId =
-  a4Status === 201
-    ? parse(AgentResponse, a4Data, "coding agent response").id
-    : null;
-if (codingAgentId) log(`  Coding Agent ID: ${codingAgentId}`);
-
-// -- Create agent role and agent in Widgets --
-
-log("Creating agent in Widgets...");
-
-const supportRoleId = await ensureRole(
+await ensureRole(
   widgetsTenantId,
   "support-bot",
   "Grants for the Customer Support Bot agent",
@@ -691,35 +551,6 @@ const supportRoleId = await ensureRole(
   ],
   aliceCookies,
 );
-
-const { status: a3Status, data: a3Data } = await api(
-  "POST",
-  `/api/tenants/${widgetsTenantId}/agents/definitions`,
-  {
-    name: "Customer Support Bot",
-    description: "Handles customer support tickets",
-    systemPrompt:
-      "You are a customer support agent. Help customers with their issues.",
-    modelConfig: { defaultModel: "claude-sonnet-5" },
-    capabilities: { ticketManagement: true, knowledgeBase: true },
-    credentialRequirements: [
-      { providerName: "Anthropic", source: "tenant", scopes: ["chat"] },
-      {
-        providerName: "Stripe",
-        source: "tenant",
-        scopes: ["charges:read", "refunds:write"],
-      },
-    ],
-    roleIds: [supportRoleId],
-  },
-  aliceCookies,
-);
-checkOrSkip("create support bot", a3Status, 201, a3Data);
-const supportBotId =
-  a3Status === 201
-    ? parse(AgentResponse, a3Data, "support bot response").id
-    : null;
-if (supportBotId) log(`  Support Bot ID: ${supportBotId}`);
 
 // -- Create custom role and grants --
 
@@ -998,134 +829,42 @@ const { status: w2Status, data: w2Data } = await api(
 );
 checkOrSkip("create widgets wallet", w2Status, 201, w2Data);
 
-// -- Create offerings --
-
-log("Creating offerings...");
-
-// Get agent IDs from listing if we didn't just create them
-const { data: acmeAgents } = await api(
-  "GET",
-  `/api/tenants/${acmeTenantId}/agents/definitions`,
-  undefined,
-  aliceCookies,
-);
-const agentList = parse(
-  paginatedSchema(AgentResponse),
-  acmeAgents,
-  "acme agents response",
-).data;
-const researchBot = agentList.find((a) => a.name === "Research Bot");
-const codeReviewBot = agentList.find((a) => a.name === "Code Review Bot");
-
-const { data: widgetAgents } = await api(
-  "GET",
-  `/api/tenants/${widgetsTenantId}/agents/definitions`,
-  undefined,
-  aliceCookies,
-);
-const widgetAgentList = parse(
-  paginatedSchema(AgentResponse),
-  widgetAgents,
-  "widget agents response",
-).data;
-const supportBot = widgetAgentList.find(
-  (a) => a.name === "Customer Support Bot",
-);
-
-if (researchBot) {
-  const { status: ofr1Status, data: ofr1Data } = await api(
-    "POST",
-    `/api/tenants/${acmeTenantId}/offerings`,
-    {
-      agentId: researchBot.id,
-      name: "Web Research",
-      description: "Search the web and summarize findings on any topic",
-      pricing: {
-        base: { amount: "0.50", currency: "USD" },
-        methods: ["credits"],
-        negotiable: false,
-      },
-    },
-    aliceCookies,
-  );
-  checkOrSkip("create web research offering", ofr1Status, 201, ofr1Data);
-
-  const { status: ofr2Status, data: ofr2Data } = await api(
-    "POST",
-    `/api/tenants/${acmeTenantId}/offerings`,
-    {
-      agentId: researchBot.id,
-      name: "Document Summarization",
-      description: "Summarize long documents into key takeaways",
-      pricing: {
-        base: { amount: "0.25", currency: "USD" },
-        methods: ["credits"],
-        negotiable: true,
-        bounds: { min: "0.10", max: "1.00" },
-      },
-    },
-    aliceCookies,
-  );
-  checkOrSkip("create summarization offering", ofr2Status, 201, ofr2Data);
-}
-
-if (codeReviewBot) {
-  const { status: ofr3Status, data: ofr3Data } = await api(
-    "POST",
-    `/api/tenants/${acmeTenantId}/offerings`,
-    {
-      agentId: codeReviewBot.id,
-      name: "Pull Request Review",
-      description:
-        "Automated code review with bug detection and improvement suggestions",
-      pricing: {
-        base: { amount: "1.00", currency: "USD" },
-        methods: ["credits"],
-        negotiable: false,
-      },
-      schema: {
-        input: { type: "object", properties: { prUrl: { type: "string" } } },
-        output: {
-          type: "object",
-          properties: { comments: { type: "array" } },
-        },
-      },
-    },
-    aliceCookies,
-  );
-  checkOrSkip("create pr review offering", ofr3Status, 201, ofr3Data);
-}
-
-if (supportBot) {
-  const { status: ofr4Status, data: ofr4Data } = await api(
-    "POST",
-    `/api/tenants/${widgetsTenantId}/offerings`,
-    {
-      agentId: supportBot.id,
-      name: "Ticket Resolution",
-      description: "Automatically resolve common customer support tickets",
-      pricing: {
-        base: { amount: "0.75", currency: "USD" },
-        methods: ["credits", "fiat"],
-        negotiable: true,
-        bounds: { min: "0.25", max: "2.00" },
-      },
-    },
-    aliceCookies,
-  );
-  checkOrSkip("create ticket resolution offering", ofr4Status, 201, ofr4Data);
-}
-
 // -- Create model catalog --
 //
-// The declarative deployment set lives in ./lib/catalog-seed-data; this driver
-// walks it. Each catalog provider gets a dedicated old-system provider (so its
-// credential has a provider FK) and a credential, then the catalog provider,
-// its offerings (carrying explicit quirks), and pricing. Ids are resolved by
-// listing after each create so the seed stays idempotent across re-runs where
-// a POST returns 409.
+// The declarative model/provider/offering set comes from
+// @intx/inference-catalog; this driver walks it and layers on the dev-only
+// credentials and pricing from ./lib/catalog-dev-fixtures (kept out of the
+// published package). Each catalog provider gets a dedicated old-system
+// provider (so its credential has a provider FK) and a credential, then the
+// catalog provider, its offerings (carrying baked capabilities and explicit
+// quirks), and pricing. Ids are resolved by listing after each create so the
+// seed stays idempotent across re-runs where a POST returns 409.
 
 log("Creating model catalog...");
+
+// The dev credentials and pricing are authored per provider and offering; a
+// gap would silently drop one, so verify coverage before seeding anything.
+// Every provider needs a credential fixture, and every offering must be either
+// priced or explicitly listed unpriced — never neither, never both.
+for (const p of catalogProviders) {
+  if (!credentialFixtures[p.name]) {
+    fatalMissing(`credential fixture for provider ${p.name}`);
+  }
+  for (const o of p.offerings) {
+    const priced = priceFixtures[p.name]?.[o.model] !== undefined;
+    const unpriced = (unpricedOfferings[p.name] ?? []).includes(o.model);
+    if (!priced && !unpriced) {
+      fatalMissing(
+        `price fixture for ${p.name}/${o.model} (or list it unpriced)`,
+      );
+    }
+    if (priced && unpriced) {
+      fatalMissing(
+        `pricing contradiction for ${p.name}/${o.model}: priced and listed unpriced`,
+      );
+    }
+  }
+}
 
 const CredentialIdName = type({ id: "string", name: "string" });
 
@@ -1154,6 +893,10 @@ const modelIdByName = new Map(
 );
 
 for (const p of catalogProviders) {
+  // Dev-only credential for this provider (coverage verified above).
+  const cred = credentialFixtures[p.name];
+  if (!cred) fatalMissing(`credential fixture for provider ${p.name}`);
+
   // Old-system provider that owns the credential. Its plugin mirrors the
   // catalog plugin (the old provider's plugin is free-form) and the metadata
   // baseURL matches the catalog endpoint.
@@ -1188,16 +931,16 @@ for (const p of catalogProviders) {
     "POST",
     `/api/tenants/${acmeTenantId}/credentials`,
     {
-      name: p.credentialName,
+      name: cred.credentialName,
       type: "api_key",
       providerId: integrationProvider.id,
-      secret: p.credentialSecret,
+      secret: cred.credentialSecret,
       scopes: ["chat"],
     },
     aliceCookies,
   );
   checkOrSkip(
-    `create credential ${p.credentialName}`,
+    `create credential ${cred.credentialName}`,
     credStatus,
     201,
     credData,
@@ -1213,8 +956,8 @@ for (const p of catalogProviders) {
     paginatedSchema(CredentialIdName),
     credListData,
     "credentials response",
-  ).data.find((c) => c.name === p.credentialName);
-  if (!credential) fatalMissing(`credential ${p.credentialName}`);
+  ).data.find((c) => c.name === cred.credentialName);
+  if (!credential) fatalMissing(`credential ${cred.credentialName}`);
 
   const { status: provStatus, data: provData } = await api(
     "POST",
@@ -1245,8 +988,11 @@ for (const p of catalogProviders) {
   for (const o of p.offerings) {
     const modelId = modelIdByName.get(o.model);
     if (modelId === undefined) {
-      log(`  SKIP offering ${p.name}/${o.model} (model not seeded)`);
-      continue;
+      // Every catalog offering must name a catalog model; a miss means the
+      // offering references a model absent from catalogModels (a typo or an
+      // omission the catalog guard test should also catch). Dropping it
+      // silently would ship a dev catalog missing a model the author intended.
+      fatalMissing(`offering ${p.name}/${o.model}: model absent from catalog`);
     }
     const { status, data } = await api(
       "POST",
@@ -1255,7 +1001,7 @@ for (const p of catalogProviders) {
         modelId,
         providerId: catalogProviderRow.id,
         priority: o.priority,
-        capabilities: offeringCapabilities(o),
+        capabilities: o.capabilities,
         quirks: o.quirks,
       },
       aliceCookies,
@@ -1283,6 +1029,10 @@ for (const p of catalogProviders) {
       (x) => x.providerId === catalogProviderRow.id && x.modelId === modelId,
     );
     if (!offering) fatalMissing(`offering ${p.name}/${o.model}`);
+    // Dev-only pricing, or skip for offerings declared unpriced. Coverage was
+    // verified above, so a missing fixture here means explicitly unpriced.
+    const price = priceFixtures[p.name]?.[o.model];
+    if (!price) continue;
     const { status, data } = await api(
       "POST",
       `/api/tenants/${acmeTenantId}/catalog/offerings/${offering.id}/pricing`,
@@ -1291,8 +1041,8 @@ for (const p of catalogProviders) {
         // Pinned so a seed re-run collides on (offering, currency,
         // effectiveFrom) and skips rather than appending a duplicate.
         effectiveFrom: "2024-01-01T00:00:00.000Z",
-        inputTokenPrice: o.price.input,
-        outputTokenPrice: o.price.output,
+        inputTokenPrice: price.input,
+        outputTokenPrice: price.output,
       },
       aliceCookies,
     );
@@ -1413,6 +1163,30 @@ async function runGit(
       resolveRun({ stdout, stderr, status: code ?? -1 });
     });
   });
+}
+
+async function ensureSeededWorkflowDefinitions(): Promise<void> {
+  // Project a workflow_definition (+ version "1") over every native
+  // `workflow`-kind asset via `ensureWorkflowDefinitionForAsset` -- the same
+  // create-if-absent helper the deploy path uses -- so a freshly seeded dev
+  // database has the definitions the launch and listing surfaces read. Rows
+  // only: no sidecar or repo is needed, just the DB connection the dev
+  // environment already exports. Each projection is its own transaction so a
+  // partial failure never leaves a definition without its version.
+  const { db, close } = createDB(resolveDbConfig(process.env));
+  try {
+    const assets = await db
+      .select({ id: asset.id })
+      .from(asset)
+      .where(eq(asset.kind, "workflow"));
+    for (const workflowAsset of assets) {
+      await db.transaction((tx) =>
+        ensureWorkflowDefinitionForAsset(tx, workflowAsset.id),
+      );
+    }
+  } finally {
+    await close();
+  }
 }
 
 function withBasicAuth(url: string, user: string, pass: string): string {
@@ -1624,17 +1398,6 @@ log(
   `  Alice has ${parse(paginatedSchema(PrincipalSummary), mePrinData, "alice principals response").data.length} principal(s) across tenants`,
 );
 
-const { status: meAgents, data: meAgentData } = await api(
-  "GET",
-  "/api/me/agents",
-  undefined,
-  aliceCookies,
-);
-check("get alice agents", meAgents, 200, meAgentData);
-log(
-  `  Alice can see ${parse(paginatedSchema(AgentSummary), meAgentData, "alice agents response").data.length} agent(s)`,
-);
-
 // Verify Bob's view
 const { data: bobPrinData } = await api(
   "GET",
@@ -1656,5 +1419,11 @@ const { data: carolPrinData } = await api(
 log(
   `  Carol has ${parse(paginatedSchema(PrincipalSummary), carolPrinData, "carol principals response").data.length} principal(s)`,
 );
+
+// Project workflow definitions over the seeded native workflow assets so a
+// freshly seeded dev database has the definitions the launch and listing
+// surfaces read.
+log("Creating workflow definitions for seeded workflow assets...");
+await ensureSeededWorkflowDefinitions();
 
 log("Seed completed successfully.");

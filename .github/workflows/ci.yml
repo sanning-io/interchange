@@ -3,10 +3,24 @@ name: Continuous Integration
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+  # Push to main is a post-merge canary: it re-runs make all against the tip of
+  # main to catch a break that no PR check saw (e.g. two green PRs that conflict
+  # semantically once both land). It reports a broken main; it cannot prevent
+  # the commit landing — that guarantee is branch protection requiring this check.
+  push:
+    branches: [main]
 
 concurrency:
-  group: ci-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  # PRs group by number so a newer push supersedes and cancels the stale run.
+  # Pushes to main group by commit SHA, giving every commit its own group. A
+  # constant refs/heads/main key would place all main pushes in one group,
+  # where a group holds only one pending run: a newer push would evict the
+  # pending run of a commit still queued behind an in-flight one, and that
+  # mid-flight commit would never be validated. Per-SHA grouping is what
+  # guarantees every commit on main runs; cancel-in-progress only governs PR
+  # supersession (it does not protect a pending run, so it cannot carry this).
+  group: ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -53,6 +67,18 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      # Cache the Playwright browser download, keyed on the resolved
+      # @playwright/test version that bun.lock pins. On a hit the install
+      # step below is a no-op; on a miss it re-downloads Chromium.
+      - name: Cache Playwright browsers
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+
+      - name: Install Playwright Chromium
+        run: bunx playwright install --with-deps chromium
+
       # Copy the committed dev-default env files. BETTER_AUTH_SECRET ships empty in
       # the example, so set it in place (do not append — a second line would leave
       # the key defined twice and the hub tests read the empty one and hard-fail).
@@ -63,18 +89,21 @@ jobs:
           cp .env.hub.example .env.hub
           secret=$(openssl rand -hex 32)
           sed -i "s/^BETTER_AUTH_SECRET=.*/BETTER_AUTH_SECRET=${secret}/" .env.hub
+          cred_key=$(openssl rand -hex 32)
+          sed -i "s/^CREDENTIAL_ENCRYPTION_KEY=.*/CREDENTIAL_ENCRYPTION_KEY=${cred_key}/" .env.hub
 
       # The DB/hub-api test harness skips only when the env files are absent, so a
       # missing file would silently drop the entire DB layer while CI stays green.
-      # Fail loudly instead: the files must exist, BETTER_AUTH_SECRET must be
-      # non-empty (else the hub tests hard-fail on requireKey), and Postgres must
-      # be reachable.
+      # Fail loudly instead: the files must exist, BETTER_AUTH_SECRET and
+      # CREDENTIAL_ENCRYPTION_KEY must be non-empty (else the spawned hub
+      # hard-fails at boot), and Postgres must be reachable.
       - name: Assert DB test env is wired
         run: |
           test -f .env
           test -f .env.migrate
           test -f .env.hub
           grep -q '^BETTER_AUTH_SECRET=.\+' .env.hub
+          grep -q '^CREDENTIAL_ENCRYPTION_KEY=.\+' .env.hub
           pg_isready -h localhost -p 5432
 
       # Pre-create the two roles db-reset assumes exist (deriving each password
@@ -96,3 +125,10 @@ jobs:
 
       - name: Run make all
         run: make all
+
+      # Browser-driven end-to-end suite. Reuses the container Postgres and
+      # the job-level PG* env: the provisioner's maintenance connection
+      # runs as the postgres superuser, so it can CREATE DATABASE per run.
+      # test-e2e-run skips the bundle build; `make all` above already built it.
+      - name: Run make test-e2e-run
+        run: make test-e2e-run

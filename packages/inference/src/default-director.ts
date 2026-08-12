@@ -21,15 +21,16 @@
 // reply so the problem is visible, and the agent remains alive for retries.
 
 import { getLogger } from "@intx/log";
-import type {
-  ReactorDirector,
-  ReactorInboundEvent,
-  ReactorState,
-  ReactorCapabilities,
-  ReactorAction,
-  AssistantTurn,
-  ToolCall,
-  ToolDefinition,
+import {
+  formatSafetyRatingText,
+  type ReactorDirector,
+  type ReactorInboundEvent,
+  type ReactorState,
+  type ReactorCapabilities,
+  type ReactorAction,
+  type AssistantTurn,
+  type ToolCall,
+  type ToolDefinition,
 } from "@intx/types/runtime";
 
 const logger = getLogger(["interchange", "inference", "default-director"]);
@@ -152,20 +153,21 @@ function extractToolCalls(turn: AssistantTurn): ToolCall[] {
 }
 
 function extractTextContent(turn: AssistantTurn): string {
-  // Both regular text and refusal blocks carry human-readable model
-  // output that the connector needs to surface — a refusal-only turn
-  // (OpenAI strict-mode policy decline) would otherwise route through
-  // the empty-response branch below and never reach the reply path,
-  // leaving the human waiting for an answer the model already
-  // declined to give. The structural "this was a refusal" signal is
-  // preserved at the persistence layer (event-collector emits a
-  // refusal turn-part); the reply path only needs the words.
+  // Text, refusal, and safety_rating blocks all carry human-readable
+  // output the connector needs to surface. A refusal-only or
+  // safety-only turn would otherwise route through the empty-response
+  // branch below and never reach the reply path, leaving the human
+  // waiting for an answer the model already declined or blocked.
+  // Structural part kinds are preserved at the persistence layer;
+  // the reply path only needs the words.
   const parts: string[] = [];
   for (const block of turn.content) {
     if (block.type === "text") {
       parts.push(block.text);
     } else if (block.type === "refusal") {
       parts.push(block.reason);
+    } else if (block.type === "safety_rating") {
+      parts.push(formatSafetyRatingText(block));
     }
   }
   return parts.join("\n").trim();

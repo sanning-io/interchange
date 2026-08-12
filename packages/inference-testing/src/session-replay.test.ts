@@ -3,17 +3,17 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-import type {
-  ConversationTurn,
-  InferenceEvent,
-  InferenceSource,
-} from "@intx/types/runtime";
+import type { InferenceEvent, InferenceSource } from "@intx/types/runtime";
 
+import type { Invariant } from "./invariants";
 import { createRecordingHarness } from "./session-recording";
 import {
   createReplayHarness,
+  replayResponsesForParsing,
+  requestBytesMatch,
   SessionReplayMismatchError,
 } from "./session-replay";
+import { userTurn } from "./turns";
 import * as wire from "./wire";
 
 const ANTHROPIC_SOURCE: InferenceSource = {
@@ -45,14 +45,6 @@ async function makeTmpDir(): Promise<string> {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "session-replay-"));
   tmpDirs.push(dir);
   return dir;
-}
-
-function userTurn(text: string): ConversationTurn {
-  return {
-    role: "user",
-    content: [{ type: "text", text }],
-    timestamp: 0,
-  };
 }
 
 function mergeChunks(chunks: Uint8Array[]): Uint8Array {
@@ -196,7 +188,7 @@ describe("createReplayHarness", () => {
 
     const replay = await createReplayHarness({ sessionDir: dir });
     try {
-      expect(replay.manifest.sessionSchemaVersion).toBe("1");
+      expect(replay.manifest.schemaVersion).toBe("2");
       expect(replay.source.provider).toBe("anthropic");
       expect(replay.capturedExchanges).toHaveLength(1);
 
@@ -305,13 +297,14 @@ describe("createReplayHarness", () => {
     await fs.writeFile(
       path.join(dir, "session.json"),
       JSON.stringify({
-        sessionSchemaVersion: "999",
+        schemaVersion: "999",
         source: { provider: "x", model: "y", baseURL: "z" },
+        origin: "live",
         capturedAt: "2026-05-25T12:00:00Z",
       }),
     );
     await expect(createReplayHarness({ sessionDir: dir })).rejects.toThrow(
-      /Invalid session manifest/,
+      /Invalid capture manifest/,
     );
   });
 
@@ -320,8 +313,9 @@ describe("createReplayHarness", () => {
     await fs.writeFile(
       path.join(dir, "session.json"),
       JSON.stringify({
-        sessionSchemaVersion: "1",
+        schemaVersion: "2",
         source: { provider: "x", model: "y", baseURL: "z" },
+        origin: "live",
         capturedAt: "2026-05-25T12:00:00Z",
       }),
     );
@@ -330,13 +324,14 @@ describe("createReplayHarness", () => {
     );
   });
 
-  test("rejects when an exchange has a raw-body request capture", async () => {
+  test("rejects a raw-byte (Files-API upload) exchange the runInference driver cannot drive", async () => {
     const dir = await makeTmpDir();
     await fs.writeFile(
       path.join(dir, "session.json"),
       JSON.stringify({
-        sessionSchemaVersion: "1",
+        schemaVersion: "2",
         source: { provider: "x", model: "y", baseURL: "z" },
+        origin: "live",
         capturedAt: "2026-05-25T12:00:00Z",
       }),
     );
@@ -358,8 +353,60 @@ describe("createReplayHarness", () => {
       "{}",
     );
     await expect(createReplayHarness({ sessionDir: dir })).rejects.toThrow(
-      /raw-body request \(request\.bin\)/,
+      /raw-byte request \(Files-API upload\).*cannot drive/s,
     );
+  });
+
+  test("rejects an exchange with both request.json and request.bin", async () => {
+    const dir = await makeTmpDir();
+    await fs.writeFile(
+      path.join(dir, "session.json"),
+      JSON.stringify({
+        schemaVersion: "2",
+        source: { provider: "x", model: "y", baseURL: "z" },
+        origin: "live",
+        capturedAt: "2026-05-25T12:00:00Z",
+      }),
+    );
+    await fs.mkdir(path.join(dir, "exchanges", "0"), { recursive: true });
+    await fs.writeFile(path.join(dir, "exchanges", "0", "request.json"), "{}");
+    await fs.writeFile(
+      path.join(dir, "exchanges", "0", "request.bin"),
+      new Uint8Array([1, 2, 3]),
+    );
+    await expect(createReplayHarness({ sessionDir: dir })).rejects.toThrow(
+      /both.*request\.json and request\.bin/s,
+    );
+  });
+
+  test("rejects an exchange with neither request.json nor request.bin", async () => {
+    const dir = await makeTmpDir();
+    await fs.writeFile(
+      path.join(dir, "session.json"),
+      JSON.stringify({
+        schemaVersion: "2",
+        source: { provider: "x", model: "y", baseURL: "z" },
+        origin: "live",
+        capturedAt: "2026-05-25T12:00:00Z",
+      }),
+    );
+    await fs.mkdir(path.join(dir, "exchanges", "0"), { recursive: true });
+    await expect(createReplayHarness({ sessionDir: dir })).rejects.toThrow(
+      /no request\.json and no request\.bin/,
+    );
+  });
+
+  test("requestBytesMatch compares raw request bodies by byte equality", () => {
+    expect(
+      requestBytesMatch(new Uint8Array([1, 2, 3]), new Uint8Array([1, 2, 3])),
+    ).toBe(true);
+    expect(
+      requestBytesMatch(new Uint8Array([1, 2, 3]), new Uint8Array([1, 2, 4])),
+    ).toBe(false);
+    expect(
+      requestBytesMatch(new Uint8Array([1, 2, 3]), new Uint8Array([1, 2])),
+    ).toBe(false);
+    expect(requestBytesMatch(new Uint8Array(), new Uint8Array())).toBe(true);
   });
 
   test("rejects when an exchange has both response.sse and response.json", async () => {
@@ -367,8 +414,9 @@ describe("createReplayHarness", () => {
     await fs.writeFile(
       path.join(dir, "session.json"),
       JSON.stringify({
-        sessionSchemaVersion: "1",
+        schemaVersion: "2",
         source: { provider: "x", model: "y", baseURL: "z" },
+        origin: "live",
         capturedAt: "2026-05-25T12:00:00Z",
       }),
     );
@@ -397,8 +445,9 @@ describe("createReplayHarness", () => {
     await fs.writeFile(
       path.join(dir, "session.json"),
       JSON.stringify({
-        sessionSchemaVersion: "1",
+        schemaVersion: "2",
         source: { provider: "x", model: "y", baseURL: "z" },
+        origin: "live",
         capturedAt: "2026-05-25T12:00:00Z",
       }),
     );
@@ -693,5 +742,267 @@ describe("createReplayHarness", () => {
     } finally {
       replay.dispose();
     }
+  });
+});
+
+describe("replayResponsesForParsing (anything-goes)", () => {
+  async function writeParserSession(
+    dir: string,
+    exchanges: {
+      requestBin?: Uint8Array;
+      responseBytes: Uint8Array;
+      contentType: string;
+    }[],
+  ): Promise<void> {
+    await fs.writeFile(
+      path.join(dir, "session.json"),
+      JSON.stringify({
+        schemaVersion: "2",
+        source: {
+          provider: "anthropic",
+          model: "claude-test",
+          baseURL: "https://api.anthropic.com",
+        },
+        origin: "live",
+        capturedAt: "2026-05-25T12:00:00Z",
+      }),
+    );
+    for (let i = 0; i < exchanges.length; i++) {
+      const ex = exchanges[i];
+      if (ex === undefined) continue;
+      const exDir = path.join(dir, "exchanges", String(i));
+      await fs.mkdir(exDir, { recursive: true });
+      if (ex.requestBin !== undefined) {
+        await fs.writeFile(path.join(exDir, "request.bin"), ex.requestBin);
+      } else {
+        await fs.writeFile(path.join(exDir, "request.json"), "{}");
+      }
+      await fs.writeFile(path.join(exDir, "request-headers.json"), "{}");
+      const respName = ex.contentType.includes("event-stream")
+        ? "response.sse"
+        : "response.json";
+      await fs.writeFile(path.join(exDir, respName), ex.responseBytes);
+      await fs.writeFile(
+        path.join(exDir, "response-headers.json"),
+        JSON.stringify({ "content-type": ex.contentType }),
+      );
+    }
+  }
+
+  test("drives a JSON exchange terminating on a tool_call without an auto-dispatch throw", async () => {
+    const dir = await makeTmpDir();
+    const toolCallBody = JSON.stringify({
+      type: "message",
+      role: "assistant",
+      model: "claude-test",
+      content: [
+        {
+          type: "tool_use",
+          id: "toolu_1",
+          name: "get_weather",
+          input: { location: "SF" },
+        },
+      ],
+      stop_reason: "tool_use",
+      usage: { input_tokens: 5, output_tokens: 3 },
+    });
+    await writeParserSession(dir, [
+      {
+        responseBytes: new TextEncoder().encode(toolCallBody),
+        contentType: "application/json",
+      },
+    ]);
+
+    const results = await replayResponsesForParsing({ sessionDir: dir });
+    expect(results).toHaveLength(1);
+    const r = results[0];
+    if (r === undefined || r.kind !== "replayed") {
+      throw new Error("expected a replayed result");
+    }
+    const types = r.events.map((e) => e.type);
+    expect(types).toContain("inference.tool_call.start");
+    expect(types).toContain("inference.tool_call.end");
+    expect(types).toContain("inference.done");
+    expect(types).not.toContain("inference.error");
+  });
+
+  test("drives an SSE plain-text exchange, parsing text deltas", async () => {
+    const dir = await makeTmpDir();
+    const sseBytes = mergeChunks(
+      wire.completeResponse("anthropic", { text: "Hello" }),
+    );
+    await writeParserSession(dir, [
+      { responseBytes: sseBytes, contentType: "text/event-stream" },
+    ]);
+
+    const results = await replayResponsesForParsing({ sessionDir: dir });
+    expect(results).toHaveLength(1);
+    const r = results[0];
+    if (r === undefined || r.kind !== "replayed") {
+      throw new Error("expected a replayed result");
+    }
+    expect(
+      r.events.filter((e) => e.type === "inference.text.delta").length,
+    ).toBeGreaterThan(0);
+    expect(r.events.some((e) => e.type === "inference.done")).toBe(true);
+  });
+
+  test("drives every exchange in a multi-exchange session", async () => {
+    const dir = await makeTmpDir();
+    await writeParserSession(dir, [
+      {
+        responseBytes: mergeChunks(
+          wire.completeResponse("anthropic", { text: "One" }),
+        ),
+        contentType: "text/event-stream",
+      },
+      {
+        responseBytes: mergeChunks(
+          wire.completeResponse("anthropic", { text: "Two" }),
+        ),
+        contentType: "text/event-stream",
+      },
+    ]);
+
+    const results = await replayResponsesForParsing({ sessionDir: dir });
+    expect(results.map((r) => r.kind)).toEqual(["replayed", "replayed"]);
+  });
+
+  test("skips a raw upload exchange but replays the generate exchange", async () => {
+    const dir = await makeTmpDir();
+    const generateBody = JSON.stringify({
+      type: "message",
+      role: "assistant",
+      model: "claude-test",
+      content: [{ type: "text", text: "done" }],
+      stop_reason: "end_turn",
+      usage: { input_tokens: 5, output_tokens: 2 },
+    });
+    await writeParserSession(dir, [
+      {
+        requestBin: new Uint8Array([1, 2, 3]),
+        responseBytes: new TextEncoder().encode('{"file":"x"}'),
+        contentType: "application/json",
+      },
+      {
+        responseBytes: new TextEncoder().encode(generateBody),
+        contentType: "application/json",
+      },
+    ]);
+
+    const results = await replayResponsesForParsing({ sessionDir: dir });
+    expect(results).toHaveLength(2);
+    const upload = results[0];
+    const generate = results[1];
+    if (upload === undefined || upload.kind !== "skipped") {
+      throw new Error("expected the upload exchange to be skipped");
+    }
+    expect(upload.reason).toBe("raw_request");
+    expect(generate?.kind).toBe("replayed");
+  });
+
+  test("surfaces a parse failure as one inference.error without re-fetching", async () => {
+    const dir = await makeTmpDir();
+    await writeParserSession(dir, [
+      {
+        responseBytes: new TextEncoder().encode("this is not json at all"),
+        contentType: "application/json",
+      },
+    ]);
+
+    // A malformed body must not trip the fetchCallCount === 1 guard: the
+    // abort-only retry policy surfaces the parse failure as a single
+    // inference.error rather than a retry that re-opens the fetch.
+    const results = await replayResponsesForParsing({ sessionDir: dir });
+    expect(results).toHaveLength(1);
+    const r = results[0];
+    if (r === undefined || r.kind !== "replayed") {
+      throw new Error("expected a replayed result");
+    }
+    expect(r.events.filter((e) => e.type === "inference.error")).toHaveLength(
+      1,
+    );
+    expect(r.events.some((e) => e.type === "inference.done")).toBe(false);
+  });
+
+  test("applies the provided invariants over each replayed exchange's decoded events", async () => {
+    const dir = await makeTmpDir();
+    const toolCallBody = JSON.stringify({
+      type: "message",
+      role: "assistant",
+      model: "claude-test",
+      content: [
+        {
+          type: "tool_use",
+          id: "toolu_1",
+          name: "get_weather",
+          input: { location: "SF" },
+        },
+      ],
+      stop_reason: "tool_use",
+      usage: { input_tokens: 5, output_tokens: 3 },
+    });
+    await writeParserSession(dir, [
+      {
+        responseBytes: new TextEncoder().encode(toolCallBody),
+        contentType: "application/json",
+      },
+    ]);
+
+    const seenBatches: InferenceEvent[][] = [];
+    const recordingInvariant: Invariant = {
+      name: "recording_probe",
+      check(events) {
+        seenBatches.push([...events]);
+        return [
+          {
+            invariant: "recording_probe",
+            message: "always reports",
+            events: [],
+          },
+        ];
+      },
+    };
+
+    const results = await replayResponsesForParsing({
+      sessionDir: dir,
+      invariants: [recordingInvariant],
+    });
+    expect(results).toHaveLength(1);
+    const r = results[0];
+    if (r === undefined || r.kind !== "replayed") {
+      throw new Error("expected a replayed result");
+    }
+
+    // The invariant ran over the real decoded event stream, not an empty array.
+    const firstBatch = seenBatches[0];
+    if (firstBatch === undefined) {
+      throw new Error("expected the invariant to have been invoked once");
+    }
+    const seenTypes = firstBatch.map((e) => e.type);
+    expect(seenTypes).toContain("inference.tool_call.end");
+    expect(seenTypes).toContain("inference.done");
+
+    // Its violation surfaces on the replayed result.
+    expect(r.violations).toHaveLength(1);
+    expect(r.violations[0]?.invariant).toBe("recording_probe");
+  });
+
+  test("reports no violations for a clean capture under the default invariants", async () => {
+    const dir = await makeTmpDir();
+    const sseBytes = mergeChunks(
+      wire.completeResponse("anthropic", { text: "Hello" }),
+    );
+    await writeParserSession(dir, [
+      { responseBytes: sseBytes, contentType: "text/event-stream" },
+    ]);
+
+    const results = await replayResponsesForParsing({ sessionDir: dir });
+    expect(results).toHaveLength(1);
+    const r = results[0];
+    if (r === undefined || r.kind !== "replayed") {
+      throw new Error("expected a replayed result");
+    }
+    expect(r.violations).toEqual([]);
   });
 });

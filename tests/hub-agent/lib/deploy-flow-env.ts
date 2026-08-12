@@ -64,7 +64,7 @@ import {
   type WorkflowRunHubPrincipal,
   type WsHandle,
 } from "@intx/hub-sessions";
-import { base64Encode, hexEncode } from "@intx/types";
+import { base64Encode, deriveWorkflowRunId, hexEncode } from "@intx/types";
 import type { WireGrantRule } from "@intx/types/grant-wire";
 import { createEd25519Crypto, generateKeyPair } from "@intx/crypto";
 import {
@@ -78,12 +78,19 @@ import type { HarnessConfig } from "@intx/types/runtime";
 import type { ToolPackagePin } from "@intx/types/tool-packages";
 import type { ApprovalSet } from "@intx/workflow-deploy";
 import type { WorkflowDefinition } from "@intx/workflow";
+import { stopServerBounded } from "@intx/test-harness/bun-server";
 
 export const AGENT_ADDRESS = "ins_test-agent@integration.interchange";
 export const AGENT_ID = "ins_test-agent";
 export const SESSION_ID = "ses_integration-1";
 export const SIDECAR_ID = "sc-integration-1";
 export const TOKEN = "test-token";
+// A second sidecar identity, for tests that need two sidecars on one hub
+// (e.g. proving a cross-sidecar/federated mail deliver reaches the
+// receiver). The default fixture only spawns the first; a caller spawns the
+// second via `startSidecarSubprocess` with these in `extraEnv`.
+export const SECOND_SIDECAR_ID = "sc-integration-2";
+export const SECOND_TOKEN = "test-token-2";
 
 const TENANT_ID = "tenant-1";
 const REGISTRY_NAME = "workspace-builtins";
@@ -160,6 +167,16 @@ export type MockToolCall = {
 
 export type StartMockInferenceOpts = {
   toolCall?: MockToolCall;
+  /**
+   * When true, `toolCall` is emitted on the FIRST turn of EVERY run (any
+   * request whose history carries no tool_result yet) rather than only once
+   * across the mock's lifetime. A run that drives the same tool then completes
+   * with a text turn once its result lands. Lets a single env exercise the
+   * tool across several runs (e.g. re-running a credential tool before and
+   * after a rotation) without the default one-shot latch swallowing the
+   * later runs.
+   */
+  toolCallEachRun?: boolean;
   /**
    * When true, the assistant reply echoes the last user message's text
    * as `echo:<text>` instead of the tool-names text turn. This lets a
@@ -353,8 +370,13 @@ export function startMockInference(
       const toolNames = (body.tools ?? []).map((t) => t.name);
       const wantsToolCall =
         opts.toolCall !== undefined &&
-        !toolCallEmitted &&
-        toolNames.includes(opts.toolCall.toolName);
+        toolNames.includes(opts.toolCall.toolName) &&
+        // Default: emit once across the mock's lifetime. `toolCallEachRun`:
+        // emit on any request whose history has no tool_result yet, so each
+        // fresh run drives the tool and then completes once its result lands.
+        (opts.toolCallEachRun === true
+          ? firstToolResultText(body) === null
+          : !toolCallEmitted);
 
       let events: string[];
       const approval = opts.approvalToolCall;
@@ -546,6 +568,91 @@ export const mail = Object.assign(factory, {
   return new Uint8Array(bytes);
 }
 
+/**
+ * Inputs for seeding the synthetic credential-consuming tool package. The
+ * caller (the tests/workflow-deploy e2e, which owns the fixture) resolves
+ * `entryPath` from its own project so this hub-agent-project helper never
+ * imports the fixture across a project boundary.
+ */
+export type SyntheticCredentialToolOpts = {
+  /** Absolute path to the fixture module compiled into the bundle entry. */
+  entryPath: string;
+  /** Package name stamped into `package.json` (the tool consumer identity). */
+  packageName: string;
+  /** Package version stamped into `package.json`. */
+  version: string;
+  /** The credential handle declared under `interchange.credentials`. */
+  handle: string;
+};
+
+// Synthetic credential-consuming tool tarball
+//
+// Unlike `buildSyntheticToolsMailTarball` (which inlines its bundle as a
+// string), this compiles a REAL, type-checked fixture module
+// (`tests/workflow-deploy/fixtures/credential-tool-bundle.ts`) into the
+// package's `sidecar-bundle.js` with
+// Bun.build, so the e2e drives the production loader against a genuine ESM
+// bundle. The caller passes the fixture's absolute path (resolved from the
+// tests/workflow-deploy project, which owns the fixture) rather than importing
+// it, so this hub-agent-project helper carries no cross-project type edge.
+//
+// The written `package.json` declares BOTH `interchange.tools` (the bundle
+// entry) and `interchange.credentials` (the handle the tool resolves), so the
+// launch-time declared-vs-bound reconcile sees the handle the delivery binds.
+export async function buildSyntheticCredentialToolTarball(
+  registerTempDir: (dir: string) => void,
+  opts: SyntheticCredentialToolOpts,
+): Promise<Uint8Array> {
+  const stagingDir = await fs.promises.mkdtemp(
+    path.join(os.tmpdir(), "cred-tool-fixture-"),
+  );
+  registerTempDir(stagingDir);
+  const packageDir = path.join(stagingDir, "package");
+  await fs.promises.mkdir(packageDir, { recursive: true });
+
+  await fs.promises.writeFile(
+    path.join(packageDir, "package.json"),
+    JSON.stringify({
+      name: opts.packageName,
+      version: opts.version,
+      type: "module",
+      interchange: {
+        tools: "./sidecar-bundle.js",
+        credentials: [{ handle: opts.handle }],
+      },
+    }),
+  );
+
+  // Resolve `@intx/*` workspace deps to their TypeScript source via the
+  // `intx-src` export condition (mirroring bin/build-builtins.ts), so the
+  // packed bundle is a genuine module the production loader imports.
+  const result = await Bun.build({
+    entrypoints: [opts.entryPath],
+    outdir: packageDir,
+    naming: "sidecar-bundle.js",
+    target: "node",
+    format: "esm",
+    conditions: ["intx-src"],
+    minify: false,
+    sourcemap: "none",
+  });
+  if (!result.success) {
+    const messages = result.logs
+      .map((log) => (log instanceof Error ? log.message : String(log)))
+      .join("\n");
+    throw new Error(
+      `buildSyntheticCredentialToolTarball: Bun.build failed for ${opts.entryPath}:\n${messages || "(no diagnostics)"}`,
+    );
+  }
+
+  const tarballPath = path.join(stagingDir, "out.tgz");
+  await tar.create({ cwd: stagingDir, gzip: true, file: tarballPath }, [
+    "package",
+  ]);
+  const bytes = await fs.promises.readFile(tarballPath);
+  return new Uint8Array(bytes);
+}
+
 export type HubEnv = {
   server: ReturnType<typeof Bun.serve>;
   router: SidecarRouter;
@@ -610,6 +717,14 @@ export async function startHub(
     transportBackedMailTool?: boolean;
     approvalMarkedMailTool?: boolean;
     registerSignalCorrelation?: SidecarLookups["registerSignalCorrelation"];
+    materializeMailTriggeredRunGrants?: SidecarLookups["materializeMailTriggeredRunGrants"];
+    /**
+     * When set, seed a second tool package alongside tools-mail: a real
+     * credential-consuming bundle compiled from a fixture module, so the
+     * credential-delivery e2e drives the production loader + capability path
+     * against a genuine tool that resolves a mediated credential.
+     */
+    credentialTool?: SyntheticCredentialToolOpts;
   } = {},
 ): Promise<HubEnv> {
   const agentEvents: HubEnv["agentEvents"] = [];
@@ -659,8 +774,13 @@ export async function startHub(
     // The spawned sidecar presents TOKEN on its handshake; verify it and
     // resolve to the fixed integration sidecar id, exercising the real
     // token-authenticated handshake rather than accepting any token.
-    authenticateSidecar: async ({ token }) =>
-      token === TOKEN ? { kind: "sidecar", sidecarId: SIDECAR_ID } : null,
+    authenticateSidecar: async ({ token }) => {
+      if (token === TOKEN) return { kind: "shared", sidecarId: SIDECAR_ID };
+      if (token === SECOND_TOKEN) {
+        return { kind: "shared", sidecarId: SECOND_SIDECAR_ID };
+      }
+      return null;
+    },
     lookups: {
       // Answer a reconnecting sidecar's ownership challenge for a deployment
       // address with the Ed25519 key that address acked at deploy time.
@@ -774,6 +894,17 @@ export async function startHub(
       ...(opts.registerSignalCorrelation !== undefined
         ? { registerSignalCorrelation: opts.registerSignalCorrelation }
         : {}),
+      // Materialize a mail-triggered run's grants for a workflow-derived
+      // recipient. Only the federated-mail capstone supplies it (the real
+      // `createMailTriggeredRunGrantsMaterializer` backed by a test DB);
+      // every other test leaves it unset, so `deliverMailToRecipient`
+      // routes inbound mail without materializing a run's grants.
+      ...(opts.materializeMailTriggeredRunGrants !== undefined
+        ? {
+            materializeMailTriggeredRunGrants:
+              opts.materializeMailTriggeredRunGrants,
+          }
+        : {}),
     },
   });
   router.events.on("agent.event", ({ agentAddress, sessionId, event }) => {
@@ -783,10 +914,44 @@ export async function startHub(
     deployAcks.set(agentAddress, publicKey);
   });
 
-  const tarballBytes = await buildSyntheticToolsMailTarball(registerTempDir, {
-    ...(opts.transportBackedMailTool === true ? { transportBacked: true } : {}),
-    ...(opts.approvalMarkedMailTool === true ? { approvalMarked: true } : {}),
-  });
+  // Seed one tarball per tool package into the single package-registry asset.
+  // tools-mail is always present; the credential-consuming package joins it
+  // only when the caller opts in. The registry walker reads each tarball's
+  // own `package.json` to resolve a pin, so the filename is arbitrary as long
+  // as it is both listed and readable through the AssetService below.
+  const tarballs: { filename: string; bytes: Uint8Array }[] = [
+    {
+      filename: TARBALL_FILENAME,
+      bytes: await buildSyntheticToolsMailTarball(registerTempDir, {
+        ...(opts.transportBackedMailTool === true
+          ? { transportBacked: true }
+          : {}),
+        ...(opts.approvalMarkedMailTool === true
+          ? { approvalMarked: true }
+          : {}),
+      }),
+    },
+  ];
+  if (opts.credentialTool !== undefined) {
+    const credentialTool = opts.credentialTool;
+    const filename = `${credentialTool.packageName
+      .replace(/^@intx\//, "")
+      .replace(/\//g, "-")}-${credentialTool.version}.tgz`;
+    tarballs.push({
+      filename,
+      bytes: await buildSyntheticCredentialToolTarball(
+        registerTempDir,
+        credentialTool,
+      ),
+    });
+  }
+  const tarballByBlobPath = new Map(
+    tarballs.map((t) => [`tarballs/${t.filename}`, t.bytes]),
+  );
+  const seededFiles: Record<string, Uint8Array> = {};
+  for (const t of tarballs) {
+    seededFiles[`tarballs/${t.filename}`] = t.bytes;
+  }
   await agentRepoStore.repoStore.initRepo({
     kind: "package-registry",
     id: ASSET_ID,
@@ -796,10 +961,8 @@ export async function startHub(
     { kind: "package-registry", id: ASSET_ID },
     DEFAULT_ASSET_REF,
     {
-      files: {
-        [`tarballs/${TARBALL_FILENAME}`]: tarballBytes,
-      },
-      message: "Seed tools-mail tarball",
+      files: seededFiles,
+      message: "Seed tool-package tarballs",
     },
   );
 
@@ -827,18 +990,15 @@ export async function startHub(
     populateAsset: () => {
       throw new Error("deploy-flow: AssetService.populateAsset not used");
     },
-    attachAsset: () => {
-      throw new Error("deploy-flow: AssetService.attachAsset not used");
-    },
-    listAgentAssets: async (_agentId: string) => [],
     readAssetBlob: async ({ assetId, path: p }) => {
       if (assetId !== ASSET_ID) {
         throw new Error(`deploy-flow: unexpected readAssetBlob ${assetId}`);
       }
-      if (p !== `tarballs/${TARBALL_FILENAME}`) {
+      const bytes = tarballByBlobPath.get(p);
+      if (bytes === undefined) {
         throw new Error(`deploy-flow: unexpected blob path ${p}`);
       }
-      return tarballBytes;
+      return bytes;
     },
     listAssetBlobs: async ({ assetId, dir: d }) => {
       if (assetId !== ASSET_ID) {
@@ -847,7 +1007,7 @@ export async function startHub(
       if (d !== "tarballs") {
         throw new Error(`deploy-flow: unexpected list dir ${d}`);
       }
-      return [TARBALL_FILENAME];
+      return tarballs.map((t) => t.filename);
     },
   };
   const fakeDb = {
@@ -1073,6 +1233,12 @@ export type StartDeployFlowEnvOpts = {
    */
   inferenceToolCall?: MockToolCall;
   /**
+   * When true, `inferenceToolCall` drives the tool on every run rather than
+   * once across the env's lifetime. See `StartMockInferenceOpts.
+   * toolCallEachRun`; used to re-run a credential tool across a rotation.
+   */
+  inferenceToolCallEachRun?: boolean;
+  /**
    * Persistent tool-call behavior for the approval capstone: the mock
    * re-issues the named tool until the history carries its result, then
    * replies with `${resultPrefix}<result>`. See
@@ -1109,6 +1275,12 @@ export type StartDeployFlowEnvOpts = {
    */
   approvalMarkedMailTool?: boolean;
   /**
+   * When set, seed a second tool package -- a real credential-consuming
+   * bundle compiled from a fixture module -- alongside tools-mail, so a test
+   * can pin it and drive the credential-delivery + capability rail end-to-end.
+   */
+  credentialTool?: SyntheticCredentialToolOpts;
+  /**
    * Co-write hook for the `signal.correlation.register` frame a suspending
    * agent step emits. When set, the mock hub's sidecar router wires it as
    * the `registerSignalCorrelation` lookup, so a parked run's correlation +
@@ -1117,32 +1289,18 @@ export type StartDeployFlowEnvOpts = {
    * other test leaves it unset and the frame is dropped with a warning.
    */
   registerSignalCorrelation?: SidecarLookups["registerSignalCorrelation"];
+  /**
+   * Materializer for a mail-triggered run's grants, wired into the mock
+   * hub's sidecar router as the `materializeMailTriggeredRunGrants` lookup.
+   * When a `mail.outbound` frame names a workflow-derived recipient, the
+   * router's `deliverMailToRecipient` calls this to stage the receiving
+   * run's grants before forwarding the mail. Only the federated-mail
+   * capstone supplies it (the real `createMailTriggeredRunGrantsMaterializer`
+   * backed by a test DB); every other test leaves it unset and the
+   * mail is routed without materialization.
+   */
+  materializeMailTriggeredRunGrants?: SidecarLookups["materializeMailTriggeredRunGrants"];
 };
-
-/**
- * Stop a `Bun.serve` server, bounding the wait so teardown cannot hang.
- *
- * A server-initiated WebSocket close (`ws.close()` from the hub upgrade
- * callback, which the reconnect helpers use to drop the hub link) does
- * NOT fire the server-side `onClose`, so Bun keeps counting the dropped
- * connection as live. `server.stop(true)` and `server.stop(false)` both
- * then wait forever for that phantom connection to drain -- a reproducible
- * Bun/Hono behavior, not a product concern (the sidecar has already been
- * killed and every tracked handle closed by the time this runs). This is
- * a deliberate teardown bound, not an error swallow: the server's only
- * remaining job is releasing its port, which the exiting test process
- * reclaims regardless. Tests that never drop the hub link resolve the
- * `stop(true)` promptly and never hit the bound.
- */
-async function stopServerBounded(
-  server: ReturnType<typeof Bun.serve>,
-): Promise<void> {
-  const STOP_TIMEOUT_MS = 1_000;
-  await Promise.race([
-    server.stop(true),
-    new Promise<void>((resolve) => setTimeout(resolve, STOP_TIMEOUT_MS)),
-  ]);
-}
 
 // Compose the full deploy-flow env: hub server, mock inference, sidecar
 // subprocess. Owns every tempdir these subsystems open and tears them
@@ -1167,10 +1325,22 @@ export async function startDeployFlowEnv(
     ...(opts.registerSignalCorrelation !== undefined
       ? { registerSignalCorrelation: opts.registerSignalCorrelation }
       : {}),
+    ...(opts.materializeMailTriggeredRunGrants !== undefined
+      ? {
+          materializeMailTriggeredRunGrants:
+            opts.materializeMailTriggeredRunGrants,
+        }
+      : {}),
+    ...(opts.credentialTool !== undefined
+      ? { credentialTool: opts.credentialTool }
+      : {}),
   });
   const inference = startMockInference({
     ...(opts.inferenceToolCall !== undefined
       ? { toolCall: opts.inferenceToolCall }
+      : {}),
+    ...(opts.inferenceToolCallEachRun === true
+      ? { toolCallEachRun: true }
       : {}),
     ...(opts.inferenceApprovalToolCall !== undefined
       ? { approvalToolCall: opts.inferenceApprovalToolCall }
@@ -1616,12 +1786,11 @@ export async function fireMailTrigger(
   const rawMessage = assembleMessage(headers, signedContent, signature);
   const base64 = base64Encode(rawMessage);
 
-  // Deliver the run's grants before the trigger mail, exactly as the
-  // production trigger route does: the runId is the mail's Message-ID, and
-  // same-address FIFO guarantees the `run.grants` frame lands ahead of the
-  // mail that dispatches the run. `messageId` here is the RFC 2822 header
-  // value; the sidecar derives the same runId from the mail bytes.
-  const runId = messageId;
+  // Deliver the run's grants before the trigger mail. The runId is the
+  // deployment's mail address (not the per-message Message-ID); derive it
+  // through the same shared helper the production route and sidecar use, so
+  // this fixture cannot mask a divergence by hand-picking the right value.
+  const runId = deriveWorkflowRunId(address);
   const grantsDelivered = env.hub.router.sendRunGrants(
     address,
     runId,

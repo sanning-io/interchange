@@ -5,13 +5,17 @@ export type {
   IterateCaptureStepsOpts,
 } from "./plugin";
 export { resolveTurn1Response, type Turn1Reconstructor } from "./plugin";
-export { runCapture, type FetchLike, type RunCaptureOpts } from "./runner";
+export {
+  runCapture,
+  type FetchLike,
+  type RunCaptureOpts,
+  type RunCaptureResult,
+} from "./runner";
 export {
   writeCapture,
   type ResponseBody,
   type WriteCaptureInput,
 } from "./write-capture";
-export { detectResponseKind, type ResponseKind } from "./content-type";
 export { assertNotCI } from "./ci-guard";
 export { requireEnv, requireEnvSet } from "./env";
 export {
@@ -22,4 +26,8 @@ export {
   type ParsedCLIHelp,
   type ParsedCLIError,
 } from "./cli";
-export { buildManifest, type BuildManifestOpts } from "./manifest";
+export {
+  extractDispatches,
+  writeDispatches,
+  type ReconstructedDispatch,
+} from "./dispatch-reconstruction";

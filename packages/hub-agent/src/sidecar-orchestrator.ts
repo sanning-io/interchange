@@ -32,6 +32,8 @@ import {
   type DrainInboundRouter,
   type GrantsInboundRouter,
   type SourcesInboundRouter,
+  type CredentialsInboundRouter,
+  type WorkflowRunPackApplier,
   type ReconnectScheduler,
 } from "./ws/hub-link";
 
@@ -148,6 +150,16 @@ export type SidecarOrchestratorConfig = {
    * `createHubLink`.
    */
   sourcesInboundRouter?: SourcesInboundRouter;
+  /** Apply Hub-authoritative workflow-run refs before replacement deploy. */
+  applyWorkflowRunPack: WorkflowRunPackApplier;
+  /**
+   * Optional inbound credential-delivery dispatcher the link consults on every
+   * inbound `credentials.update` frame. Production wires this against the
+   * sidecar's per-deployment credential handler registry so a delivery flows
+   * into the supervisor's `deliverCredentials`. The orchestrator forwards the
+   * binding unchanged to `createHubLink`.
+   */
+  credentialsInboundRouter?: CredentialsInboundRouter;
   /**
    * Returns the workflow-substrate deployment addresses this sidecar
    * currently hosts. Forwarded to the hub link, which announces them on
@@ -206,6 +218,8 @@ export function createSidecarOrchestrator(
     drainInboundRouter,
     grantsInboundRouter,
     sourcesInboundRouter,
+    credentialsInboundRouter,
+    applyWorkflowRunPack,
     getWorkflowAddresses,
     onWorkflowAddressesRoutable,
     onWorkflowAddressesUnroutable,
@@ -289,11 +303,15 @@ export function createSidecarOrchestrator(
     sessions,
     keyStore,
     deployRouter,
+    applyWorkflowRunPack,
     ...(mailInboundRouter !== undefined ? { mailInboundRouter } : {}),
     ...(signalInboundRouter !== undefined ? { signalInboundRouter } : {}),
     ...(drainInboundRouter !== undefined ? { drainInboundRouter } : {}),
     ...(grantsInboundRouter !== undefined ? { grantsInboundRouter } : {}),
     ...(sourcesInboundRouter !== undefined ? { sourcesInboundRouter } : {}),
+    ...(credentialsInboundRouter !== undefined
+      ? { credentialsInboundRouter }
+      : {}),
     ...(getWorkflowAddresses !== undefined ? { getWorkflowAddresses } : {}),
     ...(onWorkflowAddressesRoutable !== undefined
       ? { onWorkflowAddressesRoutable }

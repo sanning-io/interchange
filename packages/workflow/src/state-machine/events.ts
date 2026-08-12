@@ -9,6 +9,8 @@
 // legal in which states. See the design spec section 4 for the full
 // narrative of the cancellation, signal, and timer invariants.
 
+import type { ControlParkKind } from "@intx/types/runtime";
+
 export type RunId = string;
 export type StepId = string;
 export type AttemptId = number;
@@ -60,11 +62,11 @@ export interface RunStarted extends EventBase {
    *
    * The state machine enforces dedup against the run-scoped
    * `consumedMessageIds` set (a re-issued `RunStarted` for an
-   * already consumed message-id is rejected). The wider per-address
-   * FIFO serialization invariant (two `mail` triggers at the same
-   * address produce two `RunStarted`s in FIFO order, the second
-   * queues until the first completes) lives in the queue substrate;
-   * the runtime body has no role in enforcing it.
+   * already consumed message-id is rejected). The wider per-address FIFO
+   * invariant lives in the queue substrate: the first mail produces this
+   * RunStarted, live follow-up mail can become SignalReceived, and mail that
+   * reaches a terminal stable run is rejected without another RunStarted.
+   * The runtime body has no role in ordering the queue.
    */
   consumedMessageId?: string;
 }
@@ -105,6 +107,17 @@ export interface SignalAwaited extends EventBase {
   stepId: StepId;
   signalName: string;
   timeoutAt?: string;
+  /**
+   * The control-plane park kind, recorded so it survives a crash/reconnect:
+   * the reduced state alone cannot tell an `"input"` park (snapshot-less,
+   * never hub-registered) from an `"approval"` park, and the parked-
+   * correlation recovery must skip the former rather than throw looking for a
+   * snapshot it never had. Absent on a plain `awaitSignal` gate (not a
+   * control-plane park) and on logs written before the input kind existed --
+   * both read back as `"approval"` at the reducer, which is correct because
+   * every reserved-channel park before this change was an approval.
+   */
+  parkKind?: ControlParkKind;
 }
 
 export interface SignalReceived extends EventBase {
@@ -112,6 +125,21 @@ export interface SignalReceived extends EventBase {
   signalName: string;
   signalId: SignalId;
   payload: unknown;
+}
+
+/**
+ * Retire a step's outstanding `signal-relay` await without delivering a
+ * payload. An onTrigger container that proxied a body child's author-named
+ * `awaitSignal` up onto its own log commits this when the body progresses by
+ * another exit -- its own await timeout, or any later body event -- before the
+ * external signal arrives, so a late signal does not resolve a park the body no
+ * longer waits on. Distinct from `SignalReceived`: nothing is delivered, the
+ * await is simply torn down.
+ */
+export interface SignalAwaitAbandoned extends EventBase {
+  kind: "SignalAwaitAbandoned";
+  stepId: StepId;
+  signalName: string;
 }
 
 export interface TimerSet extends EventBase {
@@ -185,6 +213,7 @@ export type WorkflowEvent =
   | AttemptScheduled
   | SignalAwaited
   | SignalReceived
+  | SignalAwaitAbandoned
   | TimerSet
   | TimerFired
   | CancelRequested

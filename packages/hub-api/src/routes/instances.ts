@@ -1,4 +1,4 @@
-import { eq, and, inArray, asc } from "drizzle-orm";
+import { eq, and, inArray, asc, isNull, isNotNull } from "drizzle-orm";
 import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { describeRoute, resolver, validator } from "hono-openapi";
@@ -6,8 +6,6 @@ import { streamSSE } from "hono/streaming";
 import { type } from "arktype";
 
 import {
-  agent,
-  agentInstance,
   agentRole,
   agentSession,
   grant as grantTable,
@@ -17,8 +15,10 @@ import {
   principalRole,
   sessionMail,
   turnPart,
+  workflowDefinition,
+  workflowRun,
 } from "@intx/db/schema";
-import { parseAgentRow, resolveModelSources } from "@intx/db";
+import { buildCredentialDelivery, parseWorkflowDefinitionRow } from "@intx/db";
 import type { DB } from "@intx/db";
 import { authorize } from "@intx/authz";
 import type { ConditionRegistry, GrantStore } from "@intx/types/authz";
@@ -26,9 +26,9 @@ import { parseMailToEmail, extractPartByPath } from "@intx/mime";
 
 import { generateKeyPair, createEd25519Crypto } from "@intx/crypto";
 import {
-  CreateAgentInstance,
-  AgentInstanceResponse,
-  AgentHealth,
+  CreateWorkflowRun,
+  WorkflowRunResponse,
+  WorkflowRunHealth,
   OfferingDetail,
   GrantRequirement,
   SendMessage,
@@ -39,23 +39,40 @@ import {
   formatAgentAddress,
   paginatedSchema,
 } from "@intx/types";
-import type { ProviderPreference } from "@intx/types";
+import type { CredentialCipher, ProviderPreference } from "@intx/types";
+import type { CredentialDelivery } from "@intx/types/sidecar";
 import type { CryptoProvider } from "@intx/types/runtime";
 import {
+  findRoutableById,
+  resolveRunIdForSession,
+  resolveRunSessionId,
+  runRowToRoutableRecord,
   SessionLaunchError,
+  type AssetService,
   type EventCollectorRegistry,
+  type RoutableRecord,
   type SessionService,
   type SidecarRouter,
 } from "@intx/hub-sessions";
+import { extractFoldedBody } from "@intx/workflow-deploy";
+import { hydrateDefinition } from "../run-grant-materialization";
+import { resolveDefinitionSources } from "../run-source-resolution";
 import { formatOffering } from "./offerings";
+import {
+  formatInstanceView,
+  instanceStatusOf,
+  mapRunStatusToInstanceStatus,
+} from "./instance-view";
 import { validateAttachments } from "../attachment-validation";
-import { resolveGrantMaterialization } from "../grant-materialization";
+import {
+  resolveGrantMaterialization,
+  makeGrantRow,
+} from "../grant-materialization";
 
 import type { TenantEnv } from "../context";
 import { idResource } from "../middleware/grant";
 import type { RequireGrant } from "../middleware/grant";
 import { generateId } from "@intx/hub-common";
-import { first, ts } from "../format";
 import {
   parsePageParams,
   cursorCondition,
@@ -73,24 +90,65 @@ const GrantRequirements = GrantRequirement.array();
 // rejected here before the JSON parser allocates a giant string.
 const MAX_MAIL_BODY_BYTES = 44 * 1024 * 1024;
 
-function formatInstance(
-  row: typeof agentInstance.$inferSelect,
-  agentName: string,
-) {
-  return {
-    id: row.id,
-    agentId: row.agentId,
-    agentName,
-    tenantId: row.tenantId,
-    address: row.address,
-    status: row.status,
-    publicKey: row.publicKey ?? null,
-    kernelId: row.kernelId ?? null,
-    sidecarId: row.sidecarId ?? null,
-    createdAt: ts(row.createdAt),
-    updatedAt: ts(row.updatedAt),
-    endedAt: row.endedAt ? ts(row.endedAt) : null,
+type InstanceStatusFilter =
+  | "deployed"
+  | "running"
+  | "updating"
+  | "error"
+  | "stopped";
+
+function isInstanceStatusFilter(
+  status: string | undefined,
+): status is InstanceStatusFilter {
+  return (
+    status === "deployed" ||
+    status === "running" ||
+    status === "updating" ||
+    status === "error" ||
+    status === "stopped"
+  );
+}
+
+type WorkflowRunStatus = (typeof workflowRun.$inferSelect)["status"];
+
+// The `workflow_run` statuses that present as a given instance-status filter,
+// derived as the inverse of `mapRunStatusToInstanceStatus` so the two cannot
+// drift: every run status is bucketed under the instance status it maps onto.
+// No run status maps onto `deployed` or `updating`, so those filters select no
+// runs (empty array) and the caller skips the run query entirely.
+const RUN_STATUSES_BY_INSTANCE_STATUS: Record<
+  InstanceStatusFilter,
+  WorkflowRunStatus[]
+> = (() => {
+  const byStatus: Record<InstanceStatusFilter, WorkflowRunStatus[]> = {
+    deployed: [],
+    running: [],
+    updating: [],
+    error: [],
+    stopped: [],
   };
+  for (const runStatus of workflowRun.status.enumValues) {
+    byStatus[mapRunStatusToInstanceStatus(runStatus)].push(runStatus);
+  }
+  return byStatus;
+})();
+
+// The row shape the folded-run list sub-query projects: the run columns the
+// instance view needs, plus the definition name. The sub-query already gates on
+// an instance-kind definition, so the kind is not carried on the row.
+type FoldedRunListRow = {
+  run: typeof workflowRun.$inferSelect;
+  definitionName: string;
+};
+
+// Shape a folded run into the fold-normalized record the instance view expects,
+// through the same builder `findRoutableById` uses. The sub-query filters
+// `address` non-null, so a null here is a broken invariant and surfaces loudly.
+function foldedRunToRecord(row: FoldedRunListRow): RoutableRecord {
+  if (row.run.address === null) {
+    throw new Error(`folded run ${row.run.id} listed with a null address`);
+  }
+  return runRowToRoutableRecord(row.run, row.run.address);
 }
 
 export type CreateInstanceRoutesDeps = {
@@ -101,6 +159,8 @@ export type CreateInstanceRoutesDeps = {
   grantStore: GrantStore;
   conditionRegistry: ConditionRegistry;
   requireGrant: RequireGrant;
+  assetService: AssetService | null;
+  credentialCipher: CredentialCipher;
 };
 
 export function createInstanceRoutes({
@@ -111,12 +171,14 @@ export function createInstanceRoutes({
   grantStore,
   conditionRegistry,
   requireGrant,
+  assetService,
+  credentialCipher,
 }: CreateInstanceRoutesDeps): Hono<TenantEnv> {
   const app = new Hono<TenantEnv>();
 
   app.post(
     "/",
-    requireGrant("instance:*", "create"),
+    requireGrant("workflow-run:*", "create"),
     describeRoute({
       tags: ["Instances"],
       summary: "Deploy an agent instance",
@@ -126,7 +188,7 @@ export function createInstanceRoutes({
         201: {
           description: "Instance deployed",
           content: {
-            "application/json": { schema: resolver(AgentInstanceResponse) },
+            "application/json": { schema: resolver(WorkflowRunResponse) },
           },
         },
         404: {
@@ -149,36 +211,72 @@ export function createInstanceRoutes({
         },
       },
     }),
-    validator("json", CreateAgentInstance),
+    validator("json", CreateWorkflowRun),
     async (c) => {
       const tenant = c.get("tenant");
       const principal = c.get("principal");
       const body = c.req.valid("json");
 
-      const row = await db.query.agent.findFirst({
-        where: and(eq(agent.id, body.agentId), eq(agent.tenantId, tenant.id)),
+      // The caller names the definition directly by its id. It is
+      // authoritative for launchability and model resolution.
+      const definitionRow = await db.query.workflowDefinition.findFirst({
+        where: and(
+          eq(workflowDefinition.id, body.definitionId),
+          eq(workflowDefinition.tenantId, tenant.id),
+        ),
       });
-
-      if (!row) {
+      if (definitionRow === undefined) {
         return c.json(
-          { error: { code: "not_found", message: "Agent not found" } },
+          { error: { code: "not_found", message: "Definition not found" } },
           404,
         );
       }
+      const definition = parseWorkflowDefinitionRow(definitionRow);
 
-      if (row.status !== "deployed") {
+      if (definition.status !== "deployed") {
         return c.json(
           {
             error: {
               code: "conflict",
-              message: `Agent is not in a launchable state (status: ${row.status})`,
+              message: `Definition is not in a launchable state (status: ${definition.status})`,
             },
           },
           409,
         );
       }
 
-      if (!row.systemPrompt) {
+      // Source the launch body from the definition's materialized asset (the
+      // frozen `workflow.json`), not the origin agent row. The materialization
+      // cliff runs before any launch, so a null asset id is a broken invariant,
+      // not a normal state -- reject loudly rather than launch a body-less
+      // instance.
+      if (definition.assetId === null) {
+        return c.json(
+          {
+            error: {
+              code: "conflict",
+              message: "This definition has not been materialized",
+            },
+          },
+          409,
+        );
+      }
+      if (assetService === null) {
+        return c.json(
+          {
+            error: {
+              code: "unavailable",
+              message:
+                "Asset service is not configured; cannot hydrate the body",
+            },
+          },
+          503,
+        );
+      }
+      const foldedBody = extractFoldedBody(
+        await hydrateDefinition(assetService, definition.assetId),
+      );
+      if (!foldedBody.systemPrompt) {
         return c.json(
           {
             error: {
@@ -196,9 +294,21 @@ export function createInstanceRoutes({
 
       // --- Inference source resolution (catalog) ---
 
-      const creatorPrincipalId = row.creatorPrincipalId;
-
-      const modelRequirements = parseAgentRow(row).modelRequirements ?? [];
+      // The definition carries the creator the fold copied off its agent. It is
+      // a nullable column but always set for a folded definition; a null here is
+      // corruption, so fail loud rather than resolve grants against no creator.
+      const creatorPrincipalId = definition.creatorPrincipalId;
+      if (creatorPrincipalId === null) {
+        return c.json(
+          {
+            error: {
+              code: "conflict",
+              message: "This definition has no creator principal",
+            },
+          },
+          409,
+        );
+      }
 
       // The invoker's launch-time preference reorders or restricts the
       // tenant-visible providers; it cannot introduce one the catalog lacks.
@@ -207,58 +317,22 @@ export function createInstanceRoutes({
         invokerPreferences[preference.model] = preference.providers;
       }
 
-      // A model source only carries a credential secret when the definition's
-      // creator holds `credential:{id}` / `use` for it. Resolution authorizes
-      // the creator against these grants and withholds the secret otherwise,
-      // surfacing an unauthorized credential as a not-launchable skip below.
-      // Collect across the tenant ancestor chain: credential resolution reaches
-      // inherited credentials up the chain, and the authorizing `use` grant is
-      // stamped with the credential's own (ancestor) tenant, so single-tenant
-      // collection would withhold a legitimately inherited credential.
-      const creatorSourceGrants = await grantStore.collectGrantsInChain(
-        creatorPrincipalId,
-        tenant.id,
-      );
-
-      const resolution = await resolveModelSources(
+      const resolution = await resolveDefinitionSources({
         db,
-        tenant.id,
-        modelRequirements,
-        creatorSourceGrants,
-        { invokerPreferences },
-      );
+        tenantId: tenant.id,
+        modelRequirements: definition.modelRequirements,
+        fallbackModel: foldedBody.model,
+        invokerPreferences,
+        credentialCipher,
+      });
       if (!resolution.ok) {
-        const message =
-          resolution.reason === "no_requirements"
-            ? "Agent declares no model requirements; cannot resolve any inference sources"
-            : `No launchable inference source for model "${resolution.model}"` +
-              (resolution.skips.length > 0
-                ? ` (${resolution.skips
-                    .map((skip) => `${skip.provider}: ${skip.reason}`)
-                    .join(", ")})`
-                : "");
-        return c.json({ error: { code: "not_launchable", message } }, 409);
-      }
-      const sources = resolution.sources;
-
-      // The head of the catalog-priority-ordered list is the active source;
-      // the tail is the failover chain. resolveModelSources only returns ok
-      // when every required model produced at least one source, so the head
-      // is always present — the guard satisfies the type and would fail
-      // loudly if that invariant ever broke.
-      const [headSource] = sources;
-      if (headSource === undefined) {
         return c.json(
-          {
-            error: {
-              code: "not_launchable",
-              message: "Inference source resolution produced no sources",
-            },
-          },
+          { error: { code: "not_launchable", message: resolution.message } },
           409,
         );
       }
-      const defaultSource = headSource.id;
+      const sources = resolution.sources;
+      const defaultSource = resolution.defaultSource;
 
       // --- Grant requirement resolution (creator/invoker delegation) ---
 
@@ -266,7 +340,7 @@ export function createInstanceRoutes({
 
       const now = new Date();
 
-      const parsedGrantReqs = GrantRequirements(row.grantRequirements ?? []);
+      const parsedGrantReqs = GrantRequirements(foldedBody.grantRequirements);
       if (parsedGrantReqs instanceof type.errors) {
         return c.json(
           {
@@ -308,10 +382,74 @@ export function createInstanceRoutes({
       }
       const grantRows = materialization.grantRows;
 
-      // --- Resolve agent role assignments for the instance principal ---
+      // --- Credential binding resolution ---
+      //
+      // Resolve + decrypt the folded body's credential bindings into the
+      // material delivered to the tools and the `credential:{id}` / `use` grants
+      // stamped below. The builder's shape also anticipates a planned reconnect
+      // re-push that would re-deliver the material alone. A launch-blocking
+      // configuration failure (unresolved /
+      // no-origin / ambiguous binding) is a fail-closed 409 -- the same bucket
+      // as every other non-authority launchability failure here; a DB read fault
+      // throws from the builder and surfaces as 500, never mislabeled a terminal
+      // 409. No production `workflow.json` carries bindings yet, so this path
+      // runs only under test fixtures today.
+      const deliveryResult = await buildCredentialDelivery({
+        db,
+        tenantId: tenant.id,
+        bindings: foldedBody.credentialBindings,
+        creatorPrincipalId,
+        invokerPrincipalId: principal.id,
+        credentialCipher,
+      });
+      if (!deliveryResult.ok) {
+        return c.json(
+          {
+            error: {
+              code: "not_launchable",
+              message: deliveryResult.reason.message,
+            },
+          },
+          409,
+        );
+      }
+      const credentialDelivery: CredentialDelivery | undefined =
+        deliveryResult.delivery;
 
+      // A binding's credential is authorized by tenant ownership, already proven
+      // by buildCredentialDelivery's resolution -- there is nothing to
+      // re-authorize. Stamp each `credential:{id}` / `use` grant, scoped to its
+      // consuming tool package by the `{ tool }` condition the runtime
+      // per-consumer gate reads. origin `system`: the authority is tenant
+      // ownership, not a delegated personal grant.
+      for (const bindingGrant of deliveryResult.bindingGrants) {
+        grantRows.push(
+          makeGrantRow({
+            tenantId: tenant.id,
+            principalId: instancePrincipalId,
+            resource: bindingGrant.resource,
+            action: "use",
+            effect: "allow",
+            conditions: bindingGrant.conditions,
+            origin: "system",
+            expiresAt: null,
+            now,
+          }),
+        );
+      }
+
+      // An instance-kind `workflow_definition` launches as a `workflow_run`
+      // rather than an `agent_instance`: the run IS the launched instance. The
+      // plain `ins_<hex>` address, per-launch principal, grants, and deploy are
+      // identical to a legacy instance launch; only the persisted row (and how
+      // its session is keyed) differ.
+
+      // --- Resolve role assignments for the instance principal ---
+
+      // Role assignments hang off the folded definition -- agent_role.agent_id
+      // holds definition ids.
       const agentRoleRows = await db.query.agentRole.findMany({
-        where: eq(agentRole.agentId, row.id),
+        where: eq(agentRole.agentId, definition.id),
       });
       const agentRoleIds = agentRoleRows.map((a) => a.roleId);
       const agentRoleAssignments =
@@ -330,11 +468,13 @@ export function createInstanceRoutes({
       const sessionId = generateId("session");
 
       await db.transaction(async (tx) => {
-        // Create per-instance principal
+        // Create the endpoint's principal. A folded run is a workflow run, so
+        // its principal is `workflow`-kind, converging on the native run's
+        // principal shape. The refId is the instance id.
         await tx.insert(principalTable).values({
           id: instancePrincipalId,
           tenantId: tenant.id,
-          kind: "agent",
+          kind: "workflow",
           refId: instanceId,
           status: "active",
           createdAt: now,
@@ -356,29 +496,34 @@ export function createInstanceRoutes({
           await tx.insert(grantTable).values(g);
         }
 
-        // Transitional agentSession row (FK requirement)
+        // The agentSession row is keyed to the folded definition (agent_id) and
+        // to the run's principal (`workflow_run.principalId`, which is
+        // `instancePrincipalId`), so the run <-> session bridge resolves the
+        // session by that shared principal.
         await tx.insert(agentSession).values({
           id: sessionId,
           tenantId: tenant.id,
-          agentId: row.id,
-          principalId: principal.id,
+          agentId: definition.id,
+          principalId: instancePrincipalId,
           status: "active",
           createdAt: now,
           updatedAt: now,
         });
 
-        // Create instance row
-        await tx.insert(agentInstance).values({
+        // The folded run IS the launched instance: it owns the plain routing
+        // address and carries the runtime bindings an agent_instance would.
+        // `deploymentId` is null (a folded run has no deployment); the public
+        // key lands later at deploy-ack.
+        await tx.insert(workflowRun).values({
           id: instanceId,
-          agentId: row.id,
+          definitionId: definition.id,
+          deploymentId: null,
           tenantId: tenant.id,
           principalId: instancePrincipalId,
           address: agentAddress,
-          sessionId,
-          status: "deployed",
+          status: "running",
           modelPreferences: body.modelPreferences ?? null,
           createdAt: now,
-          updatedAt: now,
         });
 
         // Seed a creator-level read grant on the per-instance
@@ -404,35 +549,43 @@ export function createInstanceRoutes({
         tenant.id,
       );
 
+      // Open the inference-turn collector for the launched endpoint. The
+      // collector records turns under this id, which is the instance id or the
+      // folded run id from the shared id space -- inference_turn.instanceId
+      // carries no foreign key, so either is storable.
       eventCollectors.create(agentAddress, tenant.id, sessionId, instanceId);
 
       try {
         // Deploy the instance as a single-step workflow at the head: it runs
-        // as a supervised workflow-process child. The real `agentId` (row.id)
-        // is passed so the child resolves the instance's skills and pinned
-        // tool packages. The returned head public key is surfaced
-        // separately via the sidecar's `agent.deploy.ack`, so the route
-        // discards it here.
+        // as a supervised workflow-process child. The deploy keys by the
+        // instance id -- the surviving id the address encodes and every
+        // deploy-ref reader resolves by (the child resolves its skills and
+        // pinned tool packages by mailbox address, not this id). The returned
+        // head public key is surfaced separately via the sidecar's
+        // `agent.deploy.ack`, so the route discards it here.
         await sessionService.deployInstanceAtHead({
           agentAddress,
-          agentId: row.id,
+          agentId: instanceId,
           instanceId,
           config: {
             sessionId,
-            agentId: row.id,
+            agentId: instanceId,
             tenantId: tenant.id,
             principalId: instancePrincipalId,
             agentAddress,
-            systemPrompt: row.systemPrompt,
+            systemPrompt: foldedBody.systemPrompt,
             tools: [],
             grants,
             sources,
             defaultSource,
           },
-          toolPackagePins: parseAgentRow(row).toolPackages,
+          toolPackagePins: foldedBody.toolPackagePins,
           deployContent: {
-            systemPrompt: row.systemPrompt,
+            systemPrompt: foldedBody.systemPrompt,
           },
+          ...(credentialDelivery !== undefined
+            ? { credentials: credentialDelivery }
+            : {}),
         });
       } catch (err) {
         eventCollectors.abandon(agentAddress);
@@ -446,15 +599,16 @@ export function createInstanceRoutes({
 
         const leaked = err instanceof SessionLaunchError && err.leakedAgent;
 
+        // A leaked deploy left a running child. Mark the run failed but leave
+        // it routable (endedAt null), so the leaked child stays reachable to
+        // inspect or clean up. Otherwise roll the run back entirely.
         if (leaked) {
           await db
-            .update(agentInstance)
-            .set({ status: "error", updatedAt: failedAt })
-            .where(eq(agentInstance.id, instanceId));
+            .update(workflowRun)
+            .set({ status: "failed" })
+            .where(eq(workflowRun.id, instanceId));
         } else {
-          await db
-            .delete(agentInstance)
-            .where(eq(agentInstance.id, instanceId));
+          await db.delete(workflowRun).where(eq(workflowRun.id, instanceId));
         }
 
         // Deactivate the instance principal created during this launch
@@ -477,30 +631,38 @@ export function createInstanceRoutes({
         );
       }
 
-      const launchedAt = new Date();
-
-      const launched = first(
-        await db
-          .update(agentInstance)
-          .set({ status: "running", updatedAt: launchedAt })
-          .where(eq(agentInstance.id, instanceId))
-          .returning(),
-      );
-
-      return c.json(formatInstance(launched, row.name), 201);
+      // The folded run was inserted `running`, so there is no deployed ->
+      // running flip. Shape it through the shared instance view so it reads
+      // identically to a later GET: the run has no `updatedAt` (it mirrors
+      // `createdAt`), and its public key is null until deploy-ack lands it.
+      const runRecord: RoutableRecord = {
+        id: instanceId,
+        tenantId: tenant.id,
+        address: agentAddress,
+        publicKey: null,
+        status: "running",
+        createdAt: now,
+        updatedAt: now,
+        endedAt: null,
+        definitionId: definition.id,
+        principalId: instancePrincipalId,
+        kernelId: null,
+        sidecarId: null,
+      };
+      return c.json(formatInstanceView(runRecord, definition.name), 201);
     },
   );
 
   app.get(
     "/",
-    requireGrant("instance:*", "read"),
+    requireGrant("workflow-run:*", "read"),
     describeRoute({
       tags: ["Instances"],
       summary: "List agent instances",
       description:
-        "Lists agent instances in the tenant. Filterable by agentId and status.",
+        "Lists agent instances in the tenant. Filterable by definitionId and status.",
       parameters: [
-        { name: "agentId", in: "query", schema: { type: "string" } },
+        { name: "definitionId", in: "query", schema: { type: "string" } },
         {
           name: "status",
           in: "query",
@@ -516,7 +678,7 @@ export function createInstanceRoutes({
           description: "List of instances",
           content: {
             "application/json": {
-              schema: resolver(paginatedSchema(AgentInstanceResponse)),
+              schema: resolver(paginatedSchema(WorkflowRunResponse)),
             },
           },
         },
@@ -524,47 +686,64 @@ export function createInstanceRoutes({
     }),
     async (c) => {
       const tenantCtx = c.get("tenant");
-      const agentId = c.req.query("agentId");
+      const definitionId = c.req.query("definitionId");
       const status = c.req.query("status");
       const { limit, cursor } = parsePageParams({
         cursor: c.req.query("cursor"),
         limit: c.req.query("limit"),
       });
 
-      const conditions = [eq(agentInstance.tenantId, tenantCtx.id)];
-      if (agentId !== undefined) {
-        conditions.push(eq(agentInstance.agentId, agentId));
-      }
-      if (
-        status === "deployed" ||
-        status === "running" ||
-        status === "updating" ||
-        status === "error" ||
-        status === "stopped"
-      ) {
-        conditions.push(eq(agentInstance.status, status));
-      }
-      if (cursor) {
-        conditions.push(
-          cursorCondition(agentInstance.createdAt, agentInstance.id, cursor),
-        );
-      }
+      // A run presents as an instance when it owns a plain routing address and
+      // carries no deployment id; the two predicates enforce that, dropping a
+      // deployment-anchored run (which carries its deployment id) and an
+      // address-less child run. When a status filter selects no run statuses
+      // (`deployed`/`updating`), skip the query entirely.
+      const statusFilter = isInstanceStatusFilter(status) ? status : undefined;
 
-      const rows = await db
-        .select({
-          instance: agentInstance,
-          agentName: agent.name,
-        })
-        .from(agentInstance)
-        .innerJoin(agent, eq(agentInstance.agentId, agent.id))
-        .where(and(...conditions))
-        .orderBy(...pageOrder(agentInstance.createdAt, agentInstance.id))
-        .limit(limit);
+      const runStatuses =
+        statusFilter === undefined
+          ? undefined
+          : RUN_STATUSES_BY_INSTANCE_STATUS[statusFilter];
+      let runRows: FoldedRunListRow[] = [];
+      if (runStatuses === undefined || runStatuses.length > 0) {
+        const runConditions = [
+          eq(workflowRun.tenantId, tenantCtx.id),
+          isNotNull(workflowRun.address),
+          isNull(workflowRun.deploymentId),
+        ];
+        if (definitionId !== undefined) {
+          runConditions.push(eq(workflowRun.definitionId, definitionId));
+        }
+        if (runStatuses !== undefined) {
+          runConditions.push(inArray(workflowRun.status, runStatuses));
+        }
+        if (cursor) {
+          runConditions.push(
+            cursorCondition(workflowRun.createdAt, workflowRun.id, cursor),
+          );
+        }
+
+        runRows = await db
+          .select({
+            run: workflowRun,
+            definitionName: workflowDefinition.name,
+          })
+          .from(workflowRun)
+          .innerJoin(
+            workflowDefinition,
+            eq(workflowRun.definitionId, workflowDefinition.id),
+          )
+          .where(and(...runConditions))
+          .orderBy(...pageOrder(workflowRun.createdAt, workflowRun.id))
+          .limit(limit);
+      }
 
       return c.json(
         paginatedResponse(
-          rows.map((r) => formatInstance(r.instance, r.agentName)),
-          rows.map((r) => r.instance),
+          runRows.map((r) =>
+            formatInstanceView(foldedRunToRecord(r), r.definitionName),
+          ),
+          runRows.map((r) => ({ createdAt: r.run.createdAt, id: r.run.id })),
           limit,
         ),
       );
@@ -643,7 +822,16 @@ export function createInstanceRoutes({
         );
       }
 
-      const resolvedInstanceId = mailRow.instanceId;
+      // The authorization subject is the mail's owning routable. A folded run's
+      // mail carries a null instanceId and keys on its session, so recover the
+      // run id from the session; a legacy row's non-null instanceId is used
+      // directly. Route the run resolution through workflow_run so the subject
+      // is proven to name a real run of this tenant -- a session held by any
+      // non-run principal fails closed to 404 rather than authorizing a
+      // fabricated subject.
+      const resolvedInstanceId =
+        mailRow.instanceId ??
+        (await resolveRunIdForSession(db, mailRow.sessionId, tenant.id));
       if (!resolvedInstanceId) {
         return c.json(
           { error: { code: "not_found", message: "Blob not found" } },
@@ -657,7 +845,7 @@ export function createInstanceRoutes({
         grantStore,
         principal.id,
         tenant.id,
-        `instance:${resolvedInstanceId}`,
+        `workflow-run:${resolvedInstanceId}`,
         "read",
         conditionRegistry,
       );
@@ -699,8 +887,8 @@ export function createInstanceRoutes({
   );
 
   app.get(
-    "/:instanceId",
-    requireGrant(idResource("instance", "instanceId"), "read"),
+    "/:runId",
+    requireGrant(idResource("workflow-run", "runId"), "read"),
     describeRoute({
       tags: ["Instances"],
       summary: "Get instance detail",
@@ -710,7 +898,7 @@ export function createInstanceRoutes({
         200: {
           description: "Instance detail",
           content: {
-            "application/json": { schema: resolver(AgentInstanceResponse) },
+            "application/json": { schema: resolver(WorkflowRunResponse) },
           },
         },
         404: {
@@ -723,48 +911,45 @@ export function createInstanceRoutes({
     }),
     async (c) => {
       const tenantCtx = c.get("tenant");
-      const instanceId = c.req.param("instanceId");
+      const instanceId = c.req.param("runId");
 
-      const [row] = await db
-        .select({
-          instance: agentInstance,
-          agentName: agent.name,
-        })
-        .from(agentInstance)
-        .innerJoin(agent, eq(agentInstance.agentId, agent.id))
-        .where(
-          and(
-            eq(agentInstance.id, instanceId),
-            eq(agentInstance.tenantId, tenantCtx.id),
-          ),
-        )
-        .limit(1);
-
-      if (!row) {
+      // Resolve across the fold: a legacy agent instance or a folded run. The
+      // origin agent supplies the display name for either kind.
+      const record = await findRoutableById(db, instanceId, tenantCtx.id);
+      if (record === undefined) {
         return c.json(
           { error: { code: "not_found", message: "Instance not found" } },
           404,
         );
       }
 
-      const result = formatInstance(row.instance, row.agentName) as Record<
-        string,
-        unknown
-      >;
-
-      // Enrich with runtime status from the event collector if available.
-      const runtimeStatus = eventCollectors.getStatus(row.instance.address);
-      if (runtimeStatus !== undefined) {
-        result["runtimeStatus"] = runtimeStatus.status;
+      // The display name lives on the definition the record belongs to,
+      // scoped to the tenant.
+      const definitionRow = await db.query.workflowDefinition.findFirst({
+        where: and(
+          eq(workflowDefinition.id, record.definitionId),
+          eq(workflowDefinition.tenantId, tenantCtx.id),
+        ),
+      });
+      if (definitionRow === undefined) {
+        return c.json(
+          { error: { code: "not_found", message: "Instance not found" } },
+          404,
+        );
       }
 
-      return c.json(result);
+      // Enrich with runtime status from the event collector if available.
+      const runtimeStatus = eventCollectors.getStatus(record.address);
+
+      return c.json(
+        formatInstanceView(record, definitionRow.name, runtimeStatus?.status),
+      );
     },
   );
 
   app.get(
-    "/:instanceId/health",
-    requireGrant(idResource("instance", "instanceId"), "read"),
+    "/:runId/health",
+    requireGrant(idResource("workflow-run", "runId"), "read"),
     describeRoute({
       tags: ["Instances"],
       summary: "Get instance health",
@@ -774,7 +959,7 @@ export function createInstanceRoutes({
         200: {
           description: "Health status",
           content: {
-            "application/json": { schema: resolver(AgentHealth) },
+            "application/json": { schema: resolver(WorkflowRunHealth) },
           },
         },
         404: {
@@ -793,23 +978,17 @@ export function createInstanceRoutes({
     }),
     async (c) => {
       const tenantCtx = c.get("tenant");
-      const instanceId = c.req.param("instanceId");
+      const instanceId = c.req.param("runId");
 
-      const row = await db.query.agentInstance.findFirst({
-        where: and(
-          eq(agentInstance.id, instanceId),
-          eq(agentInstance.tenantId, tenantCtx.id),
-        ),
-      });
-
-      if (!row) {
+      const record = await findRoutableById(db, instanceId, tenantCtx.id);
+      if (record === undefined) {
         return c.json(
           { error: { code: "not_found", message: "Instance not found" } },
           404,
         );
       }
 
-      if (row.status === "stopped") {
+      if (instanceStatusOf(record) === "stopped") {
         return c.json(
           { error: { code: "gone", message: "Instance has stopped" } },
           410,
@@ -817,11 +996,11 @@ export function createInstanceRoutes({
       }
 
       const routableAddresses = sidecarRouter.getRoutableAddresses();
-      const liveness = routableAddresses.includes(row.address)
+      const liveness = routableAddresses.includes(record.address)
         ? "ok"
         : "unhealthy";
 
-      const status = eventCollectors.getStatus(row.address);
+      const status = eventCollectors.getStatus(record.address);
       const readiness = status !== undefined ? "ok" : "not_ready";
 
       return c.json({ liveness, readiness, lastCheckedAt: null });
@@ -829,8 +1008,8 @@ export function createInstanceRoutes({
   );
 
   app.get(
-    "/:instanceId/offerings",
-    requireGrant(idResource("instance", "instanceId"), "read"),
+    "/:runId/offerings",
+    requireGrant(idResource("workflow-run", "runId"), "read"),
     describeRoute({
       tags: ["Instances"],
       summary: "List instance offerings",
@@ -855,24 +1034,23 @@ export function createInstanceRoutes({
     }),
     async (c) => {
       const tenantCtx = c.get("tenant");
-      const instanceId = c.req.param("instanceId");
+      const instanceId = c.req.param("runId");
 
-      const [row] = await db
-        .select({
-          instance: agentInstance,
-          agentName: agent.name,
-        })
-        .from(agentInstance)
-        .innerJoin(agent, eq(agentInstance.agentId, agent.id))
-        .where(
-          and(
-            eq(agentInstance.id, instanceId),
-            eq(agentInstance.tenantId, tenantCtx.id),
-          ),
-        )
-        .limit(1);
+      const record = await findRoutableById(db, instanceId, tenantCtx.id);
+      if (record === undefined) {
+        return c.json(
+          { error: { code: "not_found", message: "Instance not found" } },
+          404,
+        );
+      }
 
-      if (!row) {
+      // Offerings are keyed on the definition (their `agentId` column holds a
+      // definition id). Resolve the record's definition, then filter offerings
+      // on its id and display its name.
+      const definitionRow = await db.query.workflowDefinition.findFirst({
+        where: eq(workflowDefinition.id, record.definitionId),
+      });
+      if (definitionRow === undefined) {
         return c.json(
           { error: { code: "not_found", message: "Instance not found" } },
           404,
@@ -881,18 +1059,20 @@ export function createInstanceRoutes({
 
       const offerings = await db.query.offering.findMany({
         where: and(
-          eq(offering.agentId, row.instance.agentId),
+          eq(offering.agentId, definitionRow.id),
           eq(offering.tenantId, tenantCtx.id),
         ),
       });
 
-      return c.json(offerings.map((o) => formatOffering(o, row.agentName)));
+      return c.json(
+        offerings.map((o) => formatOffering(o, definitionRow.name)),
+      );
     },
   );
 
   app.delete(
-    "/:instanceId",
-    requireGrant(idResource("instance", "instanceId"), "manage"),
+    "/:runId",
+    requireGrant(idResource("workflow-run", "runId"), "manage"),
     describeRoute({
       tags: ["Instances"],
       summary: "Stop an instance",
@@ -924,23 +1104,22 @@ export function createInstanceRoutes({
     }),
     async (c) => {
       const tenantCtx = c.get("tenant");
-      const instanceId = c.req.param("instanceId");
+      const instanceId = c.req.param("runId");
 
-      const row = await db.query.agentInstance.findFirst({
-        where: and(
-          eq(agentInstance.id, instanceId),
-          eq(agentInstance.tenantId, tenantCtx.id),
-        ),
-      });
-
-      if (!row) {
+      // A folded agent runs as a workflow_run under the same id; stop it there.
+      // findRoutableById resolves exactly the folded-instance runs, returning
+      // undefined for a missing row, a null address, or a workflow-derived
+      // (deployment-anchor) address -- a run it does not resolve is not this
+      // route's to stop and reads as absent, never driven into an undeploy.
+      const record = await findRoutableById(db, instanceId, tenantCtx.id);
+      if (record === undefined) {
         return c.json(
           { error: { code: "not_found", message: "Instance not found" } },
           404,
         );
       }
 
-      if (row.status === "stopped") {
+      if (record.endedAt !== null) {
         return c.json(
           {
             error: {
@@ -951,9 +1130,8 @@ export function createInstanceRoutes({
           409,
         );
       }
-
       try {
-        await sessionService.endSession(row.address, "instance_stopped");
+        await sessionService.endSession(record.address, "instance_stopped");
       } catch (err) {
         return c.json(
           {
@@ -970,41 +1148,48 @@ export function createInstanceRoutes({
       }
 
       const endedAt = new Date();
+      // Settle the run and its principal/session atomically. The terminal
+      // flip guards on `endedAt` rather than reusing the workflow-run store's
+      // markTerminal `status = 'running'` guard on purpose: a launch that
+      // leaked a folded run leaves it `failed` with a null `endedAt` so it
+      // stays routable, and this stop must still settle that non-terminal row
+      // — a `status = 'running'` guard would skip it.
+      await db.transaction(async (tx) => {
+        await tx
+          .update(workflowRun)
+          .set({ status: "cancelled", endedAt })
+          .where(
+            and(eq(workflowRun.id, instanceId), isNull(workflowRun.endedAt)),
+          );
 
-      await db
-        .update(agentInstance)
-        .set({
-          status: "stopped",
-          sessionId: null,
-          updatedAt: endedAt,
-          endedAt,
-        })
-        .where(eq(agentInstance.id, instanceId));
+        if (record.principalId !== null) {
+          // Deactivate the run's principal (refId guard scopes it to this
+          // run), then end its transitional session, which is keyed by that
+          // principal.
+          await tx
+            .update(principalTable)
+            .set({ status: "deactivated", updatedAt: endedAt })
+            .where(
+              and(
+                eq(principalTable.id, record.principalId),
+                eq(principalTable.refId, instanceId),
+              ),
+            );
+          await tx
+            .update(agentSession)
+            .set({ status: "ended", endedAt, updatedAt: endedAt })
+            .where(
+              and(
+                eq(agentSession.principalId, record.principalId),
+                isNull(agentSession.endedAt),
+              ),
+            );
+        }
+      });
 
-      // Deactivate the per-instance principal. The refId guard ensures we
-      // only deactivate the principal created for this specific instance.
-      await db
-        .update(principalTable)
-        .set({ status: "deactivated", updatedAt: endedAt })
-        .where(
-          and(
-            eq(principalTable.id, row.principalId),
-            eq(principalTable.refId, instanceId),
-          ),
-        );
-
-      // End associated session rows.
-      if (row.sessionId) {
-        await db
-          .update(agentSession)
-          .set({ status: "ended", endedAt, updatedAt: endedAt })
-          .where(eq(agentSession.id, row.sessionId));
-      }
-
-      eventCollectors.abandon(row.address);
+      eventCollectors.abandon(record.address);
       instanceKeyCache.delete(instanceId);
-
-      sidecarRouter.dispatchAgentEvent(row.address, {
+      sidecarRouter.dispatchAgentEvent(record.address, {
         type: "session.ended",
       });
 
@@ -1013,8 +1198,8 @@ export function createInstanceRoutes({
   );
 
   app.get(
-    "/:instanceId/events",
-    requireGrant(idResource("instance", "instanceId"), "read"),
+    "/:runId/events",
+    requireGrant(idResource("workflow-run", "runId"), "read"),
     describeRoute({
       tags: ["Instances"],
       summary: "SSE event stream",
@@ -1043,28 +1228,24 @@ export function createInstanceRoutes({
     }),
     async (c) => {
       const tenantCtx = c.get("tenant");
-      const instanceId = c.req.param("instanceId");
+      const instanceId = c.req.param("runId");
 
-      const row = await db.query.agentInstance.findFirst({
-        where: and(
-          eq(agentInstance.id, instanceId),
-          eq(agentInstance.tenantId, tenantCtx.id),
-        ),
-      });
-
-      if (!row) {
+      const record = await findRoutableById(db, instanceId, tenantCtx.id);
+      if (record === undefined) {
         return c.json(
           { error: { code: "not_found", message: "Instance not found" } },
           404,
         );
       }
 
-      if (row.status === "stopped") {
+      if (instanceStatusOf(record) === "stopped") {
         return c.json(
           { error: { code: "gone", message: "Instance has stopped" } },
           410,
         );
       }
+
+      const address = record.address;
 
       return streamSSE(c, async (stream) => {
         const noop = () => undefined;
@@ -1072,7 +1253,7 @@ export function createInstanceRoutes({
         // Emit the replay before subscribing to live events so that a
         // delta arriving between subscribe() and the replay write cannot
         // beat the catch-up text onto the stream.
-        const status = eventCollectors.getStatus(row.address);
+        const status = eventCollectors.getStatus(address);
         if (status?.status === "busy") {
           await stream.writeSSE({
             event: "agent.event",
@@ -1083,9 +1264,9 @@ export function createInstanceRoutes({
             }),
           });
         }
-        const accumulatedText = eventCollectors.getAccumulatedText(row.address);
+        const accumulatedText = eventCollectors.getAccumulatedText(address);
         if (accumulatedText !== undefined && accumulatedText !== "") {
-          const turnId = eventCollectors.getLastTurnId(row.address);
+          const turnId = eventCollectors.getLastTurnId(address);
           await stream.writeSSE({
             event: "agent.event",
             data: JSON.stringify({
@@ -1095,17 +1276,14 @@ export function createInstanceRoutes({
           });
         }
 
-        const unsubscribe = sidecarRouter.subscribeAgent(
-          row.address,
-          (event) => {
-            stream
-              .writeSSE({
-                event: "agent.event",
-                data: JSON.stringify(event),
-              })
-              .catch(noop);
-          },
-        );
+        const unsubscribe = sidecarRouter.subscribeAgent(address, (event) => {
+          stream
+            .writeSSE({
+              event: "agent.event",
+              data: JSON.stringify(event),
+            })
+            .catch(noop);
+        });
 
         const keepalive = setInterval(() => {
           stream.write(": keepalive\n\n").catch(noop);
@@ -1140,8 +1318,8 @@ export function createInstanceRoutes({
   }
 
   app.post(
-    "/:instanceId/mail",
-    requireGrant(idResource("instance", "instanceId"), "write"),
+    "/:runId/mail",
+    requireGrant(idResource("workflow-run", "runId"), "write"),
     describeRoute({
       tags: ["Instances"],
       summary: "Send mail to the agent",
@@ -1204,7 +1382,7 @@ export function createInstanceRoutes({
     async (c) => {
       const tenant = c.get("tenant");
       const principal = c.get("principal");
-      const instanceId = c.req.param("instanceId");
+      const instanceId = c.req.param("runId");
       const body = c.req.valid("json");
 
       // Decode and validate attachments at the boundary, emitting ordered,
@@ -1217,33 +1395,33 @@ export function createInstanceRoutes({
       }
       const messageAttachments = attachmentResult.attachments;
 
-      const row = await db.query.agentInstance.findFirst({
-        where: and(
-          eq(agentInstance.id, instanceId),
-          eq(agentInstance.tenantId, tenant.id),
-        ),
-      });
-
-      if (!row) {
+      const record = await findRoutableById(db, instanceId, tenant.id);
+      if (record === undefined) {
         return c.json(
           { error: { code: "not_found", message: "Instance not found" } },
           404,
         );
       }
 
-      if (row.status !== "running") {
+      const mappedStatus = instanceStatusOf(record);
+      if (mappedStatus !== "running") {
         return c.json(
           {
             error: {
               code: "conflict",
-              message: `Instance is not running (status: ${row.status})`,
+              message: `Instance is not running (status: ${mappedStatus})`,
             },
           },
           409,
         );
       }
 
-      if (!row.sessionId) {
+      // A send needs the run's live session. The running gate above guarantees
+      // one exists; resolve it here (live-only) rather than have the id lookup
+      // fetch a session for every caller when only this route reads it. The
+      // GET-history read below resolves the same way, with ended sessions.
+      const sessionId = await resolveRunSessionId(db, record.principalId);
+      if (sessionId === null) {
         return c.json(
           {
             error: {
@@ -1263,13 +1441,16 @@ export function createInstanceRoutes({
       const from = user?.name ? `"${user.name}" <${fromAddr}>` : fromAddr;
       const mimeMessageId = `<${mailId}@${tenant.domain}>`;
 
-      // Fetch recent delivered inbound mail for the MIME References chain.
+      // Fetch recent delivered inbound mail for the MIME References chain. A
+      // run's mail carries a null instanceId, so it is keyed on the session.
+      // GET history keys the same way.
+      const mailScope = eq(sessionMail.sessionId, sessionId);
       const priorMail = await db
         .select({ id: sessionMail.id })
         .from(sessionMail)
         .where(
           and(
-            eq(sessionMail.instanceId, instanceId),
+            mailScope,
             eq(sessionMail.direction, "inbound"),
             eq(sessionMail.status, "delivered"),
           ),
@@ -1300,7 +1481,7 @@ export function createInstanceRoutes({
         inReplyTo = lastIdFromSession;
         references = priorIds;
       } else {
-        const connectorState = sidecarRouter.getConnectorState(row.address);
+        const connectorState = sidecarRouter.getConnectorState(record.address);
         if (connectorState !== null) {
           inReplyTo = connectorState.lastMessageId;
           references = [connectorState.threadRoot];
@@ -1309,10 +1490,14 @@ export function createInstanceRoutes({
 
       const cryptoProvider = await getInstanceCryptoProvider(instanceId);
 
+      // A run's mail is not an instance's, so it records a null instanceId and
+      // anchors on the session (mirroring the sidecar mail-persist path).
+      const mailInstanceId = null;
+
       let rawMIME: Uint8Array;
       try {
         rawMIME = await sessionService.sendUserMessage({
-          agentAddress: row.address,
+          agentAddress: record.address,
           from,
           messageId: mimeMessageId,
           date: now,
@@ -1324,7 +1509,7 @@ export function createInstanceRoutes({
           ...(references !== undefined && references.length > 0
             ? { references }
             : {}),
-          sessionId: row.sessionId,
+          sessionId,
           tenantId: tenant.id,
           cryptoProvider,
         });
@@ -1347,8 +1532,8 @@ export function createInstanceRoutes({
 
       await db.insert(sessionMail).values({
         id: mailId,
-        sessionId: row.sessionId,
-        instanceId,
+        sessionId,
+        instanceId: mailInstanceId,
         tenantId: tenant.id,
         direction: "inbound",
         status: "delivered",
@@ -1357,7 +1542,7 @@ export function createInstanceRoutes({
       });
 
       const parsed = parseMailToEmail(rawMIME, mailId);
-      sidecarRouter.dispatchAgentEvent(row.address, {
+      sidecarRouter.dispatchAgentEvent(record.address, {
         type: "mail.delivered",
         data: {
           ...parsed,
@@ -1370,8 +1555,8 @@ export function createInstanceRoutes({
       return c.json(
         {
           id: mailId,
-          sessionId: row.sessionId,
-          instanceId,
+          sessionId,
+          instanceId: mailInstanceId,
           direction: "inbound" as const,
           status: "delivered" as const,
           receivedAt: mailCreatedAt.toISOString(),
@@ -1383,8 +1568,8 @@ export function createInstanceRoutes({
   );
 
   app.get(
-    "/:instanceId/mail",
-    requireGrant(idResource("instance", "instanceId"), "read"),
+    "/:runId/mail",
+    requireGrant(idResource("workflow-run", "runId"), "read"),
     describeRoute({
       tags: ["Instances"],
       summary: "List mail for an instance",
@@ -1410,27 +1595,37 @@ export function createInstanceRoutes({
     }),
     async (c) => {
       const tenant = c.get("tenant");
-      const instanceId = c.req.param("instanceId");
+      const instanceId = c.req.param("runId");
       const { limit, cursor } = parsePageParams({
         cursor: c.req.query("cursor"),
         limit: c.req.query("limit"),
       });
 
-      const row = await db.query.agentInstance.findFirst({
-        where: and(
-          eq(agentInstance.id, instanceId),
-          eq(agentInstance.tenantId, tenant.id),
-        ),
-      });
-
-      if (!row) {
+      const record = await findRoutableById(db, instanceId, tenant.id);
+      if (record === undefined) {
         return c.json(
           { error: { code: "not_found", message: "Instance not found" } },
           404,
         );
       }
 
-      const conditions = [eq(sessionMail.instanceId, instanceId)];
+      // History must serve a terminated run. A run's mail carries a null
+      // instanceId; its principal is 1:1 with its single session, so resolve
+      // that session (ended included) and key on it.
+      const runSessionId = await resolveRunSessionId(db, record.principalId, {
+        includeEnded: true,
+      });
+      if (runSessionId === null) {
+        return c.json(paginatedResponse([], [], limit));
+      }
+      // Bind the read to the caller's tenant directly, not only through the
+      // session the run's principal owns: the sessionId scope borrows the
+      // principal-session 1:1 invariant, so an explicit tenantId filter keeps
+      // the mail tenant-safe even if that invariant is ever violated.
+      const conditions = [
+        eq(sessionMail.tenantId, tenant.id),
+        eq(sessionMail.sessionId, runSessionId),
+      ];
       if (cursor) {
         conditions.push(
           cursorCondition(sessionMail.createdAt, sessionMail.id, cursor),
@@ -1462,8 +1657,8 @@ export function createInstanceRoutes({
   );
 
   app.get(
-    "/:instanceId/turns",
-    requireGrant(idResource("instance", "instanceId"), "read"),
+    "/:runId/turns",
+    requireGrant(idResource("workflow-run", "runId"), "read"),
     describeRoute({
       tags: ["Instances"],
       summary: "List inference turns for an instance",
@@ -1489,27 +1684,24 @@ export function createInstanceRoutes({
     }),
     async (c) => {
       const tenant = c.get("tenant");
-      const instanceId = c.req.param("instanceId");
+      const instanceId = c.req.param("runId");
       const { limit, cursor } = parsePageParams({
         cursor: c.req.query("cursor"),
         limit: c.req.query("limit"),
       });
 
-      const row = await db.query.agentInstance.findFirst({
-        where: and(
-          eq(agentInstance.id, instanceId),
-          eq(agentInstance.tenantId, tenant.id),
-        ),
-      });
-
-      if (!row) {
+      const record = await findRoutableById(db, instanceId, tenant.id);
+      if (record === undefined) {
         return c.json(
           { error: { code: "not_found", message: "Instance not found" } },
           404,
         );
       }
 
-      const conditions = [eq(inferenceTurn.instanceId, instanceId)];
+      // A turn records its producing endpoint's id: an instance id or, since the
+      // turn table's foreign key to the instance was dropped, a folded run id.
+      // Both equal the path id, so the filter is the same for either kind.
+      const conditions = [eq(inferenceTurn.instanceId, record.id)];
       if (cursor) {
         conditions.push(
           cursorCondition(inferenceTurn.startedAt, inferenceTurn.id, cursor),

@@ -13,7 +13,6 @@ import path from "node:path";
 
 import {
   assertNotCI,
-  detectResponseKind,
   writeCapture,
   type ResponseBody,
 } from "@intx/inference-discovery";
@@ -23,10 +22,14 @@ import {
   type Dependencies,
   type InferenceHarnessOptions,
 } from "@intx/inference";
+import { detectResponseKind } from "@intx/types/content-type";
 import { createBuiltinRegistry } from "@intx/inference/providers";
 import type { InferenceEvent } from "@intx/types/runtime";
 
-import { writeSessionManifest, type SessionManifest } from "./session-manifest";
+import {
+  writeCaptureManifest,
+  type CaptureManifest,
+} from "@intx/inference-discovery/catalog";
 import { isDelayedEnvelope, type ToolHandler } from "./tool-handler";
 
 /**
@@ -45,7 +48,7 @@ export interface CreateRecordingHarnessOpts {
    * the top-level `session.json`. The replay harness consumes this to
    * construct the `InferenceSource` passed to `runInference`.
    */
-  source: SessionManifest["source"];
+  source: CaptureManifest["source"];
   /**
    * Hard ceiling on how many fetch calls the harness will wrap before
    * throwing `SessionRecordingBudgetExceededError`. Guards against
@@ -283,9 +286,12 @@ async function bufferResponseBody(
   // still make it to disk verbatim.
   const text = new TextDecoder().decode(bytes);
   try {
-    const parsed: unknown = JSON.parse(text);
+    // Parse only to classify the body: a JSON response is written to
+    // response.json, a parse failure falls through to the SSE-shaped raw
+    // capture below. The decoded value itself is not retained.
+    JSON.parse(text);
     return {
-      captured: { kind: "json", bytes, parsed },
+      captured: { kind: "json", bytes },
       reconstructed: bytes,
     };
   } catch {
@@ -553,9 +559,14 @@ export function createRecordingHarness(
     // error, and we'd rather hand an interrupted recording back to
     // the user as a partially-loadable artifact than a black hole.
     const capturedAt = (now ?? (() => new Date()))().toISOString();
-    await writeSessionManifest(outputDir, {
-      sessionSchemaVersion: "1",
+    await writeCaptureManifest(outputDir, {
+      schemaVersion: "2",
       source,
+      // Provenance is owned by the fetch seam: a supplied `fetch` override
+      // means the bytes came from the synthetic wire DSL, its absence means a
+      // real provider endpoint. Read it here rather than accepting a separate
+      // origin input that could contradict the seam.
+      origin: fetchOverride !== undefined ? "synthetic" : "live",
       capturedAt,
     });
     if (inFlightDispatches.length > 0) {

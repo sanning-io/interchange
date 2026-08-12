@@ -20,13 +20,17 @@ import { configureSync, getConfig, resetSync } from "@intx/log";
 import { collectReachableObjects } from "@intx/storage-isogit";
 import type { KeyPair } from "@intx/types/runtime";
 import type { DB } from "@intx/db";
-import { createWorkflowRunStore } from "@intx/db";
+import {
+  createWorkflowRunDispatchStore,
+  createWorkflowRunStore,
+} from "@intx/db";
 import { principal, workflowRun } from "@intx/db/schema";
 import {
   createAgentRepoStore,
   createHubSessionLookups,
   WORKFLOW_RUN_RUNS_PREFIX,
 } from "@intx/hub-sessions";
+import { deriveWorkflowRunRepoId } from "@intx/workflow-deploy";
 import {
   createTestDb,
   harnessDbEnvAvailable,
@@ -36,17 +40,14 @@ import {
   seedAsset,
   seedPrincipal,
   seedTenants,
-  seedWorkflowDeployment,
   seedWorkflowRun,
 } from "@intx/test-harness/seed";
 
 const TENANT = "tnt";
 const ASSET = "ast";
-// The workflow-run repo slug the pack is received under. It is the id the
-// substrate maps to a `WorkflowRunSupervisorPrincipal`; it does not need to
-// match a `workflow_deployment.id`, since the terminal flip keys off the run
-// id carried in the event tree, not the deployment.
 const DEPLOYMENT = "dep";
+const DEPLOYMENT_ADDRESS = "ins_dep@tnt.example";
+const DEPLOYMENT_REPO_ID = deriveWorkflowRunRepoId(DEPLOYMENT_ADDRESS);
 const WFR_REF = "refs/heads/events";
 
 function eventBody(seq: number, type: string): string {
@@ -109,10 +110,11 @@ describe.skipIf(!harnessDbEnvAvailable())(
         kind: "workflow",
         name: ASSET,
       });
-      await seedWorkflowDeployment(h.db, {
+      await seedWorkflowRun(h.db, {
         id: DEPLOYMENT,
+        deploymentId: DEPLOYMENT,
         tenantId: TENANT,
-        definitionAssetId: ASSET,
+        address: DEPLOYMENT_ADDRESS,
       });
     });
 
@@ -132,13 +134,16 @@ describe.skipIf(!harnessDbEnvAvailable())(
       return d;
     }
 
-    // Build a workflow-run pack whose tip commit adds each run's event log
-    // ending in its terminal event. The genesis commit carries a
+    // Build a workflow-run pack whose tip commit adds each run's event log.
+    // The genesis commit carries a
     // `.gitignore`-only tree (the kind handler's accepted initial commit); the
-    // tip adds every run's RunStarted + terminal events in one commit, so a
-    // single pack carries a batch of newly-terminal runs.
+    // tip adds every requested event in one commit.
     async function buildPack(
-      runs: { runId: string; terminalType: string }[],
+      runs: {
+        runId: string;
+        terminalType?: string;
+        signalId?: string;
+      }[],
     ): Promise<{ pack: Uint8Array; tip: string }> {
       const srcDir = await makeTempDir("wfr-terminal-src-");
       await git.init({ fs, dir: srcDir, defaultBranch: "events" });
@@ -155,15 +160,23 @@ describe.skipIf(!harnessDbEnvAvailable())(
       });
 
       const files: Record<string, string> = {};
-      for (const { runId, terminalType } of runs) {
+      for (const { runId, terminalType, signalId } of runs) {
         files[`${WORKFLOW_RUN_RUNS_PREFIX}/${runId}/events/0.json`] = eventBody(
           0,
           "RunStarted",
         );
-        files[`${WORKFLOW_RUN_RUNS_PREFIX}/${runId}/events/1.json`] = eventBody(
-          1,
-          terminalType,
-        );
+        let seq = 1;
+        if (signalId !== undefined) {
+          files[
+            `${WORKFLOW_RUN_RUNS_PREFIX}/${runId}/events/${String(seq)}.json`
+          ] = JSON.stringify({ seq, type: "SignalReceived", signalId });
+          seq += 1;
+        }
+        if (terminalType !== undefined) {
+          files[
+            `${WORKFLOW_RUN_RUNS_PREFIX}/${runId}/events/${String(seq)}.json`
+          ] = eventBody(seq, terminalType);
+        }
       }
       for (const [rel, body] of Object.entries(files)) {
         const full = path.join(srcDir, rel);
@@ -215,10 +228,11 @@ describe.skipIf(!harnessDbEnvAvailable())(
         agentRepoStore: repoStore,
       });
       return lookups.receiveWorkflowRunPack(
-        { kind: "workflow-run", id: DEPLOYMENT },
+        { kind: "workflow-run", id: DEPLOYMENT_REPO_ID },
         pack,
         WFR_REF,
         tip,
+        { kind: "shared", agentAddress: DEPLOYMENT_ADDRESS },
       );
     }
 
@@ -364,6 +378,31 @@ describe.skipIf(!harnessDbEnvAvailable())(
         .from(principal)
         .where(eq(principal.id, "prn-bystander"));
       expect(bystander?.status).toBe("active");
+    });
+
+    test("settles a retained signal from its internal run event log", async () => {
+      const dispatchStore = createWorkflowRunDispatchStore(h.db);
+      await dispatchStore.enqueueSignal({
+        id: "dispatch-internal-signal",
+        anchorRunId: DEPLOYMENT,
+        signal: {
+          agentAddress: DEPLOYMENT_ADDRESS,
+          runId: "run-internal-signal",
+          signalName: "approval:resolved",
+          signalId: "signal-internal",
+          payload: { approved: true },
+        },
+      });
+
+      const { pack, tip } = await buildPack([
+        { runId: "run-internal-signal", signalId: "signal-internal" },
+      ]);
+      const verdict = await receiveWith(h.db, pack, tip);
+
+      expect(verdict).toEqual({ accepted: true });
+      expect(
+        (await dispatchStore.findById("dispatch-internal-signal"))?.status,
+      ).toBe("settled");
     });
 
     test("a terminal event with no run row logs loudly and still acks", async () => {

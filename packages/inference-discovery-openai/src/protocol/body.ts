@@ -1,5 +1,7 @@
 import { readFileSync } from "node:fs";
+import { basename } from "node:path";
 import {
+  CapabilityNotBuildableError,
   type Capability,
   type CapabilityIntent,
   type MediaRef,
@@ -29,6 +31,27 @@ export interface ChatCompletionsRequest {
   stream?: boolean;
   tools?: unknown[];
   response_format?: unknown;
+  // Required as "none" for gpt-5.6 Chat Completions tool calls; OpenAI
+  // rejects function tools with the default reasoning_effort on that series.
+  reasoning_effort?: "none";
+}
+
+// gpt-5.6 Chat Completions rejects function tools unless reasoning_effort
+// is explicitly "none" (use Responses API for reasoned tool use). Add a
+// model here when tool calls fail with the reasoning_effort invalid_request.
+const TOOL_CALL_REASONING_NONE_MODELS: ReadonlySet<string> = new Set([
+  "gpt-5.6-sol",
+  "gpt-5.6-terra",
+  "gpt-5.6-luna",
+]);
+
+function applyToolCallingEffort(
+  body: ChatCompletionsRequest,
+  model: string,
+): void {
+  if (TOOL_CALL_REASONING_NONE_MODELS.has(model)) {
+    body.reasoning_effort = "none";
+  }
 }
 
 function mimeTypeFor(ref: MediaRef): string {
@@ -77,22 +100,26 @@ function buildFunctionCallingBody(
   model: string,
   intent: CapabilityIntent,
 ): ChatCompletionsRequest {
-  return {
+  const body: ChatCompletionsRequest = {
     model,
     messages: [{ role: "user", content: intent.prompt }],
     tools: buildToolDecl(intent),
   };
+  applyToolCallingEffort(body, model);
+  return body;
 }
 
 export function buildMultiTurnTurn1Body(opts: {
   model: string;
   intent: CapabilityIntent;
 }): ChatCompletionsRequest {
-  return {
+  const body: ChatCompletionsRequest = {
     model: opts.model,
     messages: [{ role: "user", content: opts.intent.prompt }],
     tools: buildToolDecl(opts.intent),
   };
+  applyToolCallingEffort(body, opts.model);
+  return body;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -180,6 +207,7 @@ export function buildMultiTurnTurn2Body(opts: {
   if (tools !== undefined) {
     body.tools = tools;
   }
+  applyToolCallingEffort(body, opts.model);
   return body;
 }
 
@@ -240,28 +268,54 @@ function buildStructuredOutputBody(
   return body;
 }
 
-function buildVisionBody(
+// Shared skeleton for Chat Completions multimodal user turns: text
+// prompt plus one typed part per media ref. Vision and document only
+// differ in the expected kind and the part shape.
+function buildMediaInputBody(
   model: string,
   intent: CapabilityIntent,
+  capability: string,
+  expectedKind: MediaRef["kind"],
+  toPart: (ref: MediaRef) => unknown,
 ): ChatCompletionsRequest {
   if (!intent.media || intent.media.length === 0) {
-    throw new Error("intent has no media but vision-input requires it");
+    throw new Error(`intent has no media but ${capability} requires it`);
   }
   const parts: unknown[] = [{ type: "text", text: intent.prompt }];
   for (const ref of intent.media) {
-    if (ref.kind !== "image") {
+    if (ref.kind !== expectedKind) {
       throw new Error(
-        `vision-input only accepts image media, got: ${ref.kind}`,
+        `${capability} only accepts ${expectedKind} media, got: ${ref.kind}`,
       );
     }
-    parts.push({
-      type: "image_url",
-      image_url: { url: readMediaDataUri(ref) },
-    });
+    parts.push(toPart(ref));
   }
   return {
     model,
     messages: [{ role: "user", content: parts }],
+  };
+}
+
+function imagePart(ref: MediaRef): unknown {
+  return {
+    type: "image_url",
+    image_url: { url: readMediaDataUri(ref) },
+  };
+}
+
+function documentPart(ref: MediaRef): unknown {
+  const filename = basename(ref.path);
+  if (filename.length === 0) {
+    throw new Error(
+      "document-input media path has an empty basename; Chat Completions requires filename",
+    );
+  }
+  return {
+    type: "file",
+    file: {
+      filename,
+      file_data: readMediaDataUri(ref),
+    },
   };
 }
 
@@ -289,13 +343,29 @@ export function buildRequestBody(args: BuildRequestBodyArgs): unknown {
     case "reasoning-content-streaming":
       return buildReasoningBody(model, intent, true);
     case "vision-input":
-      return buildVisionBody(model, intent);
+      return buildMediaInputBody(
+        model,
+        intent,
+        "vision-input",
+        "image",
+        imagePart,
+      );
+    case "document-input":
+      return buildMediaInputBody(
+        model,
+        intent,
+        "document-input",
+        "document",
+        documentPart,
+      );
     case "structured-output":
       return buildStructuredOutputBody(model, intent, false);
     case "structured-output-streaming":
+    case "structured-output-refusal-streaming":
       return buildStructuredOutputBody(model, intent, true);
     default:
-      throw new Error(
+      throw new CapabilityNotBuildableError(
+        capability,
         `OpenAI protocol: capability "${capability}" not implemented`,
       );
   }

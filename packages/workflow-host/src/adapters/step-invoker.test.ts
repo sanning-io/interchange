@@ -409,7 +409,38 @@ describe("workflow-host StepInvoker adapter - happy path", () => {
       );
     }
     expect(result.suspend.correlationId).toBe("corr-1");
+    if (result.suspend.kind !== "approval") {
+      throw new Error(
+        `expected an approval suspend, got ${result.suspend.kind}`,
+      );
+    }
     expect(result.suspend.approvalSnapshot).toEqual(approvalSnapshot);
+  });
+
+  test("throws on a suspended send result that carries no approval snapshot", async () => {
+    // A suspended reactor outcome is always an approval and must carry a
+    // snapshot; a snapshot-less suspend (a director `caps.suspend` with no tool
+    // definitions) is not a supported approval park. The producer classifies
+    // the failure here rather than emitting an ambiguous suspend the runtime
+    // would reject downstream. (The "input" park -- a conversational step
+    // re-arming for the next mail -- is the workflow-host's decision, not a
+    // reactor `SendResult`, so it never flows through here.)
+    const stub = buildStubAgent();
+    const invoker = createWorkflowStepInvoker({
+      workflowAuthorize: async () => ({
+        effect: "allow",
+        matchingGrants: [],
+        resolvedBy: null,
+      }),
+      buildEnv: async () => stubBuildEnv(),
+      agentFactory: async () => stub.agent,
+    });
+
+    const sendPromise = invoker(buildRequest({ input: { goal: "ping" } }));
+    await Promise.resolve();
+    stub.resolveSend({ type: "suspended", correlationId: "corr-1" });
+
+    await expect(sendPromise).rejects.toThrow(/no approval snapshot/);
   });
 
   test("passes a string input through verbatim instead of double-JSON-encoding", async () => {
@@ -936,7 +967,11 @@ describe("workflow-host StepInvoker adapter - resume send path", () => {
 
     const req: StepInvokeRequest = {
       ...buildRequest({ input: { goal: "start" } }),
-      resume: { correlationId: "corr-1", decision: { outcome: "approved" } },
+      resume: {
+        correlationId: "corr-1",
+        decision: { outcome: "approved" },
+        kind: "approval",
+      },
     };
     const result = await invoker(req);
 
@@ -981,7 +1016,16 @@ describe("workflow-host StepInvoker adapter - resume send path", () => {
     let sentContent: string | InboundMessage | undefined;
     const agent = buildResumeStubAgent((content) => {
       sentContent = content;
-      return { type: "suspended", correlationId: "corr-B" };
+      return {
+        type: "suspended",
+        correlationId: "corr-B",
+        approvalSnapshot: {
+          name: "tool_b",
+          description: "Tool B needs approval",
+          inputSchema: { type: "object" },
+          arguments: {},
+        },
+      };
     });
 
     const invoker = createWorkflowStepInvoker({
@@ -996,7 +1040,11 @@ describe("workflow-host StepInvoker adapter - resume send path", () => {
 
     const req: StepInvokeRequest = {
       ...buildRequest({ input: { goal: "start" } }),
-      resume: { correlationId: "corr-A", decision: { outcome: "approved" } },
+      resume: {
+        correlationId: "corr-A",
+        decision: { outcome: "approved" },
+        kind: "approval",
+      },
     };
     const result = await invoker(req);
 
@@ -1021,6 +1069,52 @@ describe("workflow-host StepInvoker adapter - resume send path", () => {
       );
     }
     expect(result.suspend.correlationId).toBe("corr-B");
+  });
+
+  test("an input resume delivers a plain next turn, not a correlated gate inbound", async () => {
+    // An `"input"` resume is the step's next turn (a long-lived agent's next
+    // mail), with no gate to re-correlate. The adapter must send the decision
+    // as PLAIN synthesized content, NOT an InboundMessage stamped with the
+    // correlationId (the approval path). A plain string is the tell: nothing
+    // for the reactor's `tryCorrelate` to match, just a fresh user turn.
+    const nextTurn = {
+      role: "assistant" as const,
+      content: [{ type: "text" as const, text: "next turn reply" }],
+      model: STUB_SOURCE.model,
+      timestamp: 9,
+    };
+    let sentContent: string | InboundMessage | undefined;
+    const agent = buildResumeStubAgent((content) => {
+      sentContent = content;
+      return { type: "reply", reply: "next turn reply", turn: nextTurn };
+    });
+
+    const invoker = createWorkflowStepInvoker({
+      workflowAuthorize: async () => ({
+        effect: "allow",
+        matchingGrants: [],
+        resolvedBy: null,
+      }),
+      buildEnv: async () => stubBuildEnv(),
+      agentFactory: async () => agent,
+    });
+
+    const req: StepInvokeRequest = {
+      ...buildRequest({ input: { goal: "start" } }),
+      resume: {
+        correlationId: "corr-input-1",
+        decision: { text: "the next mail" },
+        kind: "input",
+      },
+    };
+    const result = await invoker(req);
+
+    // Plain content, not a correlated InboundMessage.
+    expect(typeof sentContent).toBe("string");
+    expect(expectOutput(result)).toEqual({
+      reply: "next turn reply",
+      turn: nextTurn,
+    });
   });
 });
 

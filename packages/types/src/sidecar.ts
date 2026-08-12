@@ -229,13 +229,40 @@ export type SignalCorrelationRegisterAckFrame =
  * A message to deliver to a local agent's INBOX. The hub routes inbound
  * mail (from UI users, from agents on other sidecars) to the correct
  * sidecar connection.
+ *
+ * `messageId` is the hub-minted id of this delivery, carried so the sidecar
+ * can acknowledge durable receipt (`mail.inbound.ack`) keyed on the SAME id
+ * the hub tracks -- no per-side re-derivation. It is the id the hub minted at
+ * ingress (also the message's `Message-ID` header), so a redelivery replays
+ * identical bytes and the downstream `RunStarted` dedup (consumedMessageIds)
+ * makes at-least-once effectively-once. Present only on hub-originated mail
+ * that participates in the ack/retry handshake (workflow trigger mail, session
+ * conversation mail); agent-to-agent relayed mail omits it.
  */
 export const MailInboundFrame = type({
   type: "'mail.inbound'",
   agentAddress: "string",
   rawMessage: "string",
+  "messageId?": "string",
 });
 export type MailInboundFrame = typeof MailInboundFrame.infer;
+
+/**
+ * Sidecar acknowledges durable receipt of a `mail.inbound`: the message is in
+ * the agent's on-disk inbox. The hub holds each delivered mail in a pending
+ * map and retries until this ack lands (or reconnect-redelivers it), so a
+ * message dropped in the connected/reconnecting window is not silently lost.
+ * Keyed on the hub-minted `messageId` the `mail.inbound` carried, so the ack
+ * clears exactly the pending entry it resolves; the ack is only sent AFTER the
+ * durable inbox write resolves (a non-ack IS the retry signal). At-least-once
+ * delivery is made effectively-once by the `RunStarted`/signal dedup guards.
+ */
+export const MailInboundAckFrame = type({
+  type: "'mail.inbound.ack'",
+  agentAddress: "string",
+  messageId: "string",
+});
+export type MailInboundAckFrame = typeof MailInboundAckFrame.infer;
 
 /**
  * Deliver a workflow-run signal to a multi-step deployment's
@@ -342,16 +369,91 @@ export type DrainDeliverFrame = typeof DrainDeliverFrame.infer;
  * `sources` entry; the validator rejects frames that violate this at the
  * boundary.
  */
-export const AgentDeployWorkflow = type({
-  definition: type({
-    id: "string > 0",
-    triggers: "unknown[]",
-    stepOrder: "string[]",
-    steps: { "[string]": "unknown" },
-    "state?": "Record<string, unknown>",
-    "+": "delete",
-  }),
+const WorkflowProjectionDefinition = type({
+  id: "string > 0",
+  triggers: "unknown[]",
+  stepOrder: "string[]",
+  steps: { "[string]": "unknown" },
+  "state?": "Record<string, unknown>",
+  "+": "delete",
+});
+
+/**
+ * A workflow projection paired with its per-step inference-source pins, with
+ * the invariant that every `stepOrder` entry has a `sources` failover chain.
+ * The narrow here is the same coverage check the top-level `AgentDeployWorkflow`
+ * applies to its own definition; this reusable form carries it into each
+ * extracted onTrigger body under `referencedDefinitions`, so a body's sources
+ * cover the body's stepOrder just as the top-level's cover the top-level's.
+ */
+const WorkflowProjectionWithSources = type({
+  definition: WorkflowProjectionDefinition,
   sources: { "[string]": InferenceSource.array().atLeastLength(1) },
+}).narrow((value, ctx) => {
+  for (const stepId of value.definition.stepOrder) {
+    if (!Object.prototype.hasOwnProperty.call(value.sources, stepId)) {
+      return ctx.mustBe(
+        `a workflow projection whose sources cover every step in stepOrder; ${JSON.stringify(stepId)} is missing`,
+      );
+    }
+  }
+  return true;
+});
+
+/**
+ * The decrypted credential material and per-handle binding descriptors
+ * delivered to a running agent so its tools can use provider-backed
+ * credentials. Secrets are decrypted hub-side and ride this payload on the
+ * live channel ONLY -- the deploy frame at launch, a `credentials.update`
+ * frame on rotation, and the child's in-memory cell. They are NEVER written to
+ * disk (they do not ride the git-committed grants file) and NEVER copied into
+ * any snapshot, event, or state -- redaction is by construction, mirroring how
+ * an `InferenceSource`'s `apiKey` stays off every egress type.
+ *
+ * `materials` is keyed by `credentialId` (a credential can back several handles,
+ * so its secret is stored once); `bindings` maps each declared tool handle to
+ * the credential that backs it and the consumer identity allowed to use it.
+ */
+export const CredentialMaterialEntry = type({
+  credentialId: "string",
+  providerKey: "string",
+  origin: "string",
+  secret: "string",
+});
+export type CredentialMaterialEntry = typeof CredentialMaterialEntry.infer;
+
+export const CredentialBindingDescriptor = type({
+  handle: "string",
+  credentialId: "string",
+  consumer: "string",
+});
+export type CredentialBindingDescriptor =
+  typeof CredentialBindingDescriptor.infer;
+
+export const CredentialDelivery = type({
+  bindings: CredentialBindingDescriptor.array(),
+  materials: CredentialMaterialEntry.array(),
+});
+export type CredentialDelivery = typeof CredentialDelivery.infer;
+
+export const AgentDeployWorkflow = type({
+  definition: WorkflowProjectionDefinition,
+  sources: { "[string]": InferenceSource.array().atLeastLength(1) },
+  // Extracted onTrigger section bodies, materialized to their own workflow
+  // assets on the sidecar so a body child's spawn-child resolves the body by
+  // ref without a hub round-trip (the body id IS the asset ref). Optional: only
+  // an onTrigger deploy carries it, and every existing non-onTrigger deploy
+  // omits it and still validates. Each entry carries the body definition AND
+  // the body's own per-step inference-source pins, materialized beside the body
+  // on disk (`sources.json`) so a body child -- in-process, its env lost across
+  // a restart -- resolves inference durably without a hub round-trip.
+  "referencedDefinitions?": WorkflowProjectionWithSources.array(),
+  // Initial credential material for the deployment's tools, decrypted hub-side
+  // and delivered on the deploy frame so it is resident before any step runs
+  // (closing the race where a tool resolves a credential before a push lands).
+  // Run-global: a credential's secret is stored once, keyed by credentialId.
+  // Optional -- a deploy whose definition binds no credentials omits it.
+  "credentials?": CredentialDelivery,
 }).narrow((value, ctx) => {
   for (const stepId of value.definition.stepOrder) {
     if (!Object.prototype.hasOwnProperty.call(value.sources, stepId)) {
@@ -449,6 +551,20 @@ export const SourcesUpdateFrame = type({
 });
 export type SourcesUpdateFrame = typeof SourcesUpdateFrame.infer;
 
+/**
+ * Push refreshed credential material to a running deployment (a rotation, or a
+ * revocation delivered by omitting the revoked credential's material so the
+ * child evicts it). Mirrors `SourcesUpdateFrame`: the sidecar routes it to the
+ * deployment's supervisor, which forwards it to the child's in-memory cell.
+ */
+export const CredentialsUpdateFrame = type({
+  type: "'credentials.update'",
+  requestId: "string",
+  agentAddress: "string",
+  delivery: CredentialDelivery,
+});
+export type CredentialsUpdateFrame = typeof CredentialsUpdateFrame.infer;
+
 // ---------------------------------------------------------------------------
 // Pack transport (bidirectional)
 // ---------------------------------------------------------------------------
@@ -542,8 +658,8 @@ export type PackPushFrame = typeof PackPushFrame.infer;
  *
  * When `mountPath` is set, the receiver materializes the pack at
  * `workspace/<mountPath>/` instead of the hardcoded agent deploy tree.
- * Absent for the agent-state deploy/state flows, which continue to apply
- * the pack to the agent's repo as before.
+ * Absent for agent-state deploy/state flows and workflow-run restoration.
+ * The receiver distinguishes those paths by `repoId.kind`.
  */
 export const PackDoneFrame = type({
   type: "'repo.pack.done'",
@@ -724,7 +840,8 @@ export const SidecarFrame = RegisterFrame.or(ReconnectFrame)
   .or(PackPushFrame)
   .or(PackDoneFrame)
   .or(PackAckFrame)
-  .or(PackRejectFrame);
+  .or(PackRejectFrame)
+  .or(MailInboundAckFrame);
 export type SidecarFrame = typeof SidecarFrame.infer;
 
 /** All frame types the hub sends to the sidecar. */
@@ -734,6 +851,7 @@ export const HubFrame = MailInboundFrame.or(AgentDeployFrame)
   .or(ChallengeFailedFrame)
   .or(PongFrame)
   .or(SourcesUpdateFrame)
+  .or(CredentialsUpdateFrame)
   .or(PackPushFrame)
   .or(PackDoneFrame)
   .or(PackAckFrame)

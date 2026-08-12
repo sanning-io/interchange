@@ -16,8 +16,12 @@ import {
   hashDefinition,
   loop,
   map,
+  onTrigger,
   sleep,
   step,
+  stepTriggerBudget,
+  validateRetryTriggerCombination,
+  type Primitive,
   type WorkflowDefinition,
 } from "./index";
 
@@ -40,6 +44,269 @@ function makeAgent(id: string): AgentDefinition<BaseEnv> {
     },
   });
 }
+
+describe("onTrigger primitive", () => {
+  test("constructor carries on/body and defaults drainBehavior to wait", () => {
+    const body = simpleBody();
+    const prim = onTrigger({ on: { type: "mail", to: "s@x.example" }, body });
+    expect(prim.kind).toBe("onTrigger");
+    expect(prim.on).toEqual({ type: "mail", to: "s@x.example" });
+    // Authored inline: the constructor wraps the WorkflowDefinition as
+    // `{ inline }`; deploy later rewrites it to `{ ref }`.
+    expect(prim.body).toEqual({ inline: body });
+    expect(prim.drainBehavior).toBe("wait");
+    // defineWorkflow, not the constructor, assigns the id from the record key.
+    expect(prim.id).toBe("");
+  });
+
+  test("honors an explicit drainBehavior and after", () => {
+    const prim = onTrigger({
+      on: { type: "manual" },
+      body: simpleBody(),
+      drainBehavior: "cancel",
+      after: ["setup"],
+    });
+    expect(prim.drainBehavior).toBe("cancel");
+    expect(prim.after).toEqual(["setup"]);
+  });
+
+  test("defineWorkflow populates the section id from its record key", () => {
+    const def = defineWorkflow({
+      id: "wf",
+      trigger: { type: "manual" },
+      steps: {
+        section: onTrigger({
+          on: { type: "mail", to: "s@x.example" },
+          body: simpleBody(),
+        }),
+      },
+    });
+    const section = def.steps.section;
+    expect(section?.kind).toBe("onTrigger");
+    expect(section?.id).toBe("section");
+  });
+
+  test("accepts a deployed ref-form section body, skipping its validation", () => {
+    // The deploy step rewrites the inline body to a `{ ref }` arm; the
+    // referenced body was validated at its own deploy, so defineWorkflow
+    // must accept the ref without descending into (absent) inline steps.
+    const section: Primitive = {
+      kind: "onTrigger",
+      id: "",
+      on: { type: "manual" },
+      body: { ref: "body-asset-ref" },
+      drainBehavior: "wait",
+    };
+    const def = defineWorkflow({ id: "wf", steps: { section } });
+    expect(def.steps.section?.kind).toBe("onTrigger");
+    expect(def.triggers).toEqual([{ type: "manual" }]);
+  });
+
+  test("collects each section's `on` into the workflow triggers", () => {
+    const def = defineWorkflow({
+      id: "wf",
+      steps: {
+        section: onTrigger({
+          on: { type: "mail", to: "s@x.example" },
+          body: simpleBody(),
+        }),
+      },
+    });
+    expect(def.triggers).toEqual([{ type: "mail", to: "s@x.example" }]);
+  });
+
+  test("dedupes a section `on` that restates a declared trigger", () => {
+    const def = defineWorkflow({
+      id: "wf",
+      trigger: { type: "mail", to: "s@x.example" },
+      steps: {
+        section: onTrigger({
+          on: { type: "mail", to: "s@x.example" },
+          body: simpleBody(),
+        }),
+      },
+    });
+    expect(def.triggers).toEqual([{ type: "mail", to: "s@x.example" }]);
+  });
+
+  test("a section body may contain an awaitSignal, unlike a loop body", () => {
+    const body = defineWorkflow({
+      id: "body",
+      trigger: { type: "manual" },
+      steps: { hold: awaitSignal({ name: "go" }) },
+    });
+    // Does not throw: an onTrigger body is the sanctioned long-lived loop.
+    defineWorkflow({
+      id: "wf",
+      steps: { section: onTrigger({ on: { type: "manual" }, body }) },
+    });
+  });
+
+  test("rejects a section body that nests another onTrigger", () => {
+    const inner = defineWorkflow({
+      id: "inner",
+      steps: {
+        nested: onTrigger({ on: { type: "manual" }, body: simpleBody() }),
+      },
+    });
+    expect(() =>
+      defineWorkflow({
+        id: "wf",
+        steps: { section: onTrigger({ on: { type: "manual" }, body: inner }) },
+      }),
+    ).toThrow(/may not nest another section/);
+  });
+
+  test("rejects a loop body that contains an onTrigger section", () => {
+    const body = defineWorkflow({
+      id: "body",
+      steps: {
+        section: onTrigger({ on: { type: "manual" }, body: simpleBody() }),
+      },
+    });
+    expect(() =>
+      defineWorkflow({
+        id: "wf",
+        trigger: { type: "manual" },
+        steps: {
+          l: loop({
+            body,
+            while: "whileFn",
+            carry: "carryFn",
+            maxIterations: 2,
+            onExhausted: "done",
+          }),
+          done: step({ agent: makeAgent("d"), after: ["l"] }),
+        },
+      }),
+    ).toThrow(/onTrigger/);
+  });
+});
+
+describe("step triggers budget", () => {
+  test("defaults to 1 when unspecified", () => {
+    expect(stepTriggerBudget(step({ agent: makeAgent("a") }))).toBe(1);
+  });
+
+  test("carries a declared finite budget", () => {
+    expect(
+      stepTriggerBudget(step({ agent: makeAgent("a"), triggers: 5 })),
+    ).toBe(5);
+  });
+
+  test("carries the unbounded budget", () => {
+    expect(
+      stepTriggerBudget(step({ agent: makeAgent("a"), triggers: "unbounded" })),
+    ).toBe("unbounded");
+  });
+
+  test("rejects a non-positive or fractional trigger count", () => {
+    expect(() => step({ agent: makeAgent("a"), triggers: 0 })).toThrow(
+      /positive integer or "unbounded"/,
+    );
+    expect(() => step({ agent: makeAgent("a"), triggers: -1 })).toThrow(
+      /positive integer or "unbounded"/,
+    );
+    expect(() => step({ agent: makeAgent("a"), triggers: 1.5 })).toThrow(
+      /positive integer or "unbounded"/,
+    );
+  });
+
+  test("rejects an invalid trigger count at the read point too", () => {
+    // A definition hydrated from workflow.json never passes through `step()`
+    // (the envelope schema checks structure only), so `stepTriggerBudget` --
+    // the single read point -- must fail loud on a persisted invalid value
+    // rather than silently coercing (0 would behave as 1; 1.5 would service
+    // an extra trigger). Build the primitive directly, as hydration does.
+    const hydrated = { ...step({ agent: makeAgent("a") }), triggers: 0 };
+    expect(() => stepTriggerBudget(hydrated)).toThrow(
+      /positive integer or "unbounded"/,
+    );
+    const fractional = { ...step({ agent: makeAgent("a") }), triggers: 1.5 };
+    expect(() => stepTriggerBudget(fractional)).toThrow(
+      /positive integer or "unbounded"/,
+    );
+  });
+
+  test("rejects a retry policy on a multi-trigger step", () => {
+    // A retried attempt re-invokes the step with its launch input and starts
+    // with no resume, so on a step with a trigger budget other than 1 a
+    // mid-run failure would re-service the launch trigger and never
+    // re-service the consumed one -- the combination fails loud.
+    const retry = { maxAttempts: 2, initialBackoffMs: 100 };
+    expect(() => step({ agent: makeAgent("a"), triggers: 3, retry })).toThrow(
+      /cannot combine with a trigger budget/,
+    );
+    expect(() =>
+      step({ agent: makeAgent("a"), triggers: "unbounded", retry }),
+    ).toThrow(/cannot combine with a trigger budget/);
+    // A batch step retries fine: re-invoking with the launch input IS the
+    // retry semantics for a single trigger.
+    step({ agent: makeAgent("a"), retry });
+    step({ agent: makeAgent("a"), triggers: 1, retry });
+    // A declared maxAttempts of 1 never retries, so it combines with any
+    // budget.
+    step({
+      agent: makeAgent("a"),
+      triggers: "unbounded",
+      retry: { maxAttempts: 1, initialBackoffMs: 100 },
+    });
+  });
+
+  test("rejects the retry/budget combination at the read point too", () => {
+    // Hydrated definitions never pass through `step()`, so the runtime's
+    // read-point guard (applied at runStep entry) must reject the persisted
+    // combination. Build the primitive directly, as hydration does.
+    const hydrated = {
+      ...step({ agent: makeAgent("a"), triggers: 3 }),
+      retry: { maxAttempts: 2, initialBackoffMs: 100 },
+    };
+    expect(() => validateRetryTriggerCombination(hydrated)).toThrow(
+      /cannot combine with a trigger budget/,
+    );
+  });
+
+  test("rejects a map-level retry over a multi-trigger inner step", () => {
+    // The map's retry applies to each fan-out instance of an inner step that
+    // declares none, so `map()` must validate the COMPOSED shape -- `step()`
+    // alone never sees a map-level retry, and without the map-side check the
+    // forbidden combination would surface only at the run's first execution.
+    const retry = { maxAttempts: 2, initialBackoffMs: 100 };
+    expect(() =>
+      map({
+        over: { from: "trigger.payload" },
+        step: step({ agent: makeAgent("a"), triggers: 2 }),
+        retry,
+      }),
+    ).toThrow(/cannot combine with a trigger budget/);
+    // The inner step's OWN retry wins over the map's, so a budget-1 inner
+    // step with its own retry composes fine under a map-level retry...
+    map({
+      over: { from: "trigger.payload" },
+      step: step({ agent: makeAgent("a"), retry }),
+      retry,
+    });
+    // ...and a multi-trigger inner step is fine when no retry reaches it.
+    map({
+      over: { from: "trigger.payload" },
+      step: step({ agent: makeAgent("a"), triggers: 2 }),
+    });
+  });
+
+  test("triggers participates in the definition hash", () => {
+    const one = defineWorkflow({
+      id: "w",
+      trigger: { type: "manual" },
+      steps: { s: step({ agent: makeAgent("a") }) },
+    });
+    const unbounded = defineWorkflow({
+      id: "w",
+      trigger: { type: "manual" },
+      steps: { s: step({ agent: makeAgent("a"), triggers: "unbounded" }) },
+    });
+    expect(hashDefinition(one)).not.toEqual(hashDefinition(unbounded));
+  });
+});
 
 describe("defineWorkflow", () => {
   test("rejects an empty steps record", () => {
@@ -118,6 +385,36 @@ describe("defineWorkflow", () => {
       steps: { default: step({ agent: planner }) },
     });
     expect(singular).toEqual(plural);
+  });
+
+  test("preserves exclusive sidecar placement across authoring shapes", () => {
+    const planner = makeAgent("planner");
+    const singular = defineWorkflow({
+      id: "w",
+      agent: planner,
+      sidecarPlacement: { sharing: "exclusive" },
+    });
+    const plural = defineWorkflow({
+      id: "w",
+      steps: { default: step({ agent: planner }) },
+      sidecarPlacement: { sharing: "exclusive" },
+    });
+    expect(singular).toEqual(plural);
+    expect(singular.sidecarPlacement).toEqual({
+      sharing: "exclusive",
+      reuse: "never",
+    });
+  });
+
+  test("rejects an unknown sidecar sharing mode", () => {
+    expect(() =>
+      defineWorkflow({
+        id: "w",
+        steps: { work: step({ agent: makeAgent("worker") }) },
+        // @ts-expect-error Exercises runtime validation for JavaScript callers.
+        sidecarPlacement: { sharing: "shared" },
+      }),
+    ).toThrow(/exclusive/);
   });
 
   test("validates after references against the steps record", () => {
@@ -521,10 +818,107 @@ describe("loop validation", () => {
   });
 });
 
+describe("awaitSignal onTimeout validation", () => {
+  test("accepts a timed awaitSignal routing to a successor on timeout", () => {
+    const recover = makeAgent("recover");
+    expect(() =>
+      defineWorkflow({
+        id: "w",
+        trigger: { type: "manual" },
+        steps: {
+          gate: awaitSignal({ name: "go", timeout: 100, onTimeout: "recover" }),
+          recover: step({ agent: recover, after: ["gate"] }),
+        },
+      }),
+    ).not.toThrow();
+  });
+
+  test("rejects onTimeout without a timeout", () => {
+    const recover = makeAgent("recover");
+    expect(() =>
+      defineWorkflow({
+        id: "w",
+        trigger: { type: "manual" },
+        steps: {
+          gate: awaitSignal({ name: "go", onTimeout: "recover" }),
+          recover: step({ agent: recover, after: ["gate"] }),
+        },
+      }),
+    ).toThrow(/onTimeout recover but sets no timeout/);
+  });
+
+  test("rejects onTimeout naming an unknown step", () => {
+    expect(() =>
+      defineWorkflow({
+        id: "w",
+        trigger: { type: "manual" },
+        steps: {
+          gate: awaitSignal({ name: "go", timeout: 100, onTimeout: "nope" }),
+        },
+      }),
+    ).toThrow(/onTimeout nope which is not a known step/);
+  });
+
+  test("rejects onTimeout naming itself", () => {
+    expect(() =>
+      defineWorkflow({
+        id: "w",
+        trigger: { type: "manual" },
+        steps: {
+          gate: awaitSignal({ name: "go", timeout: 100, onTimeout: "gate" }),
+        },
+      }),
+    ).toThrow(/cannot name itself as onTimeout/);
+  });
+
+  test("rejects an onTimeout target that does not depend on the gate", () => {
+    // onTimeout routes only on a fired timer, so the target must name the gate
+    // in its after (mirroring loop.onExhausted) -- else it would run every run.
+    const recover = makeAgent("recover");
+    expect(() =>
+      defineWorkflow({
+        id: "w",
+        trigger: { type: "manual" },
+        steps: {
+          gate: awaitSignal({ name: "go", timeout: 100, onTimeout: "recover" }),
+          recover: step({ agent: recover }),
+        },
+      }),
+    ).toThrow(/onTimeout recover must name gate in its after/);
+  });
+});
+
 describe("primitive defaults", () => {
-  test("step defaults drainBehavior to cancel", () => {
+  test("step defaults drainBehavior to cancel (batch)", () => {
     const s = step({ agent: makeAgent("a") });
     expect(s.drainBehavior).toBe("cancel");
+    const explicitOne = step({ agent: makeAgent("a"), triggers: 1 });
+    expect(explicitOne.drainBehavior).toBe("cancel");
+  });
+
+  test("step defaults drainBehavior to wait when triggers is not 1", () => {
+    const multi = step({ agent: makeAgent("a"), triggers: 5 });
+    expect(multi.drainBehavior).toBe("wait");
+    const unbounded = step({
+      agent: makeAgent("a"),
+      triggers: "unbounded",
+    });
+    expect(unbounded.drainBehavior).toBe("wait");
+  });
+
+  test("explicit drainBehavior overrides the trigger-budget default", () => {
+    const multiExplicit = step({
+      agent: makeAgent("a"),
+      triggers: 5,
+      drainBehavior: "cancel",
+    });
+    expect(multiExplicit.drainBehavior).toBe("cancel");
+    const batchExplicit = step({
+      agent: makeAgent("a"),
+      triggers: 1,
+      drainBehavior: "wait",
+    });
+    expect(batchExplicit.drainBehavior).toBe("wait");
   });
 
   test("awaitSignal defaults drainBehavior to wait", () => {
@@ -607,5 +1001,19 @@ describe("hashDefinition", () => {
       ],
     });
     expect(hashDefinition(withGrants)).not.toEqual(hashDefinition(base));
+  });
+
+  test("sidecar placement changes the content hash", () => {
+    const a = makeAgent("a");
+    const base = defineWorkflow({
+      id: "w",
+      steps: { a: step({ agent: a }) },
+    });
+    const exclusive = defineWorkflow({
+      id: "w",
+      steps: { a: step({ agent: a }) },
+      sidecarPlacement: { sharing: "exclusive" },
+    });
+    expect(hashDefinition(exclusive)).not.toEqual(hashDefinition(base));
   });
 });

@@ -140,11 +140,6 @@ function createMockDB(opts: CatalogDBOpts) {
         // subtree; no children in tests.
         findMany: async () => [],
       },
-      // The post-mutation source push scans running instances; none in tests.
-      agentInstance: {
-        findFirst: notImplemented("db.query.agentInstance.findFirst"),
-        findMany: async () => [],
-      },
       principal: {
         findFirst: async () => testPrincipal,
         findMany: notImplemented("db.query.principal.findMany"),
@@ -217,6 +212,7 @@ function createMockSidecarRouter(): SidecarRouter {
     sendAgentUndeploy: () => notImpl("sendAgentUndeploy"),
     // Mutations fire a fire-and-forget source push; resolve so it is a no-op.
     sendSourcesUpdate: () => Promise.resolve(),
+    sendCredentialsUpdate: () => Promise.resolve(),
     sendPack: () => notImpl("sendPack"),
     sendProvisionStep: () => notImpl("sendProvisionStep"),
     bindStepRoute: () => notImpl("bindStepRoute"),
@@ -380,7 +376,10 @@ describe("POST /catalog/providers", () => {
   test("creates a provider with exactly one auth binding", async () => {
     const inserts: InsertCapture[] = [];
     const app = createTestApp({
-      db: { inserts, credential: { id: "crd_1", tenantId: TENANT_ID } },
+      db: {
+        inserts,
+        credential: { id: "crd_1", tenantId: TENANT_ID, principalId: null },
+      },
     });
     const res = await postJSON(app, providersURL, {
       name: "anthropic",
@@ -399,12 +398,33 @@ describe("POST /catalog/providers", () => {
     });
   });
 
+  test("rejects a principal-owned credential (catalog providers require tenant-owned)", async () => {
+    // A catalog provider delivers its credential to any agent in the owning
+    // subtree, so a principal-owned credential cannot back it. Reject at write
+    // rather than let it resolve and then silently fail closed at launch.
+    const inserts: InsertCapture[] = [];
+    const app = createTestApp({
+      db: {
+        inserts,
+        credential: { id: "crd_1", tenantId: TENANT_ID, principalId: "prn_x" },
+      },
+    });
+    const res = await postJSON(app, providersURL, {
+      name: "anthropic",
+      plugin: "anthropic",
+      baseURL: "https://api.anthropic.com",
+      credentialId: "crd_1",
+    });
+    expect(res.status).toBe(404);
+    expect(inserts.filter((i) => i.table === "model_provider")).toHaveLength(0);
+  });
+
   test("returns 409 when the provider name already exists", async () => {
     const inserts: InsertCapture[] = [];
     const app = createTestApp({
       db: {
         inserts,
-        credential: { id: "crd_1", tenantId: TENANT_ID },
+        credential: { id: "crd_1", tenantId: TENANT_ID, principalId: null },
         modelProvider: { id: "mpv_existing" },
       },
     });

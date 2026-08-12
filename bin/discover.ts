@@ -1,11 +1,12 @@
 #!/usr/bin/env bun
 /* eslint-disable no-console */
 
+import { rmSync } from "node:fs";
 import { resolve } from "node:path";
 import {
   INTENTS,
   SUPPORT_MATRIX,
-  getFixtureDir,
+  getSessionDir,
   type SupportEntry,
 } from "@intx/inference-discovery/catalog";
 import {
@@ -15,21 +16,20 @@ import {
   runCapture,
   type ParsedCLIRun,
 } from "@intx/inference-discovery";
-import { PLUGIN_REGISTRY, findPlugin } from "./lib/discover-registry";
+import {
+  PLUGIN_REGISTRY,
+  findPlugin,
+  formatProviderHelp,
+} from "./lib/discover-registry";
 
 const ROOT = resolve(import.meta.dirname, "..");
 
 function buildHelpText(): string {
-  const providers = PLUGIN_REGISTRY.map((entry) => {
-    const envList = entry.requiredEnv.join(", ");
-    return `  ${entry.name}\n    requires env: ${envList}`;
-  }).join("\n");
-
   return `Usage: bun bin/discover.ts --provider <name> [--all | --only <capability>] [--model <name>] [-h]
 
 Captures live inference responses from a provider plug-in and writes
-fixture bundles into the provider's discovery package, under
-wire/<provider>/<model>/<capability>/.
+session bundles into the provider's discovery package, under
+sessions/<provider>/<model>/<capability>/.
 
 Options:
   --provider <name>     Required. Selects the provider plug-in to invoke.
@@ -41,7 +41,7 @@ Options:
   --help, -h            Show this message.
 
 Available providers:
-${providers}
+${formatProviderHelp()}
 
 CI guard:
   Discovery makes real, paid network calls and must never run in CI.
@@ -125,23 +125,33 @@ async function main(): Promise<number> {
 
   for (const entry of entries) {
     const intent = INTENTS[entry.capability];
-    const relDir = getFixtureDir(entry);
+    const relDir = getSessionDir(entry);
     if (relDir === null) {
       throw new Error(
-        `getFixtureDir returned null for captured entry ${entry.provider}/${entry.model}/${entry.capability}`,
+        `getSessionDir returned null for captured entry ${entry.provider}/${entry.model}/${entry.capability}`,
       );
     }
     const outDir = resolve(ROOT, relDir);
     console.error(
       `[discover] start  model=${entry.model} capability=${entry.capability}`,
     );
-    await runCapture({
+    const result = await runCapture({
       plugin,
       model: entry.model,
       capability: entry.capability,
       intent,
       outDir,
     });
+    // discover writes into the committed sessions/ tree, so a non-2xx must not
+    // pass silently: runCapture stops before the manifest on a non-2xx, leaving
+    // a partial bundle a later replay would choke on. Remove that partial and
+    // fail loudly rather than exit 0 with a broken session on disk.
+    if (result.finalStatus < 200 || result.finalStatus >= 300) {
+      rmSync(outDir, { recursive: true, force: true });
+      throw new Error(
+        `discover: ${entry.model}/${entry.capability} returned HTTP ${String(result.finalStatus)}; no session written`,
+      );
+    }
     console.error(
       `[discover] done   model=${entry.model} capability=${entry.capability}`,
     );

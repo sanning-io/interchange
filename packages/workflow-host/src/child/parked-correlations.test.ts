@@ -153,7 +153,12 @@ describe("collectParkedApprovalCorrelations", () => {
     });
 
     expect(result).toEqual([
-      { runId: "run-1", correlationId: "corr-1", kind: "approval", snapshot },
+      {
+        runId: "run-1",
+        correlationId: "corr-1",
+        parkKind: "approval",
+        snapshot,
+      },
     ]);
     expect(calls).toEqual([
       { runId: "run-1", stepId: "s", attempt: 1, correlationId: "corr-1" },
@@ -201,7 +206,7 @@ describe("collectParkedApprovalCorrelations", () => {
       "corr-a2",
       "corr-b1",
     ]);
-    expect(result.every((r) => r.kind === "approval")).toBe(true);
+    expect(result.every((r) => r.parkKind === "approval")).toBe(true);
     expect(result.every((r) => r.snapshot === snapshot)).toBe(true);
     expect(calls.sort()).toEqual(["corr-a1", "corr-a2", "corr-b1"]);
   });
@@ -225,6 +230,64 @@ describe("collectParkedApprovalCorrelations", () => {
 
     expect(result).toEqual([]);
     expect(called).toBe(false);
+  });
+
+  test("skips an input park on a reserved channel without touching the binding", async () => {
+    // An `"input"` park (a long-lived run awaiting its next mail) reduces to
+    // the same `awaiting-signal` on a reserved channel as an approval, but it
+    // carries no snapshot and is never hub-registered. Enumeration must skip it
+    // BEFORE the snapshot lookup -- so it does not throw even with NO
+    // loadParkedApproval binding wired. Were it not skipped, its mere presence
+    // would take the whole deployment's approval re-registration down on every
+    // reconnect.
+    const baseDir = await fs.mkdtemp(path.join(os.tmpdir(), "parked-corr-"));
+    const runsDir = path.join(baseDir, repoId.kind, repoId.id, "runs");
+    const runtimeRepoStore = createInMemoryRepoStore();
+    await fs.mkdir(path.join(runsDir, "run-input"), { recursive: true });
+    const seed: WorkflowEvent[] = [
+      {
+        kind: "RunStarted",
+        seq: 1,
+        at,
+        runId: "run-input",
+        definitionHash: "x",
+        trigger: { type: "manual", payload: undefined },
+      },
+      {
+        kind: "StepStarted",
+        seq: 2,
+        at,
+        stepId: "s",
+        attempt: 1,
+        input: { ref: "inline:null" },
+      },
+      {
+        kind: "SignalAwaited",
+        seq: 3,
+        at,
+        stepId: "s",
+        signalName: signalName("corr-input"),
+        parkKind: "input",
+      },
+    ];
+    for (const event of seed) await runtimeRepoStore.append("run-input", event);
+    const substrate = createStubSubstrate(baseDir);
+
+    // No loadParkedApproval binding: a control-plane APPROVAL park here would
+    // throw "no loadParkedApproval binding is wired". An input park is collected
+    // without a snapshot and without touching the binding.
+    const result = await collectParkedApprovalCorrelations({
+      substrate,
+      repoId,
+      runtimeRepoStore,
+    });
+    expect(result).toEqual([
+      {
+        runId: "run-input",
+        correlationId: "corr-input",
+        parkKind: "input",
+      },
+    ]);
   });
 
   test("throws when a control-plane park is found but no binding is wired", async () => {

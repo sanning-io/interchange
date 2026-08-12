@@ -303,9 +303,10 @@ orchestration layer above the adapter — multi-turn body construction,
 conversation history threading, tool dispatch wiring, terminal
 sequencing across turns.
 
-Where the existing `runCompatReplay` holds **one** exchange constant
-to surface adapter regressions, session replay holds an **entire
-conversation** constant: every exchange plus every tool dispatch.
+Where the session parser-regression holds **one** exchange's response
+constant to surface adapter decode regressions, session replay holds
+an **entire conversation** constant: every exchange plus every tool
+dispatch.
 If the production reactor changes how it serialises a `tool_result`
 block, or how it threads previous turns into a new request body,
 the corresponding exchange's body diverges from capture and
@@ -329,7 +330,7 @@ exchange's body diverge and break replay.
 ### Capture format
 
 ```
-packages/inference-testing/sessions/<name>/
+packages/inference-discovery-<adapter>/example-sessions/<brand>/<name>/
 ├── session.json
 ├── exchanges/
 │   ├── 0/
@@ -346,7 +347,7 @@ packages/inference-testing/sessions/<name>/
 ```
 
 The `session.json` at the root carries only session-level facts that
-describe the session as a whole — `sessionSchemaVersion`, `source`
+describe the session as a whole — `schemaVersion`, `source`
 (provider/model/baseURL), `capturedAt`. There is no catalog of the
 contents underneath; ordering and naming come from the filesystem
 layout itself, so the metadata cannot go stale.
@@ -355,6 +356,13 @@ Exchange directories are byte-identical to the discovery rig's
 captures (they're written by the same `writeCapture` function).
 Dispatch entries are a single JSON file each because both `args` and
 `result` are small JSON values.
+
+Committed sessions live next to the adapter that produced them, not in
+this package: synthetic captures recorded through the fetch seam go
+under a discovery package's `example-sessions/<brand>/`, and live
+captures recorded against real endpoints go under its
+`live-sessions/<brand>/`. Both trees sit outside the `sessions/<brand>/`
+tree that the discovery probe rig owns and overwrites.
 
 ### Recording
 
@@ -365,7 +373,8 @@ import { requireEnv } from "@intx/inference-discovery";
 const apiKey = requireEnv("ANTHROPIC_API_KEY");
 
 const harness = createRecordingHarness({
-  outputDir: "packages/inference-testing/sessions/my-scenario",
+  outputDir:
+    "packages/inference-discovery-anthropic/example-sessions/anthropic/my-scenario",
   source: {
     provider: "anthropic",
     model: "claude-sonnet-x",
@@ -414,10 +423,11 @@ The paired `fetch: FetchLike` + `bypassCIGuardForTests: true` test
 seam is reserved for this package's own unit tests; production
 recording scripts should never pass either flag.
 
-`packages/inference-testing/bin/record-example-sessions.ts` is a small
-script that uses the test seam to regenerate the committed example
-sessions without provider credentials. Run it with
-`bun --conditions=intx-src packages/inference-testing/bin/record-example-sessions.ts`.
+`bin/record-example-sessions.ts` is a small script that uses the test
+seam to regenerate the committed synthetic example sessions (under
+`packages/inference-discovery-anthropic/example-sessions/anthropic/`)
+without provider credentials. Run it with
+`bun --conditions=intx-src bin/record-example-sessions.ts`.
 
 ### Replay
 
@@ -425,7 +435,8 @@ sessions without provider credentials. Run it with
 import { createReplayHarness, INVARIANTS } from "@intx/inference-testing";
 
 const replay = await createReplayHarness({
-  sessionDir: "packages/inference-testing/sessions/my-scenario",
+  sessionDir:
+    "packages/inference-discovery-anthropic/example-sessions/anthropic/my-scenario",
 });
 try {
   // Production runInference is single-turn; the caller drives the
@@ -520,7 +531,7 @@ captured session for a regression test.
   rejects it at load time.
 - **Response content-types must be `text/event-stream` or
   `application/json`.** The recording wrapper buffers the response
-  via `detectResponseKind` from `@intx/inference-discovery`, which
+  via `detectResponseKind` from `@intx/types/content-type`, which
   throws on missing or unrecognised content-types. The current
   inference adapters only ever produce SSE or JSON responses;
   recording another shape (`text/plain`, `application/octet-stream`)

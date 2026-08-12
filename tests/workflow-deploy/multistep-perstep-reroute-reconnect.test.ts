@@ -71,7 +71,6 @@ import {
   SIDECAR_ID,
   fireMailTrigger,
   injectSignal,
-  listRunIds,
   readWorkflowRunEvents,
   settleThenDrop,
   startDeployFlowEnv,
@@ -307,66 +306,39 @@ describe("multi-step per-step re-route survival across reconnect", () => {
       deploymentMailAddress,
     );
 
-    // ---- first run: full inter-step chain to completion ----
-    const firstRunId = await runInterStepChainToCompletion(env, {
-      deploymentId: DEPLOYMENT_ID,
-      deploymentMailAddress,
-      workflowRunRepoId,
-      messageId: "<multistep-reroute-1@integration.interchange>",
-      priorRunIds: new Set<string>(),
-    });
+    // Drive the deployment's one stable run to its inter-step park, reconnect
+    // there, and then complete that SAME run. Re-firing after completion is no
+    // longer a valid way to prove route restoration.
+    await runInterStepChainToCompletion(
+      env,
+      {
+        deploymentId: DEPLOYMENT_ID,
+        deploymentMailAddress,
+        messageId: "<multistep-reroute-1@integration.interchange>",
+      },
+      async () => {
+        expect(env.hub.router.getRoutableAddresses()).toContain(
+          deploymentMailAddress,
+        );
+        await settleThenDrop(env, deploymentMailAddress);
+        await waitFor(
+          () =>
+            !env.hub.router
+              .getRoutableAddresses()
+              .includes(deploymentMailAddress),
+          { timeoutMs: 5_000, diagnostics: env.sidecarDiagnostics },
+        );
 
-    // ---- settle the pack pipeline, then drop the hub link ----
-    expect(env.hub.router.getRoutableAddresses()).toContain(
-      deploymentMailAddress,
+        const reconnectMs = await waitForReconnect(env, deploymentMailAddress, {
+          timeoutMs: 20_000,
+        });
+        expect(reconnectMs).toBeGreaterThan(1_000);
+        expect(reconnectMs).toBeLessThan(20_000);
+        expect(env.hub.router.getRoutableAddresses()).toContain(
+          deploymentMailAddress,
+        );
+      },
     );
-    await settleThenDrop(env, deploymentMailAddress);
-
-    // The deployment address leaves routing as the server-side close lands;
-    // this guards against a false "already routable" pass where the drop
-    // never actually severed the link.
-    await waitFor(
-      () =>
-        !env.hub.router.getRoutableAddresses().includes(deploymentMailAddress),
-      { timeoutMs: 5_000, diagnostics: env.sidecarDiagnostics },
-    );
-
-    // ---- wait for the reconnect ownership challenge to re-route the
-    // workflow-derived deployment address ----
-    const reconnectMs = await waitForReconnect(env, deploymentMailAddress, {
-      timeoutMs: 20_000,
-    });
-    // A generous lower bound guards against a false "already routable" pass
-    // that never actually dropped; the upper bound catches a hung link.
-    expect(reconnectMs).toBeGreaterThan(1_000);
-    expect(reconnectMs).toBeLessThan(20_000);
-    expect(env.hub.router.getRoutableAddresses()).toContain(
-      deploymentMailAddress,
-    );
-
-    // The per-step staging bindings are transient: they are never persisted
-    // into the reconnect set, so no per-step address appears in the hub's
-    // routable set to assert against. The only hub route that survives the
-    // reconnect is the deployment address the steps collapse under (asserted
-    // routable again just above); the per-step runtimes route through that
-    // single re-challenged address. The second inter-step run below, reaching
-    // completion with a distinct runId, is the load-bearing proof that
-    // inter-step routing came back with it -- re-deriving the step addresses
-    // locally here would only restate what `deriveStepAddress` already
-    // guarantees before the reconnect and pin nothing about it.
-
-    // ---- second run after reconnect: full inter-step chain again ----
-    // Only reachable because the sidecar re-established the link, the hub
-    // re-challenged the workflow-derived deployment address, and inter-step
-    // mail/signal routing came back with it.
-    const secondRunId = await runInterStepChainToCompletion(env, {
-      deploymentId: DEPLOYMENT_ID,
-      deploymentMailAddress,
-      workflowRunRepoId,
-      messageId: "<multistep-reroute-2@integration.interchange>",
-      priorRunIds: new Set<string>([firstRunId]),
-    });
-    expect(secondRunId).not.toBe(firstRunId);
   }, 180_000);
 });
 
@@ -377,29 +349,19 @@ describe("multi-step per-step re-route survival across reconnect", () => {
  * the run to complete. Asserts the ordered event chain
  * (RunStarted -> step1 Started/Completed -> SignalAwaited -> SignalReceived ->
  * step2 Started/Completed -> RunCompleted), which is the inter-step
- * mail/signal routing under test. Returns the runId the supervisor minted.
- *
- * `priorRunIds` names the run ids present before this trigger so the helper
- * can isolate the run this trigger started; the supervisor mints the id from
- * the inbound mail bytes and the test does not know it up front.
+ * mail/signal routing under test. The optional callback runs at the durable
+ * SignalAwaited park. Returns the deployment's stable runId.
  */
 async function runInterStepChainToCompletion(
   env: DeployFlowEnv,
   args: {
     deploymentId: string;
     deploymentMailAddress: string;
-    workflowRunRepoId: RepoId;
     messageId: string;
-    priorRunIds: ReadonlySet<string>;
   },
+  afterPark?: () => Promise<void>,
 ): Promise<string> {
-  const {
-    deploymentId,
-    deploymentMailAddress,
-    workflowRunRepoId,
-    messageId,
-    priorRunIds,
-  } = args;
+  const { deploymentId, deploymentMailAddress, messageId } = args;
 
   const { messageId: firedMessageId } = await fireMailTrigger(
     env,
@@ -407,9 +369,21 @@ async function runInterStepChainToCompletion(
     { messageId },
   );
 
-  // Discover the run id this trigger started: the first run id under `runs/`
-  // that was not present before the fire.
-  const runId = await waitForNewRunId(env, workflowRunRepoId, priorRunIds);
+  // The deployment address is the one stable top-level runId. RunStarted is
+  // immutable, so its consumedMessageId permanently identifies the mail that
+  // first fired this deployment.
+  const runId = deploymentMailAddress;
+  await waitFor(
+    async () => {
+      const events = await readWorkflowRunEvents(env, deploymentId, runId);
+      return events.some(
+        (e) =>
+          e.type === "RunStarted" &&
+          e.body["consumedMessageId"] === firedMessageId,
+      );
+    },
+    { diagnostics: env.sidecarDiagnostics, timeoutMs: 20_000 },
+  );
 
   // First-half chain: RunStarted -> StepStarted{step1} ->
   // StepCompleted{step1} -> SignalAwaited{name:"go"}.
@@ -449,6 +423,11 @@ async function runInterStepChainToCompletion(
   const runStartedBody = eventsBeforeSignal[runStartedIdx]?.body;
   if (runStartedBody === undefined) throw new Error("unreachable");
   expect(runStartedBody["consumedMessageId"]).toBe(firedMessageId);
+
+  // Tests that need to interrupt a live run (for example, to exercise a
+  // reconnect) do so at the durable inter-step park, never by completing and
+  // trying to fire the terminal deployment again.
+  await afterPark?.();
 
   // Inject the `go` signal through the production signal-channel path.
   const injected = await injectSignal(env, deploymentId, runId, "go", {
@@ -490,27 +469,4 @@ async function runInterStepChainToCompletion(
   expect(signalReceivedBody["payload"]).toEqual({ resumed: true });
 
   return runId;
-}
-
-/**
- * Poll until a run id appears under `runs/` that is not in `priorRunIds`, and
- * return it. Throws on timeout so a run that never started surfaces loudly.
- */
-async function waitForNewRunId(
-  env: DeployFlowEnv,
-  workflowRunRepoId: RepoId,
-  priorRunIds: ReadonlySet<string>,
-): Promise<string> {
-  const start = Date.now();
-  for (;;) {
-    const ids = await listRunIds(env, workflowRunRepoId);
-    const fresh = ids.find((id) => !priorRunIds.has(id));
-    if (fresh !== undefined) return fresh;
-    if (Date.now() - start > 30_000) {
-      throw new Error(
-        `no new run id after mail trigger; saw runIds ${JSON.stringify(ids)}\n${env.sidecarDiagnostics()}`,
-      );
-    }
-    await new Promise((r) => setTimeout(r, 50));
-  }
 }

@@ -3,15 +3,16 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  CapabilityNotBuildableError,
   INTENTS,
   SUPPORT_MATRIX,
-  getFixtureDir,
+  getSessionDir,
   type Capability,
   type ToolDecl,
 } from "@intx/inference-discovery/catalog";
 import type { CaptureStep, CapturedResponse } from "@intx/inference-discovery";
 import { createGoogleGenaiPlugin, iterateCaptureSteps } from "./index";
-import { buildRequestBody } from "./request-body";
+import { buildRequestBody, TEXT_MODELS, IMAGE_MODELS } from "./request-body";
 import { buildEndpointURL, isStreamingCapability } from "./endpoint";
 
 const TEST_API_KEY = "test-key";
@@ -29,37 +30,60 @@ const FILES_API_CAPABILITIES: ReadonlySet<Capability> = new Set<Capability>([
   "files-api-reference-streaming",
 ]);
 
-function readFixtureJSON(fixtureDir: string, ...parts: string[]): unknown {
-  const raw = readFileSync(join(REPO_ROOT, fixtureDir, ...parts), "utf8");
+function exchangePath(
+  sessionDir: string,
+  exchangeIndex: number,
+  file: string,
+): string {
+  return join(REPO_ROOT, sessionDir, "exchanges", String(exchangeIndex), file);
+}
+
+function readExchangeJSON(
+  sessionDir: string,
+  exchangeIndex: number,
+  file: string,
+): unknown {
+  const raw = readFileSync(
+    exchangePath(sessionDir, exchangeIndex, file),
+    "utf8",
+  );
   return JSON.parse(raw);
 }
 
-function readFixtureBytes(fixtureDir: string, ...parts: string[]): Uint8Array {
-  const buf = readFileSync(join(REPO_ROOT, fixtureDir, ...parts));
+function readExchangeBytes(
+  sessionDir: string,
+  exchangeIndex: number,
+  file: string,
+): Uint8Array {
+  const buf = readFileSync(exchangePath(sessionDir, exchangeIndex, file));
   return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
 }
 
-function fixtureFileExists(fixtureDir: string, ...parts: string[]): boolean {
+function exchangeFileExists(
+  sessionDir: string,
+  exchangeIndex: number,
+  file: string,
+): boolean {
   try {
-    readFileSync(join(REPO_ROOT, fixtureDir, ...parts));
+    readFileSync(exchangePath(sessionDir, exchangeIndex, file));
     return true;
   } catch {
     return false;
   }
 }
 
-function loadTurn1Response(fixtureDir: string): unknown {
-  if (fixtureFileExists(fixtureDir, "turn-1", "response.json")) {
-    return readFixtureJSON(fixtureDir, "turn-1", "response.json");
+function loadTurn1Response(sessionDir: string): unknown {
+  if (exchangeFileExists(sessionDir, 0, "response.json")) {
+    return readExchangeJSON(sessionDir, 0, "response.json");
   }
-  const turn2Body = readFixtureJSON(fixtureDir, "turn-2", "request.json");
+  const turn2Body = readExchangeJSON(sessionDir, 1, "request.json");
   if (!isPlainObject(turn2Body)) {
-    throw new Error(`turn-2 request body is not an object in ${fixtureDir}`);
+    throw new Error(`turn-2 request body is not an object in ${sessionDir}`);
   }
   const contents = turn2Body.contents;
   if (!Array.isArray(contents) || contents.length < 2) {
     throw new Error(
-      `turn-2 request body has no model-role assistant content in ${fixtureDir}`,
+      `turn-2 request body has no model-role assistant content in ${sessionDir}`,
     );
   }
   const assistantContent = contents[1];
@@ -188,9 +212,25 @@ describe("createGoogleGenaiPlugin", () => {
       "gemini-2.5-flash",
       "gemini-2.5-flash-image",
       "gemini-2.5-pro",
+      "gemini-3.6-flash",
+      "gemini-3.5-flash",
+      "gemini-3.1-flash-image",
+      "gemini-3-flash-preview",
+      "gemini-3.1-pro-preview",
     ]);
     expect(plugin.redactRequestHeaders).toEqual(["x-goog-api-key"]);
     expect(plugin.redactResponseHeaders).toEqual([]);
+  });
+
+  test("advertised models are exactly the classified text and image sets", () => {
+    // MODELS (the advertised roster) and TEXT_MODELS/IMAGE_MODELS (which
+    // classify request shape) are separate lists edited by hand. If a model is
+    // advertised but absent from both sets, classifyModel defaults it to text
+    // and the probe builds a text request for it; this catches that drift.
+    const plugin = createGoogleGenaiPlugin({ apiKey: TEST_API_KEY });
+    expect(new Set(plugin.models)).toEqual(
+      new Set([...TEXT_MODELS, ...IMAGE_MODELS]),
+    );
   });
 
   test("buildAuthHeaders returns x-goog-api-key", () => {
@@ -275,14 +315,56 @@ describe("buildRequestBody — unsupported pairs", () => {
     ).toThrow(/does not support capability/);
   });
 
-  test("throws for an unknown model", () => {
+  test("throws CapabilityNotBuildableError, not a bare Error", () => {
+    expect(() =>
+      buildRequestBody({
+        model: "gemini-2.5-flash",
+        capability: "image-output",
+        intent: INTENTS["image-output"],
+      }),
+    ).toThrow(CapabilityNotBuildableError);
+  });
+
+  test("an unknown model defaults to the text class and builds text", () => {
     expect(() =>
       buildRequestBody({
         model: "gemini-99-unknown",
         capability: "plain-text",
         intent: INTENTS["plain-text"],
       }),
-    ).toThrow(/unknown model/);
+    ).not.toThrow();
+  });
+
+  test("an unknown model cannot build an image capability by default", () => {
+    expect(() =>
+      buildRequestBody({
+        model: "gemini-99-unknown",
+        capability: "image-output",
+        intent: INTENTS["image-output"],
+      }),
+    ).toThrow(CapabilityNotBuildableError);
+  });
+
+  test("an unknown model with modelClass image builds image-output", () => {
+    expect(() =>
+      buildRequestBody({
+        model: "gemini-99-unknown",
+        capability: "image-output",
+        intent: INTENTS["image-output"],
+        modelClass: "image",
+      }),
+    ).not.toThrow();
+  });
+
+  test("a known model ignores a conflicting modelClass override", () => {
+    expect(() =>
+      buildRequestBody({
+        model: "gemini-2.5-flash",
+        capability: "image-output",
+        intent: INTENTS["image-output"],
+        modelClass: "image",
+      }),
+    ).toThrow(CapabilityNotBuildableError);
   });
 
   test("throws for capabilities no google-genai model exposes (e.g. function-calling)", () => {
@@ -409,79 +491,85 @@ describe("buildRequestBody — wire-shape spot checks", () => {
     });
   });
 
-  test("a thinking-mandatory model uses the dynamic budget where flash disables thinking", () => {
-    const streaming = buildRequestBody({
-      model: "gemini-2.5-pro",
-      capability: "plain-text-streaming",
-      intent: INTENTS["plain-text-streaming"],
-    });
-    expect(streaming).toEqual({
-      contents: [
-        {
-          role: "user",
-          parts: [{ text: INTENTS["plain-text-streaming"].prompt }],
+  test("thinking-mandatory models use the dynamic budget where flash disables thinking", () => {
+    for (const model of [
+      "gemini-2.5-pro",
+      "gemini-3.6-flash",
+      "gemini-3.1-pro-preview",
+    ] as const) {
+      const streaming = buildRequestBody({
+        model,
+        capability: "plain-text-streaming",
+        intent: INTENTS["plain-text-streaming"],
+      });
+      expect(streaming).toEqual({
+        contents: [
+          {
+            role: "user",
+            parts: [{ text: INTENTS["plain-text-streaming"].prompt }],
+          },
+        ],
+        generationConfig: {
+          maxOutputTokens: 400,
+          thinkingConfig: { thinkingBudget: -1 },
         },
-      ],
-      generationConfig: {
-        maxOutputTokens: 400,
-        thinkingConfig: { thinkingBudget: -1 },
-      },
-    });
+      });
 
-    const capability: Capability = "function-calling-multi-turn";
-    const multiTurn = buildRequestBody({
-      model: "gemini-2.5-pro",
-      capability,
-      intent: INTENTS[capability],
-    });
-    const tool = firstToolFor(capability);
-    expect(multiTurn).toEqual({
-      contents: [
-        {
-          role: "user",
-          parts: [{ text: INTENTS[capability].prompt }],
+      const capability: Capability = "function-calling-multi-turn";
+      const multiTurn = buildRequestBody({
+        model,
+        capability,
+        intent: INTENTS[capability],
+      });
+      const tool = firstToolFor(capability);
+      expect(multiTurn).toEqual({
+        contents: [
+          {
+            role: "user",
+            parts: [{ text: INTENTS[capability].prompt }],
+          },
+        ],
+        tools: [
+          {
+            functionDeclarations: [
+              {
+                name: tool.name,
+                description: tool.description,
+                parameters: tool.parameters,
+              },
+            ],
+          },
+        ],
+        toolConfig: {
+          functionCallingConfig: {
+            mode: "ANY",
+            allowedFunctionNames: [tool.name],
+          },
         },
-      ],
-      tools: [
-        {
-          functionDeclarations: [
-            {
-              name: tool.name,
-              description: tool.description,
-              parameters: tool.parameters,
-            },
-          ],
+        // thinkingBudget -1 (dynamic), and no includeThoughts key: thoughts stay
+        // suppressed on the disable path even where thinking cannot be turned off.
+        generationConfig: {
+          thinkingConfig: { thinkingBudget: -1 },
         },
-      ],
-      toolConfig: {
-        functionCallingConfig: {
-          mode: "ANY",
-          allowedFunctionNames: [tool.name],
-        },
-      },
-      // thinkingBudget -1 (dynamic), and no includeThoughts key: thoughts stay
-      // suppressed on the disable path even where thinking cannot be turned off.
-      generationConfig: {
-        thinkingConfig: { thinkingBudget: -1 },
-      },
-    });
+      });
 
-    // The streaming multi-turn variant shares the same switch case, so the
-    // dynamic budget must apply identically; pin it so a future split of the
-    // case cannot silently drop the fix.
-    const streamingCapability: Capability =
-      "function-calling-multi-turn-streaming";
-    const multiTurnStreaming = buildRequestBody({
-      model: "gemini-2.5-pro",
-      capability: streamingCapability,
-      intent: INTENTS[streamingCapability],
-    });
-    if (multiTurnStreaming.generationConfig === undefined) {
-      throw new Error("expected a generationConfig on the streaming variant");
+      // The streaming multi-turn variant shares the same switch case, so the
+      // dynamic budget must apply identically; pin it so a future split of the
+      // case cannot silently drop the fix.
+      const streamingCapability: Capability =
+        "function-calling-multi-turn-streaming";
+      const multiTurnStreaming = buildRequestBody({
+        model,
+        capability: streamingCapability,
+        intent: INTENTS[streamingCapability],
+      });
+      if (multiTurnStreaming.generationConfig === undefined) {
+        throw new Error("expected a generationConfig on the streaming variant");
+      }
+      expect(multiTurnStreaming.generationConfig.thinkingConfig).toEqual({
+        thinkingBudget: -1,
+      });
     }
-    expect(multiTurnStreaming.generationConfig.thinkingConfig).toEqual({
-      thinkingBudget: -1,
-    });
   });
 
   test("code-execution declares the codeExecution tool", () => {
@@ -608,10 +696,10 @@ describe("buildRequestBody — wire-shape spot checks", () => {
 describe("fixture-oracle: iterateCaptureSteps structurally matches every captured step's wire", () => {
   for (const entry of googleGenaiCapturedEntries()) {
     test(`${entry.model} / ${entry.capability}`, () => {
-      const fixtureDir = getFixtureDir(entry);
-      if (fixtureDir === null) {
+      const sessionDir = getSessionDir(entry);
+      if (sessionDir === null) {
         throw new Error(
-          `entry ${entry.model}/${entry.capability} has no captured fixture directory`,
+          `entry ${entry.model}/${entry.capability} has no session directory`,
         );
       }
 
@@ -619,7 +707,7 @@ describe("fixture-oracle: iterateCaptureSteps structurally matches every capture
       const isFilesApi = FILES_API_CAPABILITIES.has(entry.capability);
 
       if (isMultiTurn) {
-        const turn1ParsedResponse = loadTurn1Response(fixtureDir);
+        const turn1ParsedResponse = loadTurn1Response(sessionDir);
         const turn1Response: CapturedResponse = {
           status: 200,
           headers: {},
@@ -636,9 +724,6 @@ describe("fixture-oracle: iterateCaptureSteps structurally matches every capture
         if (step1 === undefined || step2 === undefined) {
           throw new Error("expected exactly two steps for multi-turn");
         }
-        expect(step1.subdir).toBe("turn-1");
-        expect(step2.subdir).toBe("turn-2");
-
         const expectedURL = buildEndpointURL({
           model: entry.model,
           capability: entry.capability,
@@ -646,8 +731,8 @@ describe("fixture-oracle: iterateCaptureSteps structurally matches every capture
         expect(step1.url).toBe(expectedURL);
         expect(step2.url).toBe(expectedURL);
 
-        const captured1 = readFixtureJSON(fixtureDir, "turn-1", "request.json");
-        const captured2 = readFixtureJSON(fixtureDir, "turn-2", "request.json");
+        const captured1 = readExchangeJSON(sessionDir, 0, "request.json");
+        const captured2 = readExchangeJSON(sessionDir, 1, "request.json");
         expect(normalizeForStructuralComparison(step1.body)).toEqual(
           normalizeForStructuralComparison(captured1),
         );
@@ -661,7 +746,7 @@ describe("fixture-oracle: iterateCaptureSteps structurally matches every capture
         const uploadResponse: CapturedResponse = {
           status: 200,
           headers: {},
-          parsed: readFixtureJSON(fixtureDir, "upload", "response.json"),
+          parsed: readExchangeJSON(sessionDir, 0, "response.json"),
           bytes: null,
         };
         const steps = collectSteps({
@@ -674,8 +759,6 @@ describe("fixture-oracle: iterateCaptureSteps structurally matches every capture
         if (uploadStep === undefined || generateStep === undefined) {
           throw new Error("expected exactly two steps for files-api");
         }
-        expect(uploadStep.subdir).toBe("upload");
-        expect(generateStep.subdir).toBe("generate");
         expect(uploadStep.url).toBe(
           "https://generativelanguage.googleapis.com/upload/v1beta/files",
         );
@@ -689,9 +772,9 @@ describe("fixture-oracle: iterateCaptureSteps structurally matches every capture
         if (uploadStep.kind !== "raw") {
           throw new Error("expected files-api upload step to be raw-bytes");
         }
-        const capturedUploadBytes = readFixtureBytes(
-          fixtureDir,
-          "upload",
+        const capturedUploadBytes = readExchangeBytes(
+          sessionDir,
+          0,
           "request.bin",
         );
         expect(uploadStep.contentType).toBe("application/pdf");
@@ -701,9 +784,9 @@ describe("fixture-oracle: iterateCaptureSteps structurally matches every capture
         if (generateStep.kind !== "json") {
           throw new Error("expected files-api generate step to be JSON");
         }
-        const capturedGenerate = readFixtureJSON(
-          fixtureDir,
-          "generate",
+        const capturedGenerate = readExchangeJSON(
+          sessionDir,
+          1,
           "request.json",
         );
         expect(normalizeForStructuralComparison(generateStep.body)).toEqual(
@@ -722,14 +805,13 @@ describe("fixture-oracle: iterateCaptureSteps structurally matches every capture
       if (only === undefined) {
         throw new Error("expected exactly one step for single-step capability");
       }
-      expect(only.subdir).toBeNull();
       expect(only.url).toBe(
         buildEndpointURL({
           model: entry.model,
           capability: entry.capability,
         }),
       );
-      const captured = readFixtureJSON(fixtureDir, "request.json");
+      const captured = readExchangeJSON(sessionDir, 0, "request.json");
       expect(normalizeForStructuralComparison(only.body)).toEqual(
         normalizeForStructuralComparison(captured),
       );

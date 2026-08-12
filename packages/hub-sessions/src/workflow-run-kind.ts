@@ -170,6 +170,7 @@ import { glob, repoActionToGrantVerb } from "@intx/hub-common";
 import {
   UserPrincipal,
   type AuthorizeFn,
+  type CommittedReads,
   type KindHandler,
   type NewlyTerminalRun,
   type PriorDeltaReads,
@@ -239,15 +240,28 @@ export const WORKFLOW_RUN_WATERMARK_FILE = "watermark.json";
  * deduped by a retained consumed entry, short enough that `consumed/`
  * reaches a bounded steady state of one day's message volume.
  *
- * INVARIANT (operator-owned): the horizon must be >= the longest
- * window in which the same `messageId` could legitimately be
- * re-submitted and still must be caught as a duplicate. There is no
- * automatic internal mail redelivery in the system today, so this is
- * the external re-submission window. If an at-least-once redelivery
- * source is ever added, the horizon must be >= its maximum redelivery
- * window or dedup breaks; a breach surfaces LOUDLY (a too-late
- * re-submission carrying an old `receivedAt` is refused at enqueue,
- * not silently reprocessed) rather than as silent double-processing.
+ * INVARIANT (operator-owned): the horizon must be >= the longest window in
+ * which the same `messageId` could legitimately be re-submitted and still must
+ * be caught as a duplicate. The hub now redelivers un-acked inbound mail
+ * (connected-window retry and reconnect-redelivery), so an at-least-once
+ * internal source DOES exist -- but the dedup guarantee against it does not
+ * rest on window arithmetic. It rests on a STRUCTURAL fact: `enqueueInbox` is
+ * only ever called with a freshly stamped `receivedAt` (a redelivery
+ * re-enters `onMailMessage` and re-stamps `Date.now()`, never carrying the
+ * original), and the watermark only ever advances to at most
+ * `consumedAt - retentionHorizonMs`, which is <= now, so a fresh `receivedAt`
+ * always sits a full horizon above the watermark and can never be stale-
+ * refused. A redelivery instead hits the `consumed/`/`processing/`/`inbox/`
+ * dedup index and is deduped there. The sole path that carries an original
+ * (old) `receivedAt` back into the queue is `replayProcessingToInbox`, which
+ * writes straight to `inbox/` and bypasses the stale gate entirely. So
+ * `claim_check_stale_enqueue` is unreachable via redelivery today. If any
+ * redelivery source is ever changed to carry the ORIGINAL `receivedAt` into
+ * `enqueueInbox`, stale becomes reachable, the horizon must then be >= that
+ * source's maximum redelivery window, and `StaleInboxEnqueueError`'s
+ * withhold-not-ack handling becomes load-bearing; a breach surfaces LOUDLY (an
+ * old-`receivedAt` re-submission is refused at enqueue) rather than as silent
+ * double-processing.
  */
 export const DEFAULT_CONSUMED_RETENTION_MS = 24 * 60 * 60 * 1000;
 
@@ -412,6 +426,10 @@ const ConsumedEnvelope = type({
   mailAuditRef: {
     store: "string > 0",
     path: "string > 0",
+  },
+  "rejection?": {
+    code: "string > 0",
+    message: "string > 0",
   },
   "+": "ignore",
 });
@@ -2168,14 +2186,30 @@ export const workflowRunKindHandler: KindHandler = {
               reason: `event ${entry.blobPath} CancelRequested origin must be a string`,
             };
           }
-          const principalCheck = checkCancelOriginPrincipal(
-            entry.blobPath,
-            origin,
-            principal,
-          );
-          if (!principalCheck.ok) {
-            logger.debug`workflow-run validatePush rejected ${repoId.kind}/${repoId.id} on ${ref}: ${principalCheck.reason}`;
-            return principalCheck;
+          // Enforce the cancel-origin principal only for a NEWLY-ADDED blob.
+          // A CancelRequested's origin-vs-signer rule is a write-time
+          // authorization: it belongs to the commit that authors the event. A
+          // later commit that merely carries the event forward -- e.g. the
+          // run's own workflow-process cascade write of CancelPropagated /
+          // RunCancelled, which re-lists the whole events prefix -- must not be
+          // rejected because the carried-forward cancel was authored under a
+          // different (supervisor) signer. Re-checking it protects nothing: the
+          // byte-equality check above already proves a carried-forward blob is
+          // unchanged, and the deletion-direction check proves it cannot be
+          // dropped. A tampered (byte-diverged) blob never reaches here --
+          // checkPriorByteEquality rejects it first. Mirrors the newly-terminal
+          // gate below, which likewise acts only on a blob absent from the
+          // prior tree.
+          if ((await priorReadBlob(entry.blobPath)) === null) {
+            const principalCheck = checkCancelOriginPrincipal(
+              entry.blobPath,
+              origin,
+              principal,
+            );
+            if (!principalCheck.ok) {
+              logger.debug`workflow-run validatePush rejected ${repoId.kind}/${repoId.id} on ${ref}: ${principalCheck.reason}`;
+              return principalCheck;
+            }
           }
         }
         if (terminalSeq !== null) {
@@ -2694,6 +2728,77 @@ export type EnqueueInboxResult = {
 };
 
 /**
+ * Which already-present state an `enqueueInbox` call found the messageId
+ * in. Every value is POSITIVE evidence the message's bytes are durably on
+ * disk (inbox/processing) or were already consumed -- so a caller gating a
+ * receipt on the enqueue may safely acknowledge on any of them.
+ */
+export type EnqueueAlreadyPresentReason =
+  | "duplicate"
+  | "already_inbox"
+  | "processing"
+  | "consumed";
+
+/**
+ * Outcome of an `enqueueInbox` call. Modeled as a value (not an exception)
+ * precisely because the return/throw boundary is the ack/withhold boundary
+ * for a caller gating a durable-receipt ack: a returned outcome is safe to
+ * acknowledge (the bytes are on disk -- freshly written or already present),
+ * a throw is not (the write could not complete or its disposition cannot be
+ * decided). `enqueued` is the only outcome that added a new inbox entry, so
+ * it is the only one a dispatch-driving caller wakes its loop on.
+ */
+export type EnqueueInboxOutcome =
+  | ({ outcome: "enqueued" } & EnqueueInboxResult)
+  | { outcome: "already-present"; reason: EnqueueAlreadyPresentReason };
+
+/**
+ * Internal signal thrown from the `enqueueInbox` merge callback when the
+ * messageId is already present in a queue state. Caught at the `enqueueInbox`
+ * boundary and turned into an `already-present` outcome; never escapes. It
+ * carries the specific `reason` so the boundary maps it without re-deriving.
+ */
+class InboxEntryAlreadyPresent extends Error {
+  constructor(
+    readonly reason: EnqueueAlreadyPresentReason,
+    message: string,
+  ) {
+    super(message);
+    this.name = "InboxEntryAlreadyPresent";
+  }
+}
+
+/**
+ * Thrown by `enqueueInbox` when the inbound's `receivedAt` is strictly below
+ * the address's retention watermark. This is refusal under UNCERTAINTY, not
+ * proof of prior receipt: the consumed dedup entry that would rule out a
+ * duplicate may have been pruned, so the substrate can no longer tell a
+ * duplicate from a never-processed message and refuses rather than risk
+ * reprocessing. A caller gating a durable-receipt ack MUST NOT acknowledge on
+ * this -- acking an "I cannot tell" would terminally drop a message that was
+ * never written. It is its own type (not a generic Error) so that a caller,
+ * and monitoring, can surface it as a distinct loud signal rather than
+ * blending it into ordinary I/O-failure noise.
+ *
+ * Structurally unreachable on the mail-inbound path today: `enqueueInbox` is
+ * only ever called with a freshly stamped `receivedAt` (a redelivery
+ * re-stamps `Date.now()` rather than carrying the original), and the watermark
+ * only ever advances to at most `consumedAt - retentionHorizonMs <= now`, so a
+ * fresh `receivedAt` sits a full horizon above it. The sole path that carries
+ * an original (old) `receivedAt` back into the queue is
+ * `replayProcessingToInbox`, which writes straight to `inbox/` and bypasses
+ * this gate entirely. If any redelivery source is ever changed to carry the
+ * original `receivedAt` into `enqueueInbox`, this becomes reachable and its
+ * withhold-not-ack handling becomes load-bearing.
+ */
+export class StaleInboxEnqueueError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "StaleInboxEnqueueError";
+  }
+}
+
+/**
  * Append a new inbox entry for `address`. The merge callback reads
  * the address subtree under the per-repo lock, augments the inbox
  * with the new entry, and returns the full set of address files. The
@@ -2711,7 +2816,7 @@ export async function enqueueInbox(
   principal: Principal,
   repoId: RepoId,
   args: EnqueueInboxArgs,
-): Promise<EnqueueInboxResult> {
+): Promise<EnqueueInboxOutcome> {
   const addressSegment = addressSegmentFor(args.address);
   const ref = claimCheckCommitRef();
   const inboxKey = filenameKey(args.receivedAt, args.messageId);
@@ -2726,58 +2831,78 @@ export async function enqueueInbox(
   const inboxFname = `${inboxKey}.json`;
   const consumedFname = `${args.messageId}.json`;
   const messageIdSuffix = `-${args.messageId}.json`;
-  const { commitSha } = await store.writeTreeDelta(principal, repoId, ref, {
-    changedPathPrefixes: new Set([addressPrefix(addressSegment)]),
-    message: `enqueue inbox ${args.address} ${args.messageId}`,
-    computeDelta: async (_parentCommitSha, prior) => {
-      const listing = await readAddressListing(prior, addressSegment);
-      // Refuse a definitively-stale enqueue: a message whose receivedAt
-      // is strictly below the retention watermark could have had its
-      // consumed/ dedup entry pruned, so a duplicate can no longer be
-      // ruled out. Reject it LOUDLY rather than risk reprocessing. This
-      // is the second half of the exactly-once guarantee: above the
-      // watermark the consumed/ index is authoritative; below it, refuse.
-      if (args.receivedAt < listing.watermark) {
-        throw new Error(
-          `claim_check_stale_enqueue: address ${args.address} message ${args.messageId} receivedAt ${String(args.receivedAt)} is below the retention watermark ${String(listing.watermark)}; its dedup entry may have been pruned, so it is refused as definitively-stale`,
+  // The already-present cases throw `InboxEntryAlreadyPresent` from the merge
+  // callback and are caught here into an `already-present` outcome; the
+  // stale-refusal throws `StaleInboxEnqueueError`, and a substrate/I/O failure
+  // throws a generic error -- both of those propagate. The return/throw split
+  // is deliberate and load-bearing: it is the ack/withhold boundary for a
+  // caller gating a durable-receipt ack (return = safe to ack, throw =
+  // withhold), so `stale` sits with I/O on the throw side, NOT with the
+  // already-present cases (see `StaleInboxEnqueueError`).
+  let commitSha: string;
+  try {
+    ({ commitSha } = await store.writeTreeDelta(principal, repoId, ref, {
+      changedPathPrefixes: new Set([addressPrefix(addressSegment)]),
+      message: `enqueue inbox ${args.address} ${args.messageId}`,
+      computeDelta: async (_parentCommitSha, prior) => {
+        const listing = await readAddressListing(prior, addressSegment);
+        // Refuse a definitively-stale enqueue: a message whose receivedAt
+        // is strictly below the retention watermark could have had its
+        // consumed/ dedup entry pruned, so a duplicate can no longer be
+        // ruled out. Reject it LOUDLY rather than risk reprocessing. This
+        // is the second half of the exactly-once guarantee: above the
+        // watermark the consumed/ index is authoritative; below it, refuse.
+        if (args.receivedAt < listing.watermark) {
+          throw new StaleInboxEnqueueError(
+            `claim_check_stale_enqueue: address ${args.address} message ${args.messageId} receivedAt ${String(args.receivedAt)} is below the retention watermark ${String(listing.watermark)}; its dedup entry may have been pruned, so it is refused as definitively-stale`,
+          );
+        }
+        if (listing.inbox.some((e) => e.name === inboxFname)) {
+          throw new InboxEntryAlreadyPresent(
+            "duplicate",
+            `claim_check_duplicate_inbox: ${newInboxPath} already exists`,
+          );
+        }
+        // consumed/ is keyed by messageId alone, so this is an exact
+        // filename lookup against the dedup index.
+        if (listing.consumed.some((e) => e.name === consumedFname)) {
+          throw new InboxEntryAlreadyPresent(
+            "consumed",
+            `claim_check_already_consumed: address ${args.address} message ${args.messageId} is already in the consumed dedup index`,
+          );
+        }
+        if (listing.processing.some((e) => e.name.endsWith(messageIdSuffix))) {
+          throw new InboxEntryAlreadyPresent(
+            "processing",
+            `claim_check_already_processing: address ${args.address} message ${args.messageId} is currently in processing`,
+          );
+        }
+        // Reject a second inbox entry for the same messageId at a
+        // different receivedAt. The validatePush atomicity check also
+        // catches this on the commit path, but surfacing it here gives the
+        // caller a precise error and keeps the bad tree off the substrate.
+        const inboxDup = listing.inbox.find((e) =>
+          e.name.endsWith(messageIdSuffix),
         );
-      }
-      if (listing.inbox.some((e) => e.name === inboxFname)) {
-        throw new Error(
-          `claim_check_duplicate_inbox: ${newInboxPath} already exists`,
-        );
-      }
-      // consumed/ is keyed by messageId alone, so this is an exact
-      // filename lookup against the dedup index.
-      if (listing.consumed.some((e) => e.name === consumedFname)) {
-        throw new Error(
-          `claim_check_already_consumed: address ${args.address} message ${args.messageId} is already in the consumed dedup index`,
-        );
-      }
-      if (listing.processing.some((e) => e.name.endsWith(messageIdSuffix))) {
-        throw new Error(
-          `claim_check_already_processing: address ${args.address} message ${args.messageId} is currently in processing`,
-        );
-      }
-      // Reject a second inbox entry for the same messageId at a
-      // different receivedAt. The validatePush atomicity check also
-      // catches this on the commit path, but surfacing it here gives the
-      // caller a precise error and keeps the bad tree off the substrate.
-      const inboxDup = listing.inbox.find((e) =>
-        e.name.endsWith(messageIdSuffix),
-      );
-      if (inboxDup !== undefined) {
-        throw new Error(
-          `claim_check_already_inbox: address ${args.address} message ${args.messageId} is already in the inbox at ${inboxPath(addressSegment, inboxDup.name.slice(0, -".json".length))}`,
-        );
-      }
-      return {
-        puts: { [newInboxPath]: utf8(JSON.stringify(envelope)) },
-        deletes: [],
-      };
-    },
-  });
-  return { commitSha, inboxKey, envelope };
+        if (inboxDup !== undefined) {
+          throw new InboxEntryAlreadyPresent(
+            "already_inbox",
+            `claim_check_already_inbox: address ${args.address} message ${args.messageId} is already in the inbox at ${inboxPath(addressSegment, inboxDup.name.slice(0, -".json".length))}`,
+          );
+        }
+        return {
+          puts: { [newInboxPath]: utf8(JSON.stringify(envelope)) },
+          deletes: [],
+        };
+      },
+    }));
+  } catch (err) {
+    if (err instanceof InboxEntryAlreadyPresent) {
+      return { outcome: "already-present", reason: err.reason };
+    }
+    throw err;
+  }
+  return { outcome: "enqueued", commitSha, inboxKey, envelope };
 }
 
 export type DequeueToProcessingResult = {
@@ -2936,6 +3061,16 @@ export type MarkConsumedArgs = {
   runId: string;
   consumedAt: number;
   /**
+   * Present when the supervisor deliberately refused the message instead of
+   * delivering it to the run. The consumed entry remains the durable dedup
+   * record, while Hub projection uses this detail to fail (rather than settle)
+   * an exclusive-dispatch row.
+   */
+  rejection?: {
+    code: string;
+    message: string;
+  };
+  /**
    * Retention horizon for the consumed dedup index, in milliseconds.
    * The commit advances the per-address watermark to
    * `consumedAt - retentionHorizonMs` (never backward, never past the
@@ -3024,6 +3159,7 @@ export async function markConsumed(
         runId: args.runId,
         consumedAt: args.consumedAt,
         mailAuditRef: processingEnvelope.mailAuditRef,
+        ...(args.rejection !== undefined ? { rejection: args.rejection } : {}),
       };
       consumedEnvelope = envelope;
 
@@ -3178,6 +3314,144 @@ export async function readOwnedMessageIds(
     if (consumedMessageId !== undefined) owned.add(consumedMessageId);
   }
   return owned;
+}
+
+export type WorkflowRunLifecycle = "absent" | "live" | "terminal";
+
+/** Read one run's lifecycle from a committed workflow-run tree. */
+export async function readCommittedWorkflowRunLifecycle(
+  reads: CommittedReads | null,
+  runId: string,
+): Promise<WorkflowRunLifecycle> {
+  if (reads === null) return "absent";
+  const runPath = `${WORKFLOW_RUN_RUNS_PREFIX}/${runId}`;
+  const runChildren = await reads.listDir(runPath);
+  if (
+    runChildren.some(
+      (entry) =>
+        entry.type === "blob" && entry.name === WORKFLOW_RUN_EVENTS_FILE,
+    )
+  ) {
+    return "terminal";
+  }
+
+  const eventsPath = `${runPath}/${WORKFLOW_RUN_EVENTS_DIR}`;
+  const eventEntries = (await reads.listDir(eventsPath)).filter(
+    (entry) => entry.type === "blob" && parseEventSeq(entry.name) !== null,
+  );
+  const latest = eventEntries.reduce<(typeof eventEntries)[number] | undefined>(
+    (candidate, entry) => {
+      if (candidate === undefined) return entry;
+      const candidateSeq = parseEventSeq(candidate.name);
+      const entrySeq = parseEventSeq(entry.name);
+      return entrySeq !== null &&
+        candidateSeq !== null &&
+        entrySeq > candidateSeq
+        ? entry
+        : candidate;
+    },
+    undefined,
+  );
+  if (latest !== undefined) {
+    const eventPath = `${eventsPath}/${latest.name}`;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(
+        new TextDecoder().decode(await reads.readBlobByOid(latest.oid)),
+      );
+    } catch (cause) {
+      throw new Error(`workflow_run_event_unreadable: ${eventPath}`, { cause });
+    }
+    if (
+      typeof parsed === "object" &&
+      parsed !== null &&
+      "type" in parsed &&
+      typeof parsed.type === "string" &&
+      TERMINAL_EVENT_TYPES.has(parsed.type)
+    ) {
+      return "terminal";
+    }
+  }
+  return eventEntries.length === 0 ? "absent" : "live";
+}
+
+/**
+ * Read the durable lifecycle of one run from the workflow-run working tree.
+ * `grants.json` alone is still an absent run: grants are staged before the
+ * first trigger, while the first event is the durable proof that the run was
+ * fired. A sealed event log is terminal by the kind handler's compaction
+ * invariant.
+ *
+ * The supervisor uses this when in-memory cohort membership is empty. That
+ * happens both for a genuinely new deployment and briefly during recovery,
+ * so treating both states as "fire" would start a second driver for a live
+ * log or reuse a terminal run.
+ */
+export async function readWorkflowRunLifecycle(
+  store: RepoStore,
+  repoId: RepoId,
+  runId: string,
+): Promise<WorkflowRunLifecycle> {
+  const fs = await import("node:fs/promises");
+  const path = await import("node:path");
+  const runDir = path.join(
+    store.getRepoDir(repoId),
+    WORKFLOW_RUN_RUNS_PREFIX,
+    runId,
+  );
+
+  try {
+    await fs.access(path.join(runDir, WORKFLOW_RUN_EVENTS_FILE));
+    return "terminal";
+  } catch (cause) {
+    if (
+      !(cause instanceof Error) ||
+      !("code" in cause) ||
+      cause.code !== "ENOENT"
+    ) {
+      throw cause;
+    }
+  }
+
+  const eventsDir = path.join(runDir, WORKFLOW_RUN_EVENTS_DIR);
+  let files: string[];
+  try {
+    files = await fs.readdir(eventsDir);
+  } catch (cause) {
+    if (cause instanceof Error && "code" in cause && cause.code === "ENOENT") {
+      return "absent";
+    }
+    throw cause;
+  }
+
+  const eventFiles = files.filter((file) => parseEventSeq(file) !== null);
+  const latest = eventFiles.reduce<string | undefined>((candidate, file) => {
+    if (candidate === undefined) return file;
+    const candidateSeq = parseEventSeq(candidate);
+    const fileSeq = parseEventSeq(file);
+    return fileSeq !== null && candidateSeq !== null && fileSeq > candidateSeq
+      ? file
+      : candidate;
+  }, undefined);
+  if (latest !== undefined) {
+    const eventPath = path.join(eventsDir, latest);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(await fs.readFile(eventPath, "utf8"));
+    } catch (cause) {
+      throw new Error(`workflow_run_event_unreadable: ${eventPath}`, { cause });
+    }
+    if (
+      typeof parsed === "object" &&
+      parsed !== null &&
+      "type" in parsed &&
+      typeof parsed.type === "string" &&
+      TERMINAL_EVENT_TYPES.has(parsed.type)
+    ) {
+      return "terminal";
+    }
+  }
+  return eventFiles.length === 0 ? "absent" : "live";
 }
 
 export type ReplayProcessingToInboxOpts = {

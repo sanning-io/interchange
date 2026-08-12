@@ -27,6 +27,7 @@ import type {
   AnnotatedToolFactory,
   BaseEnv,
   DirectorRegistry,
+  InferencePreference,
 } from "@intx/agent";
 import type {
   HarnessConfig,
@@ -34,6 +35,7 @@ import type {
   ToolDefinition,
 } from "@intx/types/runtime";
 import type { ToolPackagePin } from "@intx/types/tool-packages";
+import type { CredentialDelivery } from "@intx/types/sidecar";
 import { parseAgentAddress } from "@intx/types";
 import {
   STEP_ID_PATTERN,
@@ -77,6 +79,26 @@ export type LaunchSessionFn = (params: {
 }) => Promise<void>;
 
 /**
+ * An extracted onTrigger section body carried inline in the deploy frame:
+ * the rewritten `{ ref }`-target definition plus the body's own per-step
+ * inference-source pins. The sidecar materializes both alongside each other
+ * (`assets/workflow/<bodyRef>/workflow.json` + `sources.json`) so a body
+ * child resolves its definition AND its inference sources off disk -- the
+ * body child runs in-process (no process env) and its env is lost across a
+ * restart, so the sources must be durable and co-located with the body
+ * definition, not passed through an ephemeral channel.
+ *
+ * `sources` is keyed by the body's step ids (matching
+ * `definition.stepOrder`), each an ordered non-empty failover chain, exactly
+ * as the top-level deploy pins its own steps. Every body step id must have a
+ * matching entry, per the wire validator's per-body narrow.
+ */
+export interface ReferencedBodyDefinition {
+  readonly definition: WorkflowDefinition;
+  readonly sources: Record<string, InferenceSource[]>;
+}
+
+/**
  * Multi-step deploy hand-off. Called once after the per-step
  * provisioning loop has completed; mirrors the wire shape the deploy
  * router consumes (the `agent.deploy` frame's `workflow?` field). The
@@ -101,6 +123,11 @@ export type SendMultiStepDeployFn = (params: {
   definition: WorkflowDefinition;
   sources: Record<string, InferenceSource[]>;
   hubPublicKey: string;
+  /**
+   * Extracted onTrigger section bodies to materialize on the sidecar so a
+   * body child resolves by ref. Empty/absent for a workflow with no section.
+   */
+  referencedDefinitions?: readonly ReferencedBodyDefinition[];
 }) => Promise<MultiStepDeployResult>;
 
 /**
@@ -130,6 +157,17 @@ export type DeploySingleStepFn = (params: {
   sources: Record<string, InferenceSource[]>;
   hubPublicKey: string;
   toolPackagePins?: readonly ToolPackagePin[];
+  /**
+   * Extracted onTrigger section bodies to materialize on the sidecar so a
+   * body child resolves by ref. Empty/absent for a workflow with no section.
+   */
+  referencedDefinitions?: readonly ReferencedBodyDefinition[];
+  /**
+   * Decrypted credential material for the deployment's tools, delivered on the
+   * deploy frame so it is resident before any step runs. Absent when the
+   * definition binds no credentials.
+   */
+  credentials?: CredentialDelivery;
 }) => Promise<MultiStepDeployResult>;
 
 /**
@@ -380,29 +418,54 @@ export function createWorkflowDeployOrchestrator(
         throw new CapabilityApprovalDeniedError(decision);
       }
 
+      // Materialize each onTrigger section's authored inline body into its
+      // own workflow asset and rewrite the primitive to a ref, so the runtime
+      // spawns the body as a child run resolved by ref. The walk above ran on
+      // the inline form so the operator approved the body agents' caps; the
+      // stored definition carries `{ ref }` bodies from here on.
+      const { workflow: deployed, referencedDefinitions } =
+        await extractOnTriggerBodies({
+          workflow: args.workflow,
+          registry: directorRegistry,
+          workflowRepo,
+          config: args.config,
+          operatorApprovals: args.operatorApprovals,
+        });
+
       await writeWorkflowRepoTree({
-        workflow: args.workflow,
+        workflow: deployed,
         walk,
         workflowRepo,
       });
+
+      // The deploy hand-off ships the EXTRACTED definition: the runtime runs
+      // the `definition` frame carried in the deploy, so it must be the one
+      // whose onTrigger bodies are `{ ref }` -- the inline form throws at the
+      // runtime. Extraction preserves `stepOrder` and every non-onTrigger
+      // step, so branch selection and per-step derivation are unaffected. The
+      // extracted body definitions ride the frame too (referencedDefinitions)
+      // so the sidecar materializes them on disk for the body child to resolve.
+      const deployArgs: DeployWorkflowArgs = { ...args, workflow: deployed };
 
       // A one-step workflow has no distinct steps: the lone step IS the
       // head. It deploys once at the head (no per-step provisioning loop),
       // so it routes through the dedicated single-step hand-off rather
       // than `runMultiStepBranch`. The multi-step branch is reached only
       // for `stepOrder.length >= 2`.
-      if (args.workflow.stepOrder.length === 1) {
+      if (deployArgs.workflow.stepOrder.length === 1) {
         const result = await runSingleStepAtHead({
-          args,
+          args: deployArgs,
           deploySingleStepAtHead,
+          referencedDefinitions,
         });
         return { publicKey: result.publicKey };
       }
 
       const result = await runMultiStepBranch({
-        args,
+        args: deployArgs,
         launchSession,
         sendMultiStepDeploy,
+        referencedDefinitions,
       });
       return { publicKey: result.publicKey };
     },
@@ -423,8 +486,9 @@ export function createWorkflowDeployOrchestrator(
 async function runSingleStepAtHead(args: {
   args: DeployWorkflowArgs;
   deploySingleStepAtHead: DeploySingleStepFn | undefined;
+  referencedDefinitions: readonly ReferencedBodyDefinition[];
 }): Promise<MultiStepDeployResult> {
-  const { args: deploy, deploySingleStepAtHead } = args;
+  const { args: deploy, deploySingleStepAtHead, referencedDefinitions } = args;
   const deploymentId = deploy.deploymentId;
   const deploymentDomain = deploy.deploymentDomain;
   if (deploymentId === undefined) {
@@ -458,13 +522,27 @@ async function runSingleStepAtHead(args: {
     );
   }
   const stepAgent = extractAgent(primitive);
-  const source = pickStepInferenceSource({
-    stepAgent,
-    stepId,
+  // The lone step's chain IS the deploy-wide source chain: a one-step
+  // workflow pins its FULL ordered chain so the reactor fails over across it
+  // -- whole-workflow failover, identical to the instance path. (The
+  // multi-step branch keeps the per-step single-source collapse; failover
+  // across distinct steps is not a thing.) Unlike the pre-authorized instance
+  // path, the workflow deploy is gated: every source in the chain must be in
+  // the operator-approved set, and an unapproved source is a loud rejection
+  // rather than a silent skip that would reshape the reviewed chain.
+  assertChainHeadIsDefault({
+    sources: deploy.config.sources,
+    defaultSource: deploy.config.defaultSource,
     workflowId: deploy.workflow.id,
-    config: deploy.config,
-    operatorApprovals: deploy.operatorApprovals,
   });
+  for (const candidate of deploy.config.sources) {
+    if (!isSourceApproved(candidate, deploy.operatorApprovals)) {
+      throw new WorkflowDefinitionInvalidError(
+        deploy.workflow.id,
+        `step ${stepId} inference chain includes ${candidate.provider}:${candidate.model}, which is not in the operator-approved grant set`,
+      );
+    }
+  }
 
   // The lone step IS the head: one deploy at the deployment address, no
   // per-step derivation. The head's agentId and instanceId are the same
@@ -485,6 +563,14 @@ async function runSingleStepAtHead(args: {
       ? { ...deploy.deployContent, systemPrompt: stepAgent.systemPrompt }
       : deploy.deployContent;
 
+  // Tool pins for the child's tool materialization: prefer the pins carried on
+  // the folded step agent (the definition is the self-contained home for tools
+  // under the workflow model), falling back to the deploy-supplied pins for the
+  // live-authored instance path. Per-step pins for genuine multi-step workflows
+  // are a separate, deferred concern; this path is single-step by construction.
+  const headToolPackagePins =
+    stepAgent?.toolPackagePins ?? deploy.toolPackagePins;
+
   return deploySingleStepAtHead({
     agentAddress: headAddress,
     agentId: headId,
@@ -492,15 +578,14 @@ async function runSingleStepAtHead(args: {
     config: headConfig,
     deployContent: headDeployContent,
     definition: deploy.workflow,
-    // A workflow step pins a single source (no per-step failover): wrap the
-    // one operator-approved source in a one-element list. The per-step
-    // failover chain is intentionally an instance-only concern; a workflow
-    // step preserves its prior single-source behavior.
-    sources: { [stepId]: [source] },
+    // Pin the full ordered chain gated above; the reactor fails over forward
+    // across it, matching the instance deploy path.
+    sources: { [stepId]: [...deploy.config.sources] },
     hubPublicKey: deploy.hubPublicKey,
-    ...(deploy.toolPackagePins !== undefined
-      ? { toolPackagePins: deploy.toolPackagePins }
+    ...(headToolPackagePins !== undefined
+      ? { toolPackagePins: headToolPackagePins }
       : {}),
+    ...(referencedDefinitions.length > 0 ? { referencedDefinitions } : {}),
   });
 }
 
@@ -508,8 +593,14 @@ async function runMultiStepBranch(args: {
   args: DeployWorkflowArgs;
   launchSession: LaunchSessionFn;
   sendMultiStepDeploy: SendMultiStepDeployFn | undefined;
+  referencedDefinitions: readonly ReferencedBodyDefinition[];
 }): Promise<MultiStepDeployResult> {
-  const { args: deploy, launchSession, sendMultiStepDeploy } = args;
+  const {
+    args: deploy,
+    launchSession,
+    sendMultiStepDeploy,
+    referencedDefinitions,
+  } = args;
   const deploymentId = deploy.deploymentId;
   const deploymentDomain = deploy.deploymentDomain;
   if (deploymentId === undefined) {
@@ -618,7 +709,56 @@ async function runMultiStepBranch(args: {
     definition: deploy.workflow,
     sources,
     hubPublicKey: deploy.hubPublicKey,
+    ...(referencedDefinitions.length > 0 ? { referencedDefinitions } : {}),
   });
+}
+
+/**
+ * Assert the reactor's forward-only failover invariant on a single-step
+ * source chain: the chain is non-empty and its head is the default source.
+ * The reactor activates the chain's element 0 and fails over forward with no
+ * wrap, so the default must be element 0; a default placed elsewhere would
+ * silently no-op failover. Shared by the instance and workflow single-step
+ * deploy paths, which both pin a full ordered chain.
+ *
+ * Throws `WorkflowDefinitionInvalidError` (a client/definition error) so the
+ * deploy route can classify an inverted request as a 409 rather than a 502.
+ */
+export function assertChainHeadIsDefault(args: {
+  sources: readonly InferenceSource[];
+  defaultSource: string;
+  workflowId: string;
+}): void {
+  if (args.sources.length === 0) {
+    throw new WorkflowDefinitionInvalidError(
+      args.workflowId,
+      "config.sources is empty; at least the default source is required as the chain head",
+    );
+  }
+  if (args.sources[0]?.id !== args.defaultSource) {
+    throw new WorkflowDefinitionInvalidError(
+      args.workflowId,
+      `config.sources[0] (${JSON.stringify(
+        args.sources[0]?.id,
+      )}) must be the default source ${JSON.stringify(
+        args.defaultSource,
+      )}; a single-step deploy pins the full ordered chain and the reactor activates the head, so the default must be element 0`,
+    );
+  }
+}
+
+/**
+ * Whether an inference source is in the operator-approved grant set, keyed
+ * by provider and model. The single definition of "approved source," shared
+ * by single-step source selection and the single-step chain gate.
+ */
+export function isSourceApproved(
+  source: InferenceSource,
+  operatorApprovals: ApprovalSet,
+): boolean {
+  return operatorApprovals.has(
+    `inference.source:${source.provider}:${source.model}`,
+  );
 }
 
 /**
@@ -644,21 +784,22 @@ function pickStepInferenceSource(args: {
   config: HarnessConfig;
   operatorApprovals: ApprovalSet;
 }): InferenceSource {
-  const isApproved = (source: InferenceSource) =>
-    args.operatorApprovals.has(
-      `inference.source:${source.provider}:${source.model}`,
-    );
   const preferred = args.stepAgent?.inference.sources[0];
   if (preferred !== undefined) {
     const match = args.config.sources.find(
       (s) => s.provider === preferred.provider && s.model === preferred.model,
     );
-    if (match !== undefined && isApproved(match)) return match;
+    if (match !== undefined && isSourceApproved(match, args.operatorApprovals))
+      return match;
   }
   const fallback = args.config.sources.find(
     (s) => s.id === args.config.defaultSource,
   );
-  if (fallback !== undefined && isApproved(fallback)) return fallback;
+  if (
+    fallback !== undefined &&
+    isSourceApproved(fallback, args.operatorApprovals)
+  )
+    return fallback;
   const preferredDesc =
     preferred !== undefined
       ? `agent preferred ${preferred.provider}:${preferred.model}`
@@ -871,6 +1012,153 @@ function extractAgent(primitive: Primitive): AgentDefinition<BaseEnv> | null {
   return null;
 }
 
+/**
+ * Deploy each onTrigger section's authored inline body as its own workflow
+ * asset and rewrite the primitive to reference it. A section runs its body
+ * as a child run resolved by ref -- the same production path childWorkflow
+ * uses -- so the deployed definition carries `{ ref }` bodies while the
+ * author writes `{ inline }`. The ref is derived deterministically from the
+ * parent workflow id and the section's step id, so a redeploy of the same
+ * definition produces the same ref. A workflow with no inline section body
+ * is returned unchanged with no referenced bodies. Exported for a focused
+ * unit test.
+ *
+ * Returns the rewritten workflow AND each extracted body as a
+ * `ReferencedBodyDefinition` ({@link ReferencedBodyDefinition}) -- the body
+ * definition plus its own per-step inference-source pins -- so the deploy can
+ * both store the body at the hub (via `writeWorkflowRepoTree`) and carry it
+ * inline in the deploy frame for the sidecar to materialize (the hub-stored
+ * copy is not on the sidecar's disk, so a body child's spawn-child would
+ * otherwise fail to resolve the ref, and the body child -- in-process, env
+ * lost across a restart -- needs its sources durable on disk beside it). Each
+ * body's sources are pinned against the operator-approved set exactly as the
+ * top-level steps are, and a tool-bearing body agent is rejected here (see
+ * `pinBodySources`).
+ */
+export async function extractOnTriggerBodies(args: {
+  workflow: WorkflowDefinition;
+  registry: DirectorRegistry;
+  workflowRepo: WorkflowRepoWriter;
+  config: HarnessConfig;
+  operatorApprovals: ApprovalSet;
+}): Promise<{
+  workflow: WorkflowDefinition;
+  referencedDefinitions: readonly ReferencedBodyDefinition[];
+}> {
+  const steps: Record<string, Primitive> = { ...args.workflow.steps };
+  const referencedDefinitions: ReferencedBodyDefinition[] = [];
+  let rewritten = false;
+  for (const [stepId, primitive] of Object.entries(steps)) {
+    if (primitive.kind !== "onTrigger") continue;
+    if (!("inline" in primitive.body)) continue;
+    const bodyRef = `${args.workflow.id}__${stepId}`;
+    const bodyDefinition: WorkflowDefinition = {
+      ...primitive.body.inline,
+      id: bodyRef,
+    };
+    const bodyWalk = walkCapabilities(bodyDefinition, args.registry);
+    await writeWorkflowRepoTree({
+      workflow: bodyDefinition,
+      walk: bodyWalk,
+      workflowRepo: args.workflowRepo,
+    });
+    // Pin the body's own per-step inference sources (gated against the same
+    // operator-approved set) and reject any tool-bearing body agent -- both in
+    // `pinBodySources`. The pins ride inline so the body child resolves
+    // inference off disk, durably across a restart.
+    const bodySources = pinBodySources({
+      body: bodyDefinition,
+      config: args.config,
+      operatorApprovals: args.operatorApprovals,
+    });
+    referencedDefinitions.push({
+      definition: bodyDefinition,
+      sources: bodySources,
+    });
+    steps[stepId] = { ...primitive, body: { ref: bodyRef } };
+    rewritten = true;
+  }
+  if (!rewritten) {
+    return { workflow: args.workflow, referencedDefinitions: [] };
+  }
+  return { workflow: { ...args.workflow, steps }, referencedDefinitions };
+}
+
+/**
+ * Pin every step of an extracted onTrigger body to an operator-approved
+ * inference source, mirroring the top-level multi-step per-step pin: a single
+ * source wrapped in a one-element failover chain, agent-preferred when
+ * approved and available, else the gated `defaultSource`. Non-agent body
+ * steps (sleep, awaitSignal, childWorkflow) pin the fallback exactly like the
+ * top-level non-agent steps, so the body's `sources` covers every `stepOrder`
+ * entry -- the coverage the wire validator's per-body narrow requires.
+ *
+ * A body agent that declares any tool surface is rejected here
+ * (`assertBodyAgentToolless`): INTR-310 wires body agent-step execution but
+ * DEFERS staging body tool trees, while the section already unions a body
+ * agent's tool grants into its own authorized set -- so a tool-bearing body
+ * agent would be authorized for tools whose deploy tree is never staged and
+ * would materialize an empty tool set at invoke. Reject at deploy rather than
+ * ship that silent-correctness trap.
+ */
+function pinBodySources(args: {
+  body: WorkflowDefinition;
+  config: HarnessConfig;
+  operatorApprovals: ApprovalSet;
+}): Record<string, InferenceSource[]> {
+  const sources: Record<string, InferenceSource[]> = {};
+  for (const stepId of args.body.stepOrder) {
+    const primitive = args.body.steps[stepId];
+    if (primitive === undefined) {
+      throw new WorkflowDefinitionInvalidError(
+        args.body.id,
+        `body step ${stepId} listed in stepOrder is missing from steps`,
+      );
+    }
+    const stepAgent = extractAgent(primitive);
+    assertBodyAgentToolless(stepAgent, args.body.id, stepId);
+    sources[stepId] = [
+      pickStepInferenceSource({
+        stepAgent,
+        stepId,
+        workflowId: args.body.id,
+        config: args.config,
+        operatorApprovals: args.operatorApprovals,
+      }),
+    ];
+  }
+  return sources;
+}
+
+/**
+ * Reject a body agent that declares any tool surface (`toolFactories` or
+ * `toolPackagePins`). Body agent tool trees are not yet staged (INTR-310
+ * follow-up); the section unions a body agent's tool grants into its own
+ * authorized set, so a tool-bearing body agent would be authorized for tools
+ * whose deploy tree never landed on the sidecar and would materialize an
+ * empty tool set at invoke -- a silent-correctness trap. Fail loud at deploy
+ * until body tool trees ship. A toolless body agent, or a non-agent step
+ * (`agent === null`), is accepted.
+ */
+function assertBodyAgentToolless(
+  agent: AgentDefinition<BaseEnv> | null,
+  bodyId: string,
+  stepId: string,
+): void {
+  if (agent === null) return;
+  const toolFactoryCount = agent.toolFactories.length;
+  const toolPinCount = agent.toolPackagePins?.length ?? 0;
+  if (toolFactoryCount === 0 && toolPinCount === 0) return;
+  throw new WorkflowDefinitionInvalidError(
+    bodyId,
+    `onTrigger body step ${stepId} declares a tool-bearing agent (${String(
+      toolFactoryCount,
+    )} tool factories, ${String(
+      toolPinCount,
+    )} tool-package pins); body agent tools are not yet supported (INTR-310 follow-up), and shipping one would authorize the body agent for tools whose deploy tree is never staged`,
+  );
+}
+
 async function writeWorkflowRepoTree(args: {
   workflow: WorkflowDefinition;
   walk: CapabilityWalkResult;
@@ -928,19 +1216,48 @@ export function wrapHarnessAsSingleStepWorkflow(args: {
   config: HarnessConfig;
   deployContent: DeployContent;
 }): AgentDefinition<BaseEnv> {
-  const inferenceSources = args.config.sources.map((source) => ({
-    provider: source.provider,
-    model: source.model,
-  }));
-  const toolFactories = args.config.tools.map(synthesizeWalkToolFactory);
-  return {
+  return buildSingleStepAgentDefinition({
     id: args.config.agentId,
     systemPrompt: args.deployContent.systemPrompt,
-    toolFactories,
-    capabilities: [],
-    inference: {
-      sources: inferenceSources,
-    },
+    inferencePreferences: args.config.sources.map((source) => ({
+      provider: source.provider,
+      model: source.model,
+    })),
+    toolFactories: args.config.tools.map(synthesizeWalkToolFactory),
+  });
+}
+
+/**
+ * Assemble a single-step `AgentDefinition` from already-resolved fields. This
+ * is the single place the single-step agent shape is constructed, shared by
+ * the live-config wrap (`wrapHarnessAsSingleStepWorkflow`) and the offline
+ * agent-to-workflow fold synthesis, so the two cannot drift on which fields a
+ * wrapped or folded agent carries. Callers pass resolved inputs: the wrap
+ * passes walk-only synthesized tool factories and no pins; the fold passes
+ * empty tool factories (its tools ride as `toolPackagePins`), the agent's own
+ * pins, and its catalog-resolved inference preferences.
+ */
+export function buildSingleStepAgentDefinition(args: {
+  id: string;
+  systemPrompt: string;
+  inferencePreferences: readonly InferencePreference[];
+  toolFactories: readonly AnnotatedToolFactory<BaseEnv>[];
+  capabilities?: readonly string[];
+  description?: string;
+  toolPackagePins?: readonly ToolPackagePin[];
+}): AgentDefinition<BaseEnv> {
+  return {
+    id: args.id,
+    systemPrompt: args.systemPrompt,
+    toolFactories: args.toolFactories,
+    capabilities: args.capabilities ?? [],
+    inference: { sources: args.inferencePreferences },
+    ...(args.description !== undefined
+      ? { description: args.description }
+      : {}),
+    ...(args.toolPackagePins !== undefined
+      ? { toolPackagePins: args.toolPackagePins }
+      : {}),
   };
 }
 

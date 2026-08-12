@@ -14,19 +14,32 @@ build-admin-ui: FORCE
 
 lint: FORCE
 	prettier -c .
-	eslint --cache .
+	NODE_OPTIONS=--max-old-space-size=8192 eslint --cache .
 	$(BUN) bin/gen-api-docs.ts --check
 	$(BUN) bin/check-deps.ts
 	$(BUN) bin/check-launchers.ts
+	$(BUN) bin/check-test-enumeration.ts
 	$(BUN) bin/exports-shape.ts
 	$(BUN) bin/publish-metadata.ts
 
 test: FORCE
 	$(BUN) test packages/ apps/ bin/ tests/agent/ tests/agent-audit-log/ tests/agent-blob-spill/ tests/agent-common/ tests/agent-multi-provider/ tests/agent-quickstart/ tests/agent-resume/ tests/agent-rewind/ tests/agent-rich-tool/ tests/agent-structured-payload/ tests/coding-agent/ tests/hub-agent/lib/ tests/inference-testing/ tests/tool-packaging/ tests/workflow/
-	$(BUN) test --timeout 120000 tests/workflow-deploy/multistep-signal.test.ts tests/workflow-deploy/hub-link-reconnect.test.ts tests/workflow-deploy/interrupted-pack-reconnect-recovery.test.ts tests/workflow-deploy/deploy-window-reconnect-recovery.test.ts tests/workflow-deploy/midrun-signal-survives-reconnect.test.ts tests/workflow-deploy/multistep-perstep-reroute-reconnect.test.ts tests/workflow-deploy/crash-restart-reconnect-resumes.test.ts tests/workflow-deploy/single-step-real-agent.test.ts tests/workflow-deploy/map-fan-out-real-agent.test.ts tests/workflow-deploy/instance-reroute-real-agent.test.ts tests/workflow-deploy/instance-failover-real-agent.test.ts tests/workflow-deploy/multistep-signed-send.test.ts tests/workflow-deploy/single-step-message-input.test.ts tests/workflow-deploy/single-step-posix-tool.test.ts tests/workflow-deploy/single-step-grants-bridge.test.ts tests/workflow-deploy/single-step-pinned-ask-tool.test.ts tests/workflow-deploy/single-step-per-run-grants.test.ts tests/workflow-deploy/approval-tracer-roundtrip.test.ts tests/workflow-deploy/mail-trigger-derived-grants-roundtrip.test.ts tests/workflow-deploy/mail-federation-derived-grants-roundtrip.test.ts tests/workflow-deploy/single-step-event-threading.test.ts tests/workflow-deploy/single-step-conversation-durability.test.ts tests/workflow-deploy/per-level-pipeline-real-agents.test.ts tests/workflow-deploy/single-step-full-lifecycle.test.ts tests/workflow-deploy/cross-process-custom-adapter.test.ts tests/workflow-deploy/conversation-state-wal.test.ts tests/workflow-deploy/drain-roundtrip.test.ts tests/workflow-deploy/child-workflow-roundtrip.test.ts tests/workflow-deploy/child-workflow-inherited-grants-roundtrip.test.ts tests/workflow-deploy/unresolvable-director.test.ts tests/workflow-deploy/fifo-mail.test.ts tests/workflow-deploy/mail-edge-cases.test.ts tests/inference/ tests/skill-attachment-flow.test.ts tests/hub-api/ tests/db/
+	$(BUN) test --timeout 120000 tests/workflow-deploy/multistep-signal.test.ts tests/workflow-deploy/hub-link-reconnect.test.ts tests/workflow-deploy/reconnect-reemits-parked-correlation.test.ts tests/workflow-deploy/interrupted-pack-reconnect-recovery.test.ts tests/workflow-deploy/deploy-window-reconnect-recovery.test.ts tests/workflow-deploy/midrun-signal-survives-reconnect.test.ts tests/workflow-deploy/multistep-perstep-reroute-reconnect.test.ts tests/workflow-deploy/crash-restart-reconnect-resumes.test.ts tests/workflow-deploy/on-trigger-signal-delivery.test.ts tests/workflow-deploy/on-trigger-between-events-restart.test.ts tests/workflow-deploy/on-trigger-agent-body.test.ts tests/workflow-deploy/single-step-real-agent.test.ts tests/workflow-deploy/map-fan-out-real-agent.test.ts tests/workflow-deploy/instance-reroute-real-agent.test.ts tests/workflow-deploy/instance-failover-real-agent.test.ts tests/workflow-deploy/multistep-signed-send.test.ts tests/workflow-deploy/single-step-message-input.test.ts tests/workflow-deploy/single-step-posix-tool.test.ts tests/workflow-deploy/single-step-credential-tool.test.ts tests/workflow-deploy/folded-tools-failover-real-agent.test.ts tests/workflow-deploy/single-step-grants-bridge.test.ts tests/workflow-deploy/single-step-pinned-ask-tool.test.ts tests/workflow-deploy/single-step-per-run-grants.test.ts tests/workflow-deploy/approval-tracer-roundtrip.test.ts tests/workflow-deploy/mail-trigger-derived-grants-roundtrip.test.ts tests/workflow-deploy/mail-trigger-run-completes-real-route.test.ts tests/workflow-deploy/mail-federation-derived-grants-roundtrip.test.ts tests/workflow-deploy/mail-federation-run-completes.test.ts tests/workflow-deploy/single-step-event-threading.test.ts tests/workflow-deploy/single-step-conversation-durability.test.ts tests/workflow-deploy/per-level-pipeline-real-agents.test.ts tests/workflow-deploy/single-step-full-lifecycle.test.ts tests/workflow-deploy/cross-process-custom-adapter.test.ts tests/workflow-deploy/conversation-state-wal.test.ts tests/workflow-deploy/drain-roundtrip.test.ts tests/workflow-deploy/child-workflow-roundtrip.test.ts tests/workflow-deploy/child-workflow-inherited-grants-roundtrip.test.ts tests/workflow-deploy/unresolvable-director.test.ts tests/workflow-deploy/fifo-mail.test.ts tests/workflow-deploy/mail-edge-cases.test.ts tests/workflow-deploy/run-event-batching.test.ts tests/inference/ tests/hub-api/ tests/db/
 
 test-load: FORCE
 	$(BUN) test --timeout 300000 tests/workflow-deploy/fifo-mail-load.test.ts
+
+# Browser-driven admin UI end-to-end suite (Playwright). Excluded from
+# all/test; needs a running Postgres and a one-time
+# `bunx playwright install chromium`. Builds the admin UI bundle first
+# because the harness globalSetup requires apps/admin-ui/dist.
+test-e2e: build-admin-ui
+	$(MAKE) test-e2e-run
+
+# Run the suite against an already-built bundle (CI builds it via
+# `make all` and must not build it twice).
+test-e2e-run: FORCE
+	cd tests/admin-ui-e2e && bunx playwright test
 
 verify-tool-load: FORCE
 	bun bin/verify-tool-load.ts
@@ -54,5 +67,5 @@ clean:
 
 include .env-checked
 
-.PHONY: all build build-admin-ui lint test test-load verify-tool-load format docs clean builtins publish-builtins
+.PHONY: all build build-admin-ui lint test test-load test-e2e test-e2e-run verify-tool-load format docs clean builtins publish-builtins
 FORCE:

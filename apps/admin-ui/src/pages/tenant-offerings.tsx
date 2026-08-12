@@ -9,7 +9,7 @@ import { PaginatedListSentinel } from "@/components/paginated-list-sentinel";
 import { usePaginatedList } from "@/lib/hooks/use-paginated-list";
 import {
   createOfferingMutation,
-  tenantAgentsQuery,
+  tenantDefinitionsQuery,
   tenantOfferingsInfiniteQuery,
 } from "@/lib/queries/tenants";
 import { Badge } from "@/components/ui/badge";
@@ -52,15 +52,15 @@ export function TenantOfferingsPage() {
     isFetchingNextPage,
     fetchNextPage,
   } = usePaginatedList(tenantOfferingsInfiniteQuery(tenantId));
-  const { data: agents } = useQuery(tenantAgentsQuery(tenantId));
+  const { data: definitions } = useQuery(tenantDefinitionsQuery(tenantId));
 
   const [createOpen, setCreateOpen] = useState(false);
-  const [createAgentId, setCreateAgentId] = useState("");
+  const [createDefinitionId, setCreateDefinitionId] = useState("");
   const [createName, setCreateName] = useState("");
   const [createDescription, setCreateDescription] = useState("");
 
   function resetCreateForm() {
-    setCreateAgentId("");
+    setCreateDefinitionId("");
     setCreateName("");
     setCreateDescription("");
   }
@@ -170,7 +170,7 @@ export function TenantOfferingsPage() {
                 name: string;
                 description?: string;
               } = {
-                agentId: createAgentId,
+                agentId: createDefinitionId,
                 name: createName.trim(),
               };
               if (createDescription.trim())
@@ -180,15 +180,18 @@ export function TenantOfferingsPage() {
             className="grid gap-4"
           >
             <div className="grid gap-2">
-              <Label>Agent</Label>
-              <Select value={createAgentId} onValueChange={setCreateAgentId}>
+              <Label>Workflow definition</Label>
+              <Select
+                value={createDefinitionId}
+                onValueChange={setCreateDefinitionId}
+              >
                 <SelectTrigger className="w-full">
-                  <SelectValue placeholder="Select an agent" />
+                  <SelectValue placeholder="Select a workflow definition" />
                 </SelectTrigger>
                 <SelectContent>
-                  {agents?.map((a) => (
-                    <SelectItem key={a.id} value={a.id}>
-                      {a.name}
+                  {definitions?.map((definition) => (
+                    <SelectItem key={definition.id} value={definition.id}>
+                      {definition.name}
                     </SelectItem>
                   ))}
                 </SelectContent>
@@ -217,7 +220,9 @@ export function TenantOfferingsPage() {
               <Button
                 type="submit"
                 disabled={
-                  createMut.isPending || !createAgentId || !createName.trim()
+                  createMut.isPending ||
+                  !createDefinitionId ||
+                  !createName.trim()
                 }
               >
                 {createMut.isPending ? "Creating..." : "Create"}

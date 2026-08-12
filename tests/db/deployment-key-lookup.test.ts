@@ -11,22 +11,22 @@ import {
   createHubSessionLookups,
   type AgentRepoStore,
 } from "@intx/hub-sessions";
-import { workflowDeployment } from "@intx/db/schema";
 import {
   createTestDb,
   harnessDbEnvAvailable,
   type TestDb,
 } from "@intx/test-harness/db-harness";
-import { seedAsset, seedTenants } from "@intx/test-harness/seed";
+import { seedTenants, seedWorkflowRun } from "@intx/test-harness/seed";
 
 // The reconnect ownership challenge verifies a deployment address against a
 // public key resolved by `lookupPublicKey`. These tests pin the workflow-
-// deployment side of that lookup: keyed by address, gated on a live
-// ("deployed") deployment, fail-closed on a missing/null key, and routed by
-// address space so a launched-agent address never resolves against the
-// deployment table.
+// derived side of that lookup: the key now lives on the deployment's anchor
+// workflow_run row (the deployment projection is only the FK parent), keyed by
+// address, gated on a live ("running") run, fail-closed on a missing/null key,
+// and routed by address space so a launched-agent address never resolves
+// against the anchor run.
 describe.skipIf(!harnessDbEnvAvailable())(
-  "lookupPublicKey deployment-key routing (real DB)",
+  "lookupPublicKey workflow-derived key routing (real DB)",
   () => {
     let h: TestDb;
 
@@ -61,70 +61,149 @@ describe.skipIf(!harnessDbEnvAvailable())(
       }).lookupPublicKey(address);
     }
 
-    async function seedDeployment(opts: {
+    // Seed a deployment's anchor run -- the workflow_run whose id equals its
+    // deployment id. The key and liveness gate live on the run. `runStatus`
+    // "running" is a live deployment; a terminal status is the decommissioned
+    // case the read gate excludes.
+    async function seedAnchor(opts: {
       address: string;
       publicKey: string | null;
-      status: "deployed" | "error";
+      runStatus: "running" | "cancelled";
     }): Promise<void> {
       await seedTenants(h.db, [{ id: "t1" }]);
-      await seedAsset(h.db, {
-        id: "asset1",
-        tenantId: "t1",
-        kind: "workflow",
-        name: "wf",
-      });
-      await h.db.insert(workflowDeployment).values({
+      await seedWorkflowRun(h.db, {
         id: "dep1",
         tenantId: "t1",
-        definitionAssetId: "asset1",
+        deploymentId: "dep1",
         address: opts.address,
         publicKey: opts.publicKey,
-        status: opts.status,
+        status: opts.runStatus,
       });
     }
 
-    test("resolves a deployed deployment's key by address", async () => {
-      await seedDeployment({
+    test("resolves a live anchor run's key by address", async () => {
+      await seedAnchor({
         address: "ins_dep_abc@wf.example",
         publicKey: "pk1",
-        status: "deployed",
+        runStatus: "running",
       });
       expect(await lookupPublicKey("ins_dep_abc@wf.example")).toBe("pk1");
     });
 
-    test("returns null when the deployment has not yet acked a key", async () => {
-      await seedDeployment({
+    test("returns null when the anchor run has not yet acked a key", async () => {
+      await seedAnchor({
         address: "ins_dep_abc@wf.example",
         publicKey: null,
-        status: "deployed",
+        runStatus: "running",
       });
       expect(await lookupPublicKey("ins_dep_abc@wf.example")).toBeNull();
     });
 
-    test("returns null for a non-deployed (torn-down) deployment", async () => {
-      await seedDeployment({
+    test("returns null for a decommissioned (terminal) anchor run", async () => {
+      await seedAnchor({
         address: "ins_dep_abc@wf.example",
         publicKey: "pk1",
-        status: "error",
+        runStatus: "cancelled",
       });
       expect(await lookupPublicKey("ins_dep_abc@wf.example")).toBeNull();
     });
 
-    test("returns null for an unknown deployment address", async () => {
+    test("returns null for an unknown workflow-derived address", async () => {
       expect(await lookupPublicKey("ins_dep_missing@wf.example")).toBeNull();
     });
 
-    test("routes a launched-agent address to agent_instance, never the deployment table", async () => {
-      // A workflow_deployment row must not answer for a launched-agent
-      // (ins_...) address. The two address spaces are disjoint and the lookup
-      // routes by discriminator, so an absent agent_instance row returns null
-      // rather than leaking a deployment key.
-      await seedDeployment({
+    test("routes a launched-agent address to the plain path, never the anchor run", async () => {
+      // A plain launched-agent address must not resolve against the anchor run.
+      // The address spaces are disjoint and the lookup routes by discriminator,
+      // so an absent agent_instance / folded run returns null rather than
+      // leaking the anchor's key.
+      await seedAnchor({
         address: "ins_dep_abc@wf.example",
         publicKey: "pk1",
-        status: "deployed",
+        runStatus: "running",
       });
       expect(await lookupPublicKey("ins_launched@wf.example")).toBeNull();
+    });
+
+    test("two concurrent deployments resolve to their own distinct anchor-run keys", async () => {
+      // Each deployment owns its own anchor run at its own address with its own
+      // minted key; the lookup keys on the address and never crosses them, so
+      // two concurrent deployments verify reconnect against distinct keys.
+      await seedTenants(h.db, [{ id: "t1" }]);
+      const deployments = [
+        {
+          id: "dep_one",
+          address: "ins_dep_one@wf.example",
+          publicKey: "pk-one",
+        },
+        {
+          id: "dep_two",
+          address: "ins_dep_two@wf.example",
+          publicKey: "pk-two",
+        },
+      ];
+      for (const d of deployments) {
+        await seedWorkflowRun(h.db, {
+          id: d.id,
+          tenantId: "t1",
+          deploymentId: d.id,
+          address: d.address,
+          publicKey: d.publicKey,
+          status: "running",
+        });
+      }
+      expect(await lookupPublicKey("ins_dep_one@wf.example")).toBe("pk-one");
+      expect(await lookupPublicKey("ins_dep_two@wf.example")).toBe("pk-two");
+    });
+  },
+);
+
+// A folded run is a supervised workflow-process child, pinned forever: the
+// reconnect deploy-ref catch-up must skip it. `lookupDeployRef` resolves the
+// address and returns null for a run WITHOUT reading the repo store, so the
+// caller's null short-circuit excludes it.
+describe.skipIf(!harnessDbEnvAvailable())(
+  "lookupDeployRef fold-aware reconcile guard (real DB)",
+  () => {
+    let h: TestDb;
+
+    beforeAll(async () => {
+      h = await createTestDb();
+    });
+
+    afterAll(async () => {
+      await h.close();
+    });
+
+    beforeEach(async () => {
+      await h.reset();
+      await seedTenants(h.db, [{ id: "t1" }]);
+    });
+
+    test("returns null for a folded run without reading the repo store", async () => {
+      await seedWorkflowRun(h.db, {
+        id: "ins_folded",
+        tenantId: "t1",
+        address: "ins_folded@wf.example",
+        status: "running",
+      });
+      // Any repo-store access is a bug: a run short-circuits to null before the
+      // deploy-ref read, so a throwing stub proves the short-circuit.
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- throwing stub; the run path must not read the repo store
+      const throwingRepoStore = new Proxy(
+        {},
+        {
+          get() {
+            throw new Error("agentRepoStore must not be read for a folded run");
+          },
+        },
+      ) as AgentRepoStore;
+
+      const ref = await createHubSessionLookups({
+        db: h.db,
+        agentRepoStore: throwingRepoStore,
+      }).lookupDeployRef("ins_folded@wf.example");
+      expect(ref).toBeNull();
     });
   },
 );

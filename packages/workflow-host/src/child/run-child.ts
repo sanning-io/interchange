@@ -25,7 +25,8 @@
 //      each one whose log lacks a terminal event.
 //   4. Emit `ready` on the control channel.
 //   5. Loop on control-channel frames:
-//        - `trigger.fired` -> open a new run via `runtimeRun`.
+//        - `trigger.fired` -> first-fire the deployment's top-level run via
+//          `runtimeRun` (the supervisor only sends this for an absent log).
 //        - `grants-updated` -> replace the credentialsSnapshot.
 //        - `drain` -> forward to the drain controller (no-op here).
 //        - `shutdown` -> stop accepting new triggers and exit the
@@ -63,11 +64,6 @@ import {
   readProcessingEntry,
   workflowDefinitionEnvelopeSchema,
 } from "@intx/hub-sessions/substrate";
-import {
-  extractPartByPath,
-  parseHeaderSection,
-  parseMimePart,
-} from "@intx/mime";
 import type { DirectorRegistry } from "@intx/agent";
 import { createDefaultDirectorRegistry } from "@intx/agent";
 import type { AuthzCallResult } from "@intx/inference";
@@ -80,6 +76,7 @@ import type {
   StepInvokeResult,
   StepInvoker,
   SpawnChildWorkflow,
+  SpawnSuspendableChild,
   WorkflowAuthorizeFn,
   WorkflowDefinition,
   WorkflowPark,
@@ -94,9 +91,11 @@ import {
 } from "../drain-controller";
 
 import type { InferenceSource } from "@intx/types/runtime";
+import type { CredentialDelivery } from "@intx/types/sidecar";
 
 import { createWorkflowRunRepoStore } from "../adapters/repo-store";
 import { createWorkflowRunBlobSubstrate } from "../adapters/blob-substrate";
+import type { HostSpawnSuspendableChild } from "../adapters/spawn-child";
 import {
   createControlChannelSender,
   createEventChannelSender,
@@ -109,6 +108,7 @@ import {
   type NdjsonWriter,
 } from "../ipc/index";
 import { createWorkflowHostSignalChannel } from "../seams/signal-channel";
+import { extractConversationText } from "../conversation-text";
 import type { CredentialsSnapshot } from "../supervisor/credentials";
 import { hashGrants } from "../supervisor/credentials";
 
@@ -141,6 +141,17 @@ const WORKFLOW_JSON_PATH = "workflow.json";
  */
 export type CredentialsSnapshotRef = {
   current: CredentialsSnapshot | null;
+};
+
+/**
+ * The deployment's decrypted credential material and per-handle descriptors,
+ * held through a mutable reference and swapped wholesale on a rotation push (a
+ * revoked credential arrives by omission, so the swap evicts it). The secret
+ * lives ONLY here -- read at tool-invoke time through the gated capability --
+ * and is never copied into a snapshot, event, or state.
+ */
+export type CredentialMaterialRef = {
+  current: CredentialDelivery | null;
 };
 
 /**
@@ -253,12 +264,31 @@ export type DrainController = WorkflowHostDrainController;
  * by the run-loop (`runWorkflowChild`), not the binding: the binding
  * only reads it through to the adapter.
  */
+/**
+ * Per-run credential inputs the top-level step invoker carries to the
+ * substrate: the live material cell the control channel writes each delivery
+ * into, and a resolver for a step's grants (which the substrate gates
+ * credential use against). The substrate combines these with its own static
+ * provider registry to assemble each tool bundle's `credentials` capability.
+ *
+ * Grants are typed `readonly unknown[]` here: this package owns no grant
+ * grammar (the credentials snapshot's grants are `unknown[]` throughout), so
+ * the substrate casts to its `GrantRule` shape at its own boundary, exactly
+ * as the grant evaluator does. The cell is read live per use, so a rotation or
+ * a revoking re-push reaches an already-shaped handle without a rebuild.
+ */
+export interface CredentialWiring {
+  readonly materialRef: CredentialMaterialRef;
+  readonly resolveStepGrants: (stepId: string) => readonly unknown[];
+}
+
 export type ChildStepInvoker = (
   req: StepInvokeRequest,
   onEvent: (event: EventPayload) => void,
   authorize: WorkflowAuthorizeFn,
   warmCache: WarmAgentCache | undefined,
   sourcesRef: SourcesSnapshotRef,
+  credentialWiring: CredentialWiring,
 ) => Promise<StepInvokeResult>;
 
 /**
@@ -301,6 +331,21 @@ export interface RunWorkflowChildBindings {
    * `createWorkflowSpawnChild`; tests inject a stub.
    */
   spawnChild: SpawnChildWorkflow;
+  /**
+   * Suspendable child-spawn callback the runtime body invokes for an
+   * `onTrigger` section's per-event body: a child run driven across approval
+   * parks via a live handle (see `SpawnSuspendableChild`). The production
+   * binary wires this against `createWorkflowSpawnSuspendableChild`. Optional
+   * because it is only needed to service `onTrigger` sections -- a child
+   * process that never runs one omits it, and `runOnTrigger` fails loud if a
+   * workflow uses a section the env did not wire.
+   *
+   * Host-widened with an `onEvent` sink (`HostSpawnSuspendableChild`): the
+   * runtime env exposes the narrow `SpawnSuspendableChild`, and `buildRuntimeEnv`
+   * injects the run's event-channel funnel into this binding so a body's live
+   * inference events reach the hub stream. The runtime contract stays narrow.
+   */
+  spawnSuspendableChild?: HostSpawnSuspendableChild;
   /** Host-process scheduler singleton. The child consumes the same instance. */
   scheduler: Scheduler;
   /** Grant evaluator wired against the host's grant-rule grammar. */
@@ -367,6 +412,14 @@ export interface RunWorkflowChildBindings {
    * rather than resolving a default.
    */
   initialSources?: Record<string, InferenceSource[]>;
+  /**
+   * Bootstrap credential material for the deployment's tools, decrypted
+   * hub-side and delivered on the deploy frame so it is resident before any
+   * step runs. Seeds the mutable `credentialMaterialRef` the gated capability
+   * reads. Absent when the deployment binds no credentials; a later
+   * `credentials-updated` control frame refreshes it on rotation.
+   */
+  initialCredentialMaterial?: CredentialDelivery;
   /**
    * Optional override for the child's Ed25519 keypair factory. The
    * child mints a fresh keypair at startup, holds the private half
@@ -492,6 +545,34 @@ export async function runWorkflowChild(
   const sourcesRef: SourcesSnapshotRef = {
     current: opts.bindings.initialSources ?? {},
   };
+  const credentialMaterialRef: CredentialMaterialRef = {
+    current: opts.bindings.initialCredentialMaterial ?? null,
+  };
+  // The per-run credential wiring the top-level step invoker carries to the
+  // substrate: the live material cell and a resolver for a step's grants from
+  // the same credentials snapshot `authorize` reads. Built once over the two
+  // refs; every step build reads them live, so a rotation -- or a revoking
+  // re-push that swaps a ref -- is reflected without rebuilding the wiring.
+  const credentialWiring: CredentialWiring = {
+    materialRef: credentialMaterialRef,
+    resolveStepGrants: (stepId) => {
+      const snapshot = credentialsRef.current;
+      if (snapshot === null) {
+        throw new Error(
+          `workflow-child credential wiring: no credentials snapshot for step ${stepId}; a tool-bearing step cannot resolve its grants before the run carries any`,
+        );
+      }
+      const entry = snapshot.steps.find(
+        (step) => step.stepId === baseStepId(stepId),
+      );
+      if (entry === undefined) {
+        throw new Error(
+          `workflow-child credential wiring: credentials snapshot has no entry for step ${baseStepId(stepId)}`,
+        );
+      }
+      return entry.grants;
+    },
+  };
   const directors = opts.bindings.directors ?? createDefaultDirectorRegistry();
   const clock = opts.bindings.clock ?? defaultClock;
   const newId = opts.bindings.newId ?? defaultNewId;
@@ -585,6 +666,7 @@ export async function runWorkflowChild(
       drainController,
       warmCache,
       sourcesRef,
+      credentialWiring,
       onEvent: (event) => {
         void eventSender.send(event).catch((cause) => {
           logger.error`event-channel send failed during resume run ${run.runId}: ${String(cause)}`;
@@ -609,13 +691,12 @@ export async function runWorkflowChild(
           cleanupRunStorage: opts.bindings.cleanupRunStorage,
           runId: run.runId,
         });
+        runsInFlight.delete(run.runId);
         return emitTerminalEvent(upstreamSender, result);
       })
       .catch((cause) => {
-        logger.error`resumed run ${run.runId} failed: ${String(cause)}`;
-      })
-      .finally(() => {
         runsInFlight.delete(run.runId);
+        logger.error`resumed run ${run.runId} failed: ${String(cause)}`;
       });
     resumedRunIds.push(run.runId);
   }
@@ -638,6 +719,13 @@ export async function runWorkflowChild(
       childPid: process.pid,
       childPublicKey: hexEncode(childKeyPair.publicKey),
     },
+  });
+
+  // Report self-discovered runs so the supervisor seeds its cohort
+  // tracking before the dispatch loop starts.
+  await upstreamSender.send({
+    type: "resumed.runs",
+    data: { runIds: resumedRunIds },
   });
 
   const triggeredRunIds: string[] = [];
@@ -674,6 +762,8 @@ export async function runWorkflowChild(
           runsInFlight,
           warmCache,
           sourcesRef,
+          credentialMaterialRef,
+          credentialWiring,
           ...(opts.substrateWriteBridge !== undefined
             ? { substrateWriteBridge: opts.substrateWriteBridge }
             : {}),
@@ -748,6 +838,8 @@ async function handleControlPayload(
     runsInFlight: Map<string, WorkflowRun>;
     warmCache: WarmAgentCache | undefined;
     sourcesRef: SourcesSnapshotRef;
+    credentialMaterialRef: CredentialMaterialRef;
+    credentialWiring: CredentialWiring;
     substrateWriteBridge?: SubstrateWriteResponseSink;
     outboundMailBridge?: ChildOutboundMailBridge;
   },
@@ -756,16 +848,16 @@ async function handleControlPayload(
     case "trigger.fire": {
       // One driver per runId. If this child is already driving this
       // runId -- self-discovery resumed it, or an earlier trigger opened
-      // it -- the supervisor's re-fire (which carries `runId = messageId`
-      // and no resumeFromEvents) must NOT spawn a second `runtimeRun`. A
+      // it -- a duplicate/stale trigger frame (which carries the deployment's
+      // mail address as the runId and no resumeFromEvents) must NOT spawn
+      // a second `runtimeRun`. A
       // second concurrent driver would race the live one to settle the
       // same residual and the loser throws an uncaught TransitionError,
       // and even a driver that avoided the throw would double-emit the
       // terminal. The live driver's completion continuation owns the
       // single terminal emission; the supervisor's terminal-event-driven
-      // `markConsumed` consumes the message off that one terminal, so no
-      // work is dropped by declining here. Record the runId (the
-      // supervisor did fire a trigger and it was accepted) and signal
+      // `markConsumed` consumes the original message off that one terminal,
+      // so no work is dropped by declining here. Record the runId and signal
       // "handled, not shutdown" the same way the normal trigger case
       // returns, without awaiting the live handle's `complete` inline
       // (that would block the control loop).
@@ -801,6 +893,7 @@ async function handleControlPayload(
         drainController: ctx.drainController,
         warmCache: ctx.warmCache,
         sourcesRef: ctx.sourcesRef,
+        credentialWiring: ctx.credentialWiring,
         onEvent: (event) => {
           void ctx.eventSender.send(event).catch((cause) => {
             logger.error`event-channel send failed during run ${payload.data.runId}: ${String(cause)}`;
@@ -829,13 +922,12 @@ async function handleControlPayload(
             cleanupRunStorage: ctx.bindings.cleanupRunStorage,
             runId: payload.data.runId,
           });
+          ctx.runsInFlight.delete(payload.data.runId);
           return emitTerminalEvent(ctx.upstreamSender, result);
         })
         .catch((cause) => {
-          logger.error`triggered run ${payload.data.runId} failed: ${String(cause)}`;
-        })
-        .finally(() => {
           ctx.runsInFlight.delete(payload.data.runId);
+          logger.error`triggered run ${payload.data.runId} failed: ${String(cause)}`;
         });
       ctx.triggeredRunIds.push(payload.data.runId);
       return false;
@@ -871,7 +963,26 @@ async function handleControlPayload(
       ctx.credentialsRef.current = snapshot;
       return false;
     }
+    case "credentials-updated": {
+      // Replace the in-memory credential material wholesale. A revoked
+      // credential arrives by omission -- its material entry is absent from
+      // the delivery -- so the swap evicts it. Atomic whole-object assignment,
+      // so a concurrent reader never observes a torn cell. The secret stays on
+      // this ref only; nothing here copies it into a snapshot, event, or state.
+      ctx.credentialMaterialRef.current = payload.data.delivery;
+      return false;
+    }
     case "signal.deliver": {
+      // Drop a delivery for a run this child is not driving. The dispatch path
+      // only ever targets a live run id, but a stale or mis-routed frame -- a
+      // synthetic body-child id, or a run that crashed and has not been
+      // re-discovered -- must not commit an orphan `SignalReceived` to a log no
+      // awaiter is tailing. `runsInFlight` is the one-driver authority on which
+      // runs this child drives.
+      if (!ctx.runsInFlight.has(payload.data.runId)) {
+        logger.warn`signal.deliver for run ${payload.data.runId} which is not in flight; dropping (signalName=${payload.data.signalName})`;
+        return false;
+      }
       // Land the signal as a `SignalReceived` commit on the run's
       // event log. The signal-channel substrate's `subscribeKind`
       // peer (the per-run signal channel installed at run start) is
@@ -1104,6 +1215,14 @@ async function handleControlPayload(
       });
       return false;
     }
+    case "resumed.runs": {
+      // `resumed.runs` is the child->supervisor self-discovery report;
+      // receiving one on the child's downstream side is a protocol
+      // violation in the same shape as a downstream `ready`.
+      throw new Error(
+        "workflow-child received a `resumed.runs` frame on its inbound control channel; this is a child-only upstream payload",
+      );
+    }
     case "parked-correlations.response": {
       // `parked-correlations.response` is the child->supervisor reply frame;
       // receiving one on the child's downstream side is a protocol violation
@@ -1132,6 +1251,7 @@ function buildRuntimeEnv(args: {
   drainController: DrainController;
   warmCache: WarmAgentCache | undefined;
   sourcesRef: SourcesSnapshotRef;
+  credentialWiring: CredentialWiring;
   onEvent: (event: EventPayload) => void;
   upstreamSender: ControlChannelSender;
 }): WorkflowRuntimeEnv {
@@ -1166,8 +1286,20 @@ function buildRuntimeEnv(args: {
       args.authorize,
       args.warmCache,
       args.sourcesRef,
+      args.credentialWiring,
     );
   };
+  // Adapt the host binding (which takes the run's `onEvent` sink) down to the
+  // runtime's narrow `SpawnSuspendableChild` by injecting THIS run's event
+  // funnel -- the same closure `invokeStep` forwards -- so a body's live
+  // inference events ride the parent run's event channel to the hub stream
+  // (and inherit its loud-on-failure logging), while the runtime env keeps the
+  // narrow contract with no event slot.
+  const hostSuspendable = args.bindings.spawnSuspendableChild;
+  const spawnSuspendableChild: SpawnSuspendableChild | undefined =
+    hostSuspendable === undefined
+      ? undefined
+      : (spawnInput) => hostSuspendable(spawnInput, args.onEvent);
   return {
     repoStore: args.runtimeRepoStore,
     scheduler: args.bindings.scheduler,
@@ -1177,6 +1309,10 @@ function buildRuntimeEnv(args: {
     authorize: args.authorize,
     invokeStep,
     spawnChild: args.bindings.spawnChild,
+    // Wire the suspendable-child seam only when the host supplied it; a child
+    // that never runs an onTrigger section omits the binding, and the runtime
+    // body fails loud if a workflow reaches a section the env did not wire.
+    ...(spawnSuspendableChild !== undefined ? { spawnSuspendableChild } : {}),
     clock: args.clock,
     newId: args.newId,
     drain: args.drainController,
@@ -1221,10 +1357,10 @@ export function emitParkNotify(
       data: {
         runId: park.runId,
         correlationId: park.correlationId,
-        kind: park.kind,
-        // An approval park always carries its snapshot (the `WorkflowPark`
-        // type requires it), so the frame always forwards one.
-        snapshot: park.approvalSnapshot,
+        parkKind: park.parkKind,
+        ...(park.approvalSnapshot !== undefined
+          ? { snapshot: park.approvalSnapshot }
+          : {}),
       },
     })
     .catch((cause) => {
@@ -1404,58 +1540,6 @@ async function resolveTriggerPayload(args: {
   }
   const raw = base64Decode(rawMessageBase64);
   return extractConversationText(raw, args.messageId);
-}
-
-/**
- * Extract the conversation body text from a raw inbound MIME message.
- *
- * Three on-wire shapes are handled, matching every producer the mail
- * bus accepts:
- *   1. The Interchange assembler's `multipart/signed` envelope whose
- *      first part is a `multipart/mixed` body carrying the text at part
- *      path `1.1`.
- *   2. A `multipart/signed` envelope wrapping a bare `text/plain` part
- *      (a sender that signs without the `multipart/mixed` wrapper); the
- *      text is at part path `1`.
- *   3. A flat top-level `text/plain` message (no multipart structure at
- *      all); the body is the bytes after the header section.
- *
- * The top-level `Content-Type` selects the shape: only a `multipart/*`
- * root walks into parts; anything else reads the single body directly.
- * This mirrors the conversation branch of mail-memory's `fetchFull`
- * while also tolerating the flat single-part case the in-process agent
- * accepts, so a non-standard inbound mail still delivers its text to
- * the agent rather than crashing the run.
- */
-function extractConversationText(raw: Uint8Array, messageId: string): string {
-  const { headers, bodyOffset } = parseHeaderSection(raw);
-  const rootMime = (headers.get("content-type") ?? "")
-    .split(";")[0]
-    ?.trim()
-    .toLowerCase();
-  if (rootMime === undefined || !rootMime.startsWith("multipart/")) {
-    // Flat single-part message: the body is everything after the
-    // header section.
-    return new TextDecoder("utf-8", { fatal: false }).decode(
-      raw.subarray(bodyOffset),
-    );
-  }
-  let part1: ReturnType<typeof parseMimePart>;
-  try {
-    part1 = parseMimePart(extractPartByPath(raw, "1"));
-  } catch (cause) {
-    throw new Error(
-      `workflow-child trigger.fire: cannot parse inbound mail part 1 for messageId ${messageId}`,
-      { cause },
-    );
-  }
-  const part1Mime = (part1.contentType.split(";")[0] ?? "")
-    .trim()
-    .toLowerCase();
-  const bodyBytes = part1Mime.startsWith("multipart/")
-    ? parseMimePart(extractPartByPath(raw, "1.1")).body
-    : part1.body;
-  return new TextDecoder("utf-8", { fatal: false }).decode(bodyBytes);
 }
 
 /**

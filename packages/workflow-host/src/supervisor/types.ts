@@ -11,7 +11,7 @@
 import type {
   DequeueToProcessingResult,
   EnqueueInboxArgs,
-  EnqueueInboxResult,
+  EnqueueInboxOutcome,
   MarkConsumedArgs,
   MarkConsumedResult,
   Principal,
@@ -107,7 +107,13 @@ export type PrincipalSigner = (
  *
  * `subscribeMailForAddress` returns a disposer the supervisor calls
  * during teardown. The supplied handler is invoked with the raw RFC
- * 2822 message bytes of each inbound message at the address.
+ * 2822 message bytes of each inbound message at the address, and returns
+ * a promise that resolves once the message is durably accepted (its inbox
+ * write landed, or the message was already durably present) and rejects
+ * when it was not (a transient failure, a stale refusal, or a phase where
+ * the deployment is tearing down). The host propagates that settlement to
+ * the wire so a durable-receipt ack is sent only on resolution -- resolve
+ * is the ack signal, reject is the withhold signal.
  *
  * `sendOutbound` is the OUTBOUND half of mailbox ownership (§3a). The
  * supervisor is the sole mail owner: the workflow-process child never
@@ -132,7 +138,7 @@ export interface MailBusBindings {
   unregisterAddress(address: string): void;
   subscribeMailForAddress(
     address: string,
-    handler: (rawMessage: Uint8Array) => void,
+    handler: (rawMessage: Uint8Array) => Promise<void>,
   ): () => void;
   sendOutbound(
     senderAddress: string,
@@ -235,7 +241,7 @@ export interface InboxPrimitives {
     principal: Principal,
     repoId: RepoId,
     args: EnqueueInboxArgs,
-  ): Promise<EnqueueInboxResult>;
+  ): Promise<EnqueueInboxOutcome>;
   dequeueToProcessing(
     store: SubstrateRepoStore,
     principal: Principal,
@@ -331,6 +337,13 @@ export interface WorkflowSupervisorBindings {
     runId: string;
     deploymentId: string;
   }) => Promise<import("./credentials").CredentialsSnapshot>;
+  /**
+   * Decrypted credential material for the deployment's tools, delivered to the
+   * child on the pre-trigger barrier alongside the grants. Absent when the
+   * deployment binds no credentials. A rotation flows through
+   * `deliverCredentials`, not this static binding.
+   */
+  credentialDelivery?: import("@intx/types/sidecar").CredentialDelivery;
   /** Subprocess spawner the supervisor invokes per spawn. */
   subprocessSpawner: SubprocessSpawner;
   /**
@@ -543,15 +556,6 @@ export interface WorkflowSupervisorBindings {
    */
   readyTimeoutMs?: number;
   /**
-   * Watchdog timeout (ms) for the supervisor's substrate-write
-   * handler's wait on the dispatch loop's `markConsumed` when a
-   * terminal-event blob lands in a proxied write. Defaults to
-   * `DEFAULT_TERMINAL_WRITE_WATCHDOG_MS`. Tests inject a small value
-   * so the watchdog path is observable without holding a test loop
-   * for the production duration.
-   */
-  terminalWriteWatchdogMs?: number;
-  /**
    * Watchdog timeout (ms) for `reEmitParkedCorrelations`' wait on the
    * child's `parked-correlations.response`. Caps the wait so a
    * wedged-but-alive child (whose cohort never tears down, so the
@@ -637,9 +641,8 @@ export type DispatchSubstrateLeg =
  * (design §10b). All are cheap filesystem reads against the workflow-run
  * repo's on-disk working tree, taken only when the observer is wired.
  *
- *   - `runsFanOut`     — entry count under `runs/` (one subdir per message;
- *                        never pruned). The candidate-(i) "collapse runs"
- *                        win is sized by this.
+ *   - `runsFanOut`     — entry count under `runs/` (the stable top-level run
+ *                        plus any internal body-child runs).
  *   - `consumedFanOut` — entry count under
  *                        `addresses/<addr>/consumed/` (one dedup entry per
  *                        message; never pruned). The candidate-(iv) "prune
@@ -660,8 +663,13 @@ export type DispatchStructuralCounters = {
 /**
  * One observation emitted by `WorkflowSupervisorBindings.onDispatchTiming`.
  *
+ * Both variants key on `messageId`, the per-message identifier (the mail's
+ * Message-ID). The top-level run id cannot serve as the key: one deployment
+ * keeps that stable id across all of its live trigger occurrences, so it does
+ * not distinguish one dispatched message from the next.
+ *
  * The `"roundtrip"` variant is the 4.7 latency-gate bracket: pair the
- * `"dispatch-start"` and `"reply-produced"` marks for the same `runId` to
+ * `"dispatch-start"` and `"reply-produced"` marks for the same `messageId` to
  * recover the per-message round-trip. `atMs` is a high-resolution
  * monotonic timestamp (`performance.now()`).
  *
@@ -677,13 +685,13 @@ export type DispatchStructuralCounters = {
 export type DispatchTimingMark =
   | {
       kind: "roundtrip";
-      runId: string;
+      messageId: string;
       marker: "dispatch-start" | "reply-produced";
       atMs: number;
     }
   | {
       kind: "leg";
-      runId: string;
+      messageId: string;
       leg: DispatchSubstrateLeg;
       phase: "start" | "end";
       atMs: number;

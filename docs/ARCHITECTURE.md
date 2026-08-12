@@ -91,7 +91,7 @@ The harness manages inference through a layered abstraction. Agent definitions d
 
 The reactor director selects which model to use for each inference call (per-call, not per-session). The harness maps that model to the highest-priority available model provider, which determines everything needed for the call: protocol adapter, endpoint, and credentials. Different model providers for the same model may use entirely different protocols — one may speak the Anthropic API while another speaks an OpenAI-compatible API — so failover between model providers can mean switching the protocol adapter, not just the endpoint. The inference layer is stateless with respect to model provider selection; it executes against whatever configuration the harness provides.
 
-Model provider selection follows the priority order established at launch. The highest-priority source is active; on a source-specific failure — an authentication failure, a protocol mismatch, or a transient network or timeout error the inference harness has already retried — the reactor fails over to the next source in the list. A rate limit is the exception: it waits out a short same-source backoff first, since it clears with time, and only then fails over. The error surfaces only once the list is exhausted. Source-invariant failures (a context-window overflow, a fatal request error, or an abort) do not trigger failover, since no other source would serve the call differently. Each new inference cycle restarts at the most-preferred source. v1 uses strict priority; equal-priority load-balancing and configurable selection strategies (weighted round-robin, latency-based) are a planned extension.
+Model provider selection follows the priority order established at launch. The highest-priority source is active; on a source-specific failure — an authentication failure, a protocol mismatch, or a transient network, timeout, or rate-limit error the inference harness has already retried — the reactor fails over to the next source in the list. The error surfaces only once the list is exhausted. Source-invariant failures (a context-window overflow, a fatal request error, or an abort) do not trigger failover, since no other source would serve the call differently. Each new inference cycle restarts at the most-preferred source. v1 uses strict priority; equal-priority load-balancing and configurable selection strategies (weighted round-robin, latency-based) are a planned extension.
 
 The model provider list is not fixed for the agent's lifetime. The control plane can push model provider updates to a running deployment — adding newly available model providers, removing revoked ones, or adjusting priorities. The sidecar routes the update to the deployment's supervisor, which swaps the running agent's sources in place. The harness applies updates without interrupting in-flight inference calls; the updated list takes effect on the next selection.
 
@@ -209,6 +209,20 @@ Each harness runs in its own isolated context. The degree of isolation depends o
 - Audit logging for all external interactions
 - Alternate identity tracking for external services
 - Content safety boundaries between trusted and untrusted input
+
+These are boundaries inside a sidecar. Workflows can also require an infrastructure boundary through sidecar placement.
+
+### Sidecar Placement
+
+Workflow deployments use shared sidecar capacity by default. A workflow, or any tenant in its ancestor chain, may instead require `exclusive` placement. Exclusive means the allocated sidecar accepts only that deployment: shared scheduling excludes allocated workers, and every deployment, trigger, signal, and workflow-state write is routed through the allocation's authenticated generation.
+
+A deployment owns one addressable top-level run. Its stable run id is the deployment mail address. The first inbound trigger fires it; later trigger occurrences can resume a live `onTrigger` section through the run's current correlation, but they do not create another top-level run. Terminal event history is immutable and a terminal deployment cannot be fired again. Internal section/body children have distinct synthetic run ids and are not directly addressable from the Hub API. The run's authorization snapshot is reserved once and reused for every trigger occurrence in that run.
+
+Placement can only be strengthened. A child tenant cannot relax an exclusive requirement inherited from a parent, and a tenant cannot relax a requirement declared by the workflow. The effective placement is fixed when the deployment anchor is prepared. If exclusivity is required but no provisioner plugin is configured, deployment fails closed instead of falling back to shared capacity.
+
+When replacement recovery is explicitly enabled, an exclusive deployment keeps the same durable identity across worker loss: the same deployment id, anchor `workflow_run`, mail address, workflow-run Git repository, and sidecar allocation. Replacement advances the allocation generation and rehydrates that deployment on new capacity from Hub-owned state. A replacement worker is therefore a continuation of the existing deployment, not a new workflow run. Replacement recovery is disabled by default because Hub-owned state does not include arbitrary files created in the sidecar or its isolation containers.
+
+The placement model records whether capacity may be reused for the same deployment, but an explicitly enabled recovery replacement is currently the supported reuse case. Explicit release/reuse policy at deployment teardown is not yet wired into the API lifecycle.
 
 ### Trust Boundary
 

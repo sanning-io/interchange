@@ -3,6 +3,7 @@ import { describe, test, expect } from "bun:test";
 import { createInMemoryGrantStore } from "@intx/authz";
 import type { GrantRule } from "@intx/types/authz";
 import type { AssetService } from "@intx/hub-sessions";
+import { workflowRun as workflowRunTable } from "@intx/db/schema";
 
 import { createMailTriggeredRunGrantsMaterializer } from "./run-grant-materialization";
 
@@ -41,17 +42,86 @@ function workflowJson(): string {
   });
 }
 
-// A DB stand-in exercising only the reads STAGING performs: the deployment
-// lookup and the workflow asset lookup. Staging writes nothing, so the
-// commit path (a real transaction with a guard select and inserts) is left
-// to the DB-backed test; this mock deliberately does not model it.
-function mockDb(opts: { deploymentRow: unknown; assetRow: unknown }) {
+// A DB stand-in for the deployment lookup and first-run reservation. It
+// reports no pre-existing run principal, so each test exercises the winning
+// reservation path.
+function mockDb(opts: {
+  deploymentRow:
+    | { id: string; tenantId: string; definitionAssetId: string }
+    | undefined;
+  assetRow: unknown;
+  topLevelRunStatus?: "running" | "completed" | "failed" | "cancelled" | null;
+  lockedRunStatus?: "running" | "completed" | "failed" | "cancelled";
+}) {
+  // The materializer resolves the deployment's anchor run and its definition in
+  // one inner-joined select keyed by address; model that read shape here.
+  const select = () => ({
+    from: (table: unknown) => {
+      let joined = false;
+      const chain = {
+        innerJoin: () => {
+          joined = true;
+          return chain;
+        },
+        leftJoin: () => {
+          joined = true;
+          return chain;
+        },
+        where: () => ({
+          limit: () =>
+            Object.assign(
+              Promise.resolve(
+                table === workflowRunTable && opts.deploymentRow
+                  ? joined
+                    ? [
+                        {
+                          deploymentId: opts.deploymentRow.id,
+                          tenantId: opts.deploymentRow.tenantId,
+                          definitionId: `wfd_${opts.deploymentRow.id}`,
+                          definitionAssetId:
+                            opts.deploymentRow.definitionAssetId,
+                          anchorStatus: "running",
+                          topLevelRunStatus: opts.topLevelRunStatus ?? null,
+                        },
+                      ]
+                    : [{ status: "running" }]
+                  : [],
+              ),
+              {
+                for: () =>
+                  Promise.resolve(
+                    table === workflowRunTable && opts.deploymentRow
+                      ? [{ status: opts.lockedRunStatus ?? "running" }]
+                      : [],
+                  ),
+              },
+            ),
+        }),
+      };
+      return chain;
+    },
+  });
+  const insert = (_table: unknown) => ({
+    values: (values: unknown) =>
+      Object.assign(Promise.resolve(), {
+        onConflictDoNothing: () => ({
+          returning: () => Promise.resolve([values]),
+        }),
+      }),
+  });
   // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- drizzle PgDatabase type cannot be structurally satisfied in tests
   return {
     query: {
-      workflowDeployment: { findFirst: async () => opts.deploymentRow },
       asset: { findFirst: async () => opts.assetRow },
     },
+    select,
+    insert,
+    transaction: async (
+      fn: (tx: {
+        select: typeof select;
+        insert: typeof insert;
+      }) => Promise<unknown> | unknown,
+    ) => fn({ select, insert }),
   } as unknown as Parameters<
     typeof createMailTriggeredRunGrantsMaterializer
   >[0]["db"];
@@ -65,8 +135,6 @@ function mockAssetService(json: string): AssetService {
   return {
     createAsset: () => notImpl("createAsset"),
     populateAsset: () => notImpl("populateAsset"),
-    attachAsset: () => notImpl("attachAsset"),
-    listAgentAssets: () => notImpl("listAgentAssets"),
     readAssetBlob: async () => new TextEncoder().encode(json),
   } as unknown as AssetService;
 }
@@ -109,9 +177,61 @@ describe("createMailTriggeredRunGrantsMaterializer staging", () => {
     });
     const result = await materialize({
       agentAddress: WORKFLOW_ADDRESS,
-      runId: "<mail-run-1@tenant.example>",
+      runId: WORKFLOW_ADDRESS,
     });
     expect(result.outcome).toBe("skip");
+  });
+
+  test("rejects mail for a terminal stable run before loading its definition", async () => {
+    const materialize = createMailTriggeredRunGrantsMaterializer({
+      db: mockDb({
+        deploymentRow,
+        assetRow,
+        topLevelRunStatus: "completed",
+      }),
+      assetService: {
+        ...mockAssetService(workflowJson()),
+        readAssetBlob: async () => {
+          throw new Error("terminal run must not load its definition");
+        },
+      },
+      grantStore: createInMemoryGrantStore([creatorGrant()]),
+    });
+
+    await expect(
+      materialize({
+        agentAddress: WORKFLOW_ADDRESS,
+        runId: WORKFLOW_ADDRESS,
+      }),
+    ).resolves.toMatchObject({
+      outcome: "rejected",
+      status: 409,
+      code: "workflow_run_terminal",
+    });
+  });
+
+  test("revalidates under lock before reserving a run that became terminal", async () => {
+    const materialize = createMailTriggeredRunGrantsMaterializer({
+      db: mockDb({
+        deploymentRow,
+        assetRow,
+        topLevelRunStatus: null,
+        lockedRunStatus: "failed",
+      }),
+      assetService: mockAssetService(workflowJson()),
+      grantStore: createInMemoryGrantStore([creatorGrant()]),
+    });
+
+    await expect(
+      materialize({
+        agentAddress: WORKFLOW_ADDRESS,
+        runId: WORKFLOW_ADDRESS,
+      }),
+    ).resolves.toMatchObject({
+      outcome: "rejected",
+      status: 409,
+      code: "workflow_run_terminal",
+    });
   });
 
   test("stages the tool grant and the creator requirement, omitting the invoker one", async () => {
@@ -123,7 +243,7 @@ describe("createMailTriggeredRunGrantsMaterializer staging", () => {
 
     const result = await materialize({
       agentAddress: WORKFLOW_ADDRESS,
-      runId: "<mail-run-1@tenant.example>",
+      runId: WORKFLOW_ADDRESS,
     });
 
     if (result.outcome !== "materialized") {
@@ -138,9 +258,7 @@ describe("createMailTriggeredRunGrantsMaterializer staging", () => {
     // The invoker-sourced requirement is silently omitted (no invoker on the
     // wire), so it never materializes.
     expect(resources).not.toContain("secret:other/use");
-    // Every staged grant is principal-scoped on the run principal, and the
-    // commit is deferred (a callable the caller invokes after delivery).
-    expect(typeof result.commit).toBe("function");
+    // Every reserved grant is principal-scoped on the run principal.
     for (const g of result.stepGrants) {
       expect(g.roleId).toBeNull();
       expect(g.principalId).not.toBeNull();
@@ -182,7 +300,7 @@ describe("createMailTriggeredRunGrantsMaterializer staging", () => {
     });
     const result = await materialize({
       agentAddress: WORKFLOW_ADDRESS,
-      runId: "<mail-run-2@tenant.example>",
+      runId: WORKFLOW_ADDRESS,
     });
     if (result.outcome !== "materialized") {
       throw new Error(`expected materialized, got ${result.outcome}`);

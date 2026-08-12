@@ -26,7 +26,7 @@ This inverts the typical approach where each provider implements the full stream
 
 - **Anthropic** — Messages API with streaming, extended thinking, prompt caching
 - **OpenAI-compatible** — Covers OpenAI, OpenRouter, OpenCode Go/Zen, and self-hosted endpoints (Ollama, vLLM)
-- **Google GenAI** — Gemini `streamGenerateContent` over SSE. The request builder translates the internal `ConversationTurn[]` format into Gemini's `contents`/`systemInstruction`/`tools`/`generationConfig` shape, including the three `MediaSource` variants (`base64` → `inlineData`, `file-reference` and `url` → `fileData`/`fileUri`), `tool_call`/`tool_result` round-trip (with a callId-to-name lookup built from prior assistant turns), `ThinkingBlock` round-trip with positional `thoughtSignature` pairing (signature on the block attaches to the next non-thinking part — typically a `functionCall` — matching the wire convention), and lowercase-to-uppercase `responseModalities`. The SSE response parser handles plain-text streaming, thinking streams, function-calling, image output, and code execution: per-part block-index allocation (consecutive same-kind parts coalesce; different-kind parts allocate a fresh index; each `functionCall`, `inlineData`, `executableCode`, and `codeExecutionResult` is its own atomic block), `thoughtSignature` on a follow-on part emits `inference.thinking.signature` against the preceding thinking block's index, `functionCall` parts emit `inference.tool_call.start` + a single `inference.tool_call.delta` carrying the full serialized args (Gemini delivers args complete, not fragmented), `inlineData` parts emit `inference.image_output` with the bytes wrapped as a base64 `ImageBlock`, and `executableCode`/`codeExecutionResult` parts emit `inference.code_execution.start`/`inference.code_execution.result` with a synthetic per-response `gemini-exec-<index>` request id back-pointed from the result block (Gemini's wire carries no explicit back-pointer; the parser enforces strict LIFO pairing with depth 1). The `language` field is passed through verbatim — Gemini emits SCREAMING_CASE (e.g. `"PYTHON"`) and cross-provider comparisons must account for that. Gemini's `outcome` enum maps to the normalized `status` field as `OUTCOME_OK → "ok"`, `OUTCOME_FAILED → "error"`, `OUTCOME_DEADLINE_EXCEEDED → "timeout"`; the raw enum is preserved on `providerOutcome`, and an unknown outcome surfaces as `protocol_mismatch`. A single `inference.usage` emission fires at the terminal event (the one carrying `finishReason`), mapping `promptTokenCount`/`candidatesTokenCount`/`thoughtsTokenCount`/`cachedContentTokenCount` onto `TokenUsage`'s `input`/`output`/`thinking`/`cacheRead`. Grounding is surfaced as citation events: a candidate's `groundingMetadata.groundingSupports` expands into one `inference.citation` event per `(support, chunk)` pair, with the citation's `citedText`/`textOffset` taken from the support's `segment` and the `source` taken from the referenced `groundingChunks[].web` entry (uri + title). Citations anchor to the current text block's index — grounding without a preceding text anchor surfaces as `protocol_mismatch`. Chunk kinds other than `web` (a future shape that has not yet appeared in the captured corpus) are skipped to avoid synthesizing a citation source from a field set the parser cannot map; an out-of-range chunk index in a support throws. `inference.error` mapping for non-`STOP` finish reasons is not yet wired into the parser; events carrying that wire shape either fall through with no internal emission or surface as `protocol_mismatch` via schema validation.
+- **Google GenAI** — Gemini `streamGenerateContent` over SSE. The request builder translates the internal `ConversationTurn[]` format into Gemini's `contents`/`systemInstruction`/`tools`/`generationConfig` shape, including the three `MediaSource` variants (`base64` → `inlineData`, `file-reference` and `url` → `fileData`/`fileUri`), `tool_call`/`tool_result` round-trip (with a callId-to-name lookup built from prior assistant turns), `ThinkingBlock` round-trip with positional `thoughtSignature` pairing (signature on the block attaches to the next non-thinking part — typically a `functionCall` — matching the wire convention), and lowercase-to-uppercase `responseModalities`. The SSE response parser handles plain-text streaming, thinking streams, function-calling, image output, and code execution: per-part block-index allocation (consecutive same-kind parts coalesce; different-kind parts allocate a fresh index; each `functionCall`, `inlineData`, `executableCode`, and `codeExecutionResult` is its own atomic block), `thoughtSignature` on a follow-on part emits `inference.block.signature` against the preceding thinking block's index, `functionCall` parts emit `inference.tool_call.start` + a single `inference.tool_call.delta` carrying the full serialized args (Gemini delivers args complete, not fragmented), `inlineData` parts emit `inference.image_output` with the bytes wrapped as a base64 `ImageBlock`, and `executableCode`/`codeExecutionResult` parts emit `inference.code_execution.start`/`inference.code_execution.result` with a synthetic per-response `gemini-exec-<index>` request id back-pointed from the result block (Gemini's wire carries no explicit back-pointer; the parser enforces strict LIFO pairing with depth 1). The `language` field is passed through verbatim — Gemini emits SCREAMING_CASE (e.g. `"PYTHON"`) and cross-provider comparisons must account for that. Gemini's `outcome` enum maps to the normalized `status` field as `OUTCOME_OK → "ok"`, `OUTCOME_FAILED → "error"`, `OUTCOME_DEADLINE_EXCEEDED → "timeout"`; the raw enum is preserved on `providerOutcome`, and an unknown outcome surfaces as `protocol_mismatch`. A single `inference.usage` emission fires at the terminal event (the one carrying `finishReason`), mapping `promptTokenCount`/`candidatesTokenCount`/`thoughtsTokenCount`/`cachedContentTokenCount` onto `TokenUsage`'s `input`/`output`/`thinking`/`cacheRead`. Grounding is surfaced as citation events: a candidate's `groundingMetadata.groundingSupports` expands into one `inference.citation` event per `(support, chunk)` pair, with the citation's `citedText`/`textOffset` taken from the support's `segment` and the `source` taken from the referenced `groundingChunks[].web` entry (uri + title). Citations anchor to the current text block's index — grounding without a preceding text anchor surfaces as `protocol_mismatch`. Chunk kinds other than `web` (a future shape that has not yet appeared in the captured corpus) are skipped to avoid synthesizing a citation source from a field set the parser cannot map; an out-of-range chunk index in a support throws. `inference.error` mapping for non-`STOP` finish reasons is not yet wired into the parser; events carrying that wire shape either fall through with no internal emission or surface as `protocol_mismatch` via schema validation.
 
 ### Provider Registry
 
@@ -186,19 +186,21 @@ The event protocol extensions that surface multimodal content:
 
 - `inference.citation` — emitted when a provider streams citation metadata attached to a text region. The optional `index` field on the event payload names the source content block; when present, the harness interleaves the citation immediately after the block at that index in the finalized turn's `content[]`.
 - `inference.thinking.redacted` — emitted when the provider delivers a redacted_thinking block (one-shot, no delta stream).
+- `inference.safety_rating` — emitted when a provider surfaces a structured safety signal. The first landed shape is Gemini `promptFeedback.blockReason` (prompt-level block with no candidates); the payload is a `SafetyRatingBlock` carrying the provider-native reason string. The harness appends the block to the finalized turn's `content[]`.
 - `inference.image_output` — emitted mid-stream when an adapter finalizes an image-output block, signaling that the image is ready for downstream handoff before the full `inference.done` lands.
 - `inference.code_execution.{start,delta,result}` — emitted when the model invokes a server-side code-execution tool; results pair to requests by `requestId`.
 
-All delta-flavoured events (`inference.text.delta`, `inference.thinking.delta`, `inference.thinking.signature`, `inference.tool_call.start`, `inference.tool_call.delta`) carry an optional `index` field. Presence of `index` means the provider modeled the block position explicitly; absence means a single-block guarantee from the wire (e.g., OpenAI Chat Completions today). Downstream consumers that care about per-block structure walk the finalized `inference.done` turn's `content[]`.
+All delta-flavoured events (`inference.text.delta`, `inference.thinking.delta`, `inference.block.signature`, `inference.tool_call.start`, `inference.tool_call.delta`) carry an optional `index` field. Presence of `index` means the provider modeled the block position explicitly; absence means a single-block guarantee from the wire (e.g., OpenAI Chat Completions today). Downstream consumers that care about per-block structure walk the finalized `inference.done` turn's `content[]`.
 
 #### Provider coverage
 
 The adapter retrofits land:
 
-- **Anthropic** — image input (base64 + file-reference + url), document input (base64 + file-reference + url), `redacted_thinking` round-trip (parser + builder), citation streaming (`citations_delta` to `inference.citation`), full per-index propagation on every delta.
-- **OpenAI** — image input via the `image_url` shape (base64 data URL + public url passed verbatim); file-reference rejection with explicit messaging because Chat Completions only accepts data URLs and public URLs; document input deferred pending a captured fixture against the `file` content type; per-index `tool_calls[]` propagation namespaced into the same counter as text/thinking so a tool_call streamed before text doesn't collide with the later text block.
+- **Anthropic** — image input (base64 + file-reference + url), document input (base64 + file-reference + url) with optional `title`/`context` emitted as siblings of `source` when present and dropped when absent, `redacted_thinking` round-trip (parser + builder), citation streaming (`citations_delta` to `inference.citation`), full per-index propagation on every delta.
+- **OpenAI** — image input via the `image_url` shape (base64 data URL + public url passed verbatim); file-reference rejection with explicit messaging because Chat Completions only accepts data URLs and public URLs; document input via the Chat Completions `file` content type (base64 → data-URI `file_data` with a mime-derived `document.pdf` filename; file-reference → `file_id`; url rejected — no URL form on `file`); `DocumentBlock` `title`/`context` are not on this wire; per-index `tool_calls[]` propagation namespaced into the same counter as text/thinking so a tool_call streamed before text doesn't collide with the later text block.
+- **Google GenAI** — `inference.safety_rating` from `promptFeedback.blockReason` on prompt-blocked responses (no candidates); usage is emitted on that terminal path from `usageMetadata`. `SafetyRatingBlock` is rewritten to text via `formatSafetyRatingText` when marshaling follow-up request history (output-only; no input wire shape). Candidate-level `safetyRatings` arrays and `finishReason: "SAFETY"` are not yet observed in the discovery corpus.
 
-The wire shapes for both adapters are exercised end-to-end via the compat-replay infrastructure (`packages/inference-testing/src/compat-replay.ts`), which walks the discovery `SUPPORT_MATRIX` and replays every captured fixture through the current adapter with the full Invariant list applied.
+The wire shapes for both adapters are exercised end-to-end via the session parser-regression (`packages/inference-testing/src/session-parser-regression.test.ts`), which walks the discovery `SUPPORT_MATRIX` and replays every captured session response through the current adapter with the full Invariant list applied.
 
 ### Cross-Provider Message Transformation
 
@@ -206,6 +208,7 @@ When conversations cross provider boundaries (model switch, agent handoff, sessi
 
 Transformations:
 
+- **SafetyRatingBlock** — prompt-level structured safety is output-only. Adapters rewrite each `safety_rating` block to text via `formatSafetyRatingText` when marshaling request history (Gemini, Anthropic, OpenAI). `transformMessages` applies the same rewrite when a caller invokes it for a model switch; today transform is not wired automatically into the reactor — adapter-side marshaling is the live path.
 - **Tool call ID normalization** — Provider ID formats vary (OpenAI Responses API generates 450+ character IDs with pipes; Anthropic has strict format requirements). IDs are normalized to a portable format with a bidirectional mapping for round-trip fidelity.
 - **Thinking block handling** — Encrypted/redacted reasoning blocks are valid only for the originating model. Stripped when replaying to a different provider.
 - **Thinking signature preservation** — Opaque signatures for multi-turn reasoning continuity are kept for same-model, dropped for cross-model.
@@ -213,7 +216,7 @@ Transformations:
 - **Orphaned tool call recovery** — Interrupted conversations show tool calls without results. Synthetic error results are injected so the target model sees a complete tool sequence.
 - **Incomplete turn filtering** — Error/aborted assistant messages are filtered during replay to prevent "reasoning without output" errors on the target model.
 
-Transformation runs automatically when the target model differs from a message's originating model. The originating model is tracked per-message, not per-conversation, because model switches can happen mid-conversation.
+`transformMessages` is the shared helper for those rewrites when a caller invokes it for a model switch. Adapter `buildRequest` paths also apply provider-specific history fixes (including SafetyRatingBlock → text) on every request. The originating model is tracked per-message, not per-conversation, because model switches can happen mid-conversation.
 
 ## Structured Outputs
 
@@ -258,15 +261,50 @@ The adapter forwards the caller's schema verbatim. When Gemini rejects, the HTTP
 
 ### Refusal semantics
 
-OpenAI strict mode produces structured refusals when the safety classifier declines a request: the assistant message carries a `refusal` field instead of `content`, and the streaming wire surfaces refusal fragments through `delta.refusal` rather than `delta.content`. The adapter emits these as a new event variant:
+A model can decline a request on two different channels. They are not
+interchangeable in this runtime.
+
+**Structured wire refusal (OpenAI contract).** OpenAI's documented
+strict-mode structured-outputs path can surface a safety-policy decline
+through a dedicated `refusal` field instead of `content`. On the stream
+that appears as `delta.refusal` fragments rather than `delta.content`.
+When those bytes arrive, the OpenAI adapter emits:
 
 ```
 inference.refusal.delta — Refusal fragment (token: string, index?: number)
 ```
 
-The event shape mirrors `inference.text.delta` so the harness's existing per-index block accumulator routes refusal fragments without any new state. The finalized assistant turn carries a `RefusalBlock { type: "refusal", reason: string }` in its `content[]` array, so consumers can branch on the block type rather than scan event history. Refusal is semantically distinct from `inference.error`: the HTTP call succeeded and the model produced a coherent response, but that response is "I will not satisfy this schema" rather than schema-conformant content.
+The event shape mirrors `inference.text.delta` so the harness's per-index
+block accumulator routes the fragments without new state. The finalized
+assistant turn carries a `RefusalBlock { type: "refusal", reason: string }`
+so consumers can branch on block type. That path is distinct from
+`inference.error`: the HTTP call succeeded; the response is a coherent
+decline on the structured channel, not a transport or protocol failure.
 
-Gemini and Anthropic have no equivalent structured refusal field; declines from those providers surface as ordinary text content (with a textual refusal message) or as HTTP errors.
+**Content-channel decline.** The model can also refuse in ordinary
+assistant text (or, under `json_schema`, in schema-conformant JSON whose
+fields hold a textual decline). Those bytes travel as normal
+`delta.content` / text content. The adapter does **not** promote them to
+`inference.refusal.delta` or `RefusalBlock`. Downstream code that only
+looks for `RefusalBlock` will not see a content-channel decline as a
+structured refusal.
+
+**What is proven where.** Parser and harness coverage for the structured
+channel is synthetic: wire-DSL `chunk({ refusal })` streams drive the
+OpenAI adapter and `tests/inference/refusal-harness.test.ts` end-to-end.
+A live discovery probe under
+`packages/inference-discovery-openai/sessions/openai/gpt-5.5/structured-output-refusal-streaming/exchanges/0/`
+is retained as a support-matrix `misled` row: against gpt-5.5, a strict
+`json_schema` request plus a policy-sensitive prompt never produced a
+non-null `delta.refusal`. The model instead streamed schema-conformant
+JSON whose `steps` array carried a textual decline (`finish_reason:
+stop`). That fixture documents live classifier behavior on the content
+channel; it does not prove the structured `refusal` field and does not
+replace the synthetic parser coverage.
+
+Gemini and Anthropic have no equivalent structured refusal field;
+declines from those providers surface as ordinary text content or as
+HTTP errors — content-channel or error-path only.
 
 ## Agent Reactor
 
@@ -796,7 +834,7 @@ Provider errors are classified into categories that determine the reactor's resp
 - **Retryable** — Rate limits (429), server errors (500, 502, 503, 504), overload, network failures. Response: exponential backoff with retry.
 - **Context overflow** — Request exceeds the model's context window. Each provider phrases this differently (20+ known patterns). Response: trigger compaction, not retry.
 - **Credential failure** — Authentication rejected, token expired. Response: emit a credential gate, suspend the reactor for credential refresh. In a platform with managed credentials, expiry is expected and recoverable.
-- **Quota exhausted** — Provider-level usage limit hit (distinct from transient rate limits). Response: fail or switch model, depending on director policy.
+- **Quota exhausted** — Provider-level usage limit hit (distinct from transient rate limits). The `runInference` wrapper retries it mechanically (see Retry Behavior); once the wrapper gives up, the reactor fails over to the next inference source rather than re-running the exhausted one.
 - **Fatal** — Invalid request, unsupported model, malformed content. Response: fail immediately with diagnostic information.
 - **Aborted** — Caller cancelled via AbortSignal. Response: clean termination.
 - **Timeout** — Per-call inactivity or total wall-clock cap fired (see Per-Call Timeouts). The call produced no usable response. Response: treat as transient infrastructure failure and retry per director policy rather than as a model decision.
@@ -821,6 +859,10 @@ The retry delay is awaited against `Dependencies.scheduler.setTimeout`; the call
 Between attempts the wrapper emits one `inference.retry` event carrying the failed attempt's number, the policy-chosen `delayMs`, and the classified error. Consumers that want telemetry on retry frequency or tuning data subscribe to this event; consumers that do not care can ignore it.
 
 If a custom policy throws synchronously or its returned Promise rejects, the wrapper treats the failure as `{ kind: "abort" }` and surfaces the original `inference.error` to the caller. The policy's own exception is logged at `warn` (so a misbehaving custom policy is not invisible) and dropped — the inference error is what the caller needs to act on, not the bug in the policy callback.
+
+Mechanical retry for `quota_exhausted` is owned solely by this wrapper. The reactor drives one wrapper pass per inference source and then fails over to the next source on any non-source-invariant error, including quota; it adds no same-source retry of its own. The worst case for a sustained `quota_exhausted` response that omits `retryAfterMs` is therefore the wrapper's cap of **3 HTTP calls per source** (a flat 1000 ms baseline between attempts), repeated across at most the configured failover sources — 3 calls times the number of sources, with no reactor-level multiplier on top.
+
+One consequence: a quota error now fails over immediately once the wrapper's attempts are spent. For a multi-source agent this is the intended behaviour — move to a healthy source rather than sit on a throttled one. For a single-source agent whose provider returns `quota_exhausted` without a `Retry-After`, the error surfaces after the wrapper's few short attempts instead of a long same-source wait; operators who need extended pacing for that case supply a custom `RetryPolicy` via `InferenceOptions.retryPolicy`.
 
 ## Per-Call Timeouts
 

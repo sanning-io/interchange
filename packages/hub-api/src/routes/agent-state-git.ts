@@ -1,20 +1,14 @@
 /**
  * Agent-state smart-HTTP route group.
  *
- * Two URL grammars exposed under two Hono sub-apps:
+ * One URL grammar exposed under a Hono sub-app:
  *
- *   /api/tenants/:tenantId/agents/instances/:insId/state.git/...
- *     -> RepoId { kind: "agent-state", id: insId }
- *     (per-instance runtime state, written by the sidecar's first
- *      state pack)
+ *   /api/tenants/:tenantId/workflows/runs/:runId/state.git/...
+ *     -> RepoId { kind: "agent-state", id: runId }
+ *     (a folded run's runtime state, written by the sidecar's first
+ *      state pack to `agents/<runId>`)
  *
- *   /api/tenants/:tenantId/agents/definitions/:agtId/state.git/...
- *     -> RepoId { kind: "agent-state", id: agtId }
- *     (per-definition repo with hub-written deploy artifacts; the
- *      `deploy/` prefix is populated by writeDeployTree at instance
- *      launch)
- *
- * Both grammars are READ-ONLY over HTTP. Upload-pack
+ * The grammar is READ-ONLY over HTTP. Upload-pack
  * (`info/refs?service=git-upload-pack` and `POST /git-upload-pack`)
  * runs behind the same bearer middleware the asset routes use, with
  * a pre-resolved authz verdict on the constructed UserPrincipal.
@@ -27,21 +21,20 @@
  * the substrate's `handleReceivePack` is NOT imported here — agent
  * state never accepts writes over HTTP.
  *
- * Both resolvers verify the instance / definition row belongs to
- * `:tenantId` and 404 otherwise. The per-instance repo is
- * lazily-materialised: on a never-pushed instance, `listRefs`
- * returns the empty list and the advertise layer emits the
- * `capabilities^{}` empty-repo record so a stock `git clone`
- * succeeds against an empty tree rather than 404ing.
+ * The resolver verifies the folded run belongs to `:tenantId` and
+ * 404s otherwise. The per-run repo is lazily-materialised: on a
+ * never-pushed run, `listRefs` returns the empty list and the
+ * advertise layer emits the `capabilities^{}` empty-repo record so a
+ * stock `git clone` succeeds against an empty tree rather than 404ing.
  */
 
-import { and, eq } from "drizzle-orm";
+import { and, eq, isNull, isNotNull } from "drizzle-orm";
 import { Hono, type Context } from "hono";
 import { createMiddleware } from "hono/factory";
 import type { MiddlewareHandler } from "hono";
 
 import { authorize } from "@intx/authz";
-import { agent as agentTable, agentInstance } from "@intx/db/schema";
+import { workflowRun } from "@intx/db/schema";
 import type { DB } from "@intx/db";
 import { repoActionToGrantVerb } from "@intx/hub-common";
 import { getLogger } from "@intx/log";
@@ -337,8 +330,6 @@ function makeUploadPackStore(
 
 // ----- Resolver shape -----------------------------------------------
 
-type AgentStateRouteMode = "instance" | "definition";
-
 type SmartHttpResolved = {
   principal: UserPrincipal;
   repoId: RepoId;
@@ -355,27 +346,26 @@ type ResolveResult =
 
 async function resolveAgentStateId(
   db: DB["db"],
-  mode: AgentStateRouteMode,
   tenantId: string,
   paramId: string,
 ): Promise<{ ok: true; id: string } | { ok: false; reason: string }> {
-  if (mode === "instance") {
-    const row = await db.query.agentInstance.findFirst({
-      where: and(
-        eq(agentInstance.id, paramId),
-        eq(agentInstance.tenantId, tenantId),
-      ),
-    });
-    if (row === undefined) {
-      return { ok: false, reason: `no instance ${paramId} in tenant` };
-    }
-    return { ok: true, id: row.id };
-  }
-  const row = await db.query.agent.findFirst({
-    where: and(eq(agentTable.id, paramId), eq(agentTable.tenantId, tenantId)),
+  // Only a folded launch run owns state at `agents/<runId>`: it is born with a
+  // routing address and no deployment (`deploymentId IS NULL AND address IS NOT
+  // NULL`), so its sidecar persists via the plain-address path. A deployment
+  // anchor/child run keeps its state under `workflow-runs/<slug>` instead, so
+  // the shape gate keeps those out of this route. Deliberately NOT gated on
+  // status: a stopped run's final state is exactly what a read-only clone
+  // serves, matching the legacy instance route -- do not add a `running` guard.
+  const row = await db.query.workflowRun.findFirst({
+    where: and(
+      eq(workflowRun.id, paramId),
+      eq(workflowRun.tenantId, tenantId),
+      isNull(workflowRun.deploymentId),
+      isNotNull(workflowRun.address),
+    ),
   });
   if (row === undefined) {
-    return { ok: false, reason: `no agent definition ${paramId} in tenant` };
+    return { ok: false, reason: `no run ${paramId} in tenant` };
   }
   return { ok: true, id: row.id };
 }
@@ -389,7 +379,6 @@ type ResolveSmartHttpDeps = {
 async function resolveSmartHttp(
   deps: ResolveSmartHttpDeps,
   c: Context<TenantGitTokenEnv>,
-  mode: AgentStateRouteMode,
   action: RepoAction,
 ): Promise<ResolveResult> {
   const tenantRow = c.get("tenant");
@@ -413,18 +402,17 @@ async function resolveSmartHttp(
       message: `token claims do not include action ${action}`,
     };
   }
-  const paramName = mode === "instance" ? "instanceId" : "agentId";
-  const paramId = c.req.param(paramName);
+  const paramId = c.req.param("runId");
   if (paramId === undefined) {
     return {
       ok: false,
       status: 400,
       code: "bad_request",
-      message: `missing :${paramName} in URL`,
+      message: "missing :runId in URL",
     };
   }
   const tenantId = tenantRow.id;
-  const resolved = await resolveAgentStateId(deps.db, mode, tenantId, paramId);
+  const resolved = await resolveAgentStateId(deps.db, tenantId, paramId);
   if (!resolved.ok) {
     return {
       ok: false,
@@ -443,10 +431,9 @@ async function resolveSmartHttp(
   });
   if (authz.effect !== "allow") {
     log.info(
-      "agent-state authz denied {tenantId} {mode}={id} principal={principalId}",
+      "agent-state authz denied {tenantId} run={id} principal={principalId}",
       {
         tenantId,
-        mode,
         id: resolved.id,
         principalId: principalRow.id,
       },
@@ -477,14 +464,12 @@ export type CreateAgentStateGitRoutesDeps = {
   conditionRegistry: ConditionRegistry;
 };
 
-function createAgentStateGitRoutes(
+export function createAgentStateRunGitRoutes(
   deps: CreateAgentStateGitRoutesDeps,
-  mode: AgentStateRouteMode,
 ): Hono<TenantGitTokenEnv> {
   const app = new Hono<TenantGitTokenEnv>();
-  const paramSeg = mode === "instance" ? ":instanceId" : ":agentId";
 
-  app.get(`/${paramSeg}/state.git/info/refs`, async (c) => {
+  app.get("/:runId/state.git/info/refs", async (c) => {
     const service = c.req.query("service");
     if (service !== "git-upload-pack") {
       // The receive-pack case is handled by the deny middleware above;
@@ -499,7 +484,7 @@ function createAgentStateGitRoutes(
         400,
       );
     }
-    const r = await resolveSmartHttp(deps, c, mode, "resolveRef");
+    const r = await resolveSmartHttp(deps, c, "resolveRef");
     if (!r.ok) {
       return c.json({ error: { code: r.code, message: r.message } }, r.status);
     }
@@ -518,8 +503,8 @@ function createAgentStateGitRoutes(
     });
   });
 
-  app.post(`/${paramSeg}/state.git/git-upload-pack`, async (c) => {
-    const r = await resolveSmartHttp(deps, c, mode, "createPack");
+  app.post("/:runId/state.git/git-upload-pack", async (c) => {
+    const r = await resolveSmartHttp(deps, c, "createPack");
     if (!r.ok) {
       return c.json({ error: { code: r.code, message: r.message } }, r.status);
     }
@@ -534,18 +519,6 @@ function createAgentStateGitRoutes(
   return app;
 }
 
-export function createAgentStateInstanceGitRoutes(
-  deps: CreateAgentStateGitRoutesDeps,
-): Hono<TenantGitTokenEnv> {
-  return createAgentStateGitRoutes(deps, "instance");
-}
-
-export function createAgentStateDefinitionGitRoutes(
-  deps: CreateAgentStateGitRoutesDeps,
-): Hono<TenantGitTokenEnv> {
-  return createAgentStateGitRoutes(deps, "definition");
-}
-
 /**
  * Smart-HTTP paths excluded from the OpenAPI document. The agent-state
  * routes serve binary git wire vocabulary; advertising them in the
@@ -553,10 +526,7 @@ export function createAgentStateDefinitionGitRoutes(
  * endpoints.
  */
 export const AGENT_STATE_OPENAPI_EXCLUDE_GLOBS = [
-  "/api/tenants/*/agents/instances/*/state.git/info/refs",
-  "/api/tenants/*/agents/instances/*/state.git/git-upload-pack",
-  "/api/tenants/*/agents/instances/*/state.git/git-receive-pack",
-  "/api/tenants/*/agents/definitions/*/state.git/info/refs",
-  "/api/tenants/*/agents/definitions/*/state.git/git-upload-pack",
-  "/api/tenants/*/agents/definitions/*/state.git/git-receive-pack",
+  "/api/tenants/*/workflows/runs/*/state.git/info/refs",
+  "/api/tenants/*/workflows/runs/*/state.git/git-upload-pack",
+  "/api/tenants/*/workflows/runs/*/state.git/git-receive-pack",
 ] as const;

@@ -5,7 +5,7 @@ import {
   SupportEntry,
   STRUCTURED_OUTPUT_CAPABILITIES,
   assertNotesDiscipline,
-  getFixtureDir,
+  getSessionDir,
 } from "./support-matrix";
 
 describe("SUPPORT_MATRIX validation", () => {
@@ -115,37 +115,26 @@ describe("STRUCTURED_OUTPUT_CAPABILITIES", () => {
   });
 });
 
-describe("getFixtureDir", () => {
-  test("composes the anthropic package wire path for a captured entry", () => {
+describe("getSessionDir", () => {
+  test("composes the anthropic package sessions path for a captured entry", () => {
     const entry = SUPPORT_MATRIX.find(
       (e) => e.provider === "anthropic" && e.outcome === "captured",
     );
     expect(entry).toBeDefined();
     if (entry === undefined) return;
-    expect(getFixtureDir(entry)).toBe(
-      `packages/inference-discovery-anthropic/wire/anthropic/${entry.model}/${entry.capability}`,
+    expect(getSessionDir(entry)).toBe(
+      `packages/inference-discovery-anthropic/sessions/anthropic/${entry.model}/${entry.capability}`,
     );
   });
 
-  test("composes the openai package wire path for a captured opencode-zen entry", () => {
+  test("composes the openai package sessions path for a captured opencode-zen entry", () => {
     const entry = SUPPORT_MATRIX.find(
       (e) => e.provider === "opencode-zen" && e.outcome === "captured",
     );
     expect(entry).toBeDefined();
     if (entry === undefined) return;
-    expect(getFixtureDir(entry)).toBe(
-      `packages/inference-discovery-openai/wire/opencode-zen/${entry.model}/${entry.capability}`,
-    );
-  });
-
-  test("returns a fixture path for a misled entry", () => {
-    const entry = SUPPORT_MATRIX.find(
-      (e) => e.provider === "anthropic" && e.outcome === "misled",
-    );
-    expect(entry).toBeDefined();
-    if (entry === undefined) return;
-    expect(getFixtureDir(entry)).toBe(
-      `packages/inference-discovery-anthropic/wire/anthropic/${entry.model}/${entry.capability}`,
+    expect(getSessionDir(entry)).toBe(
+      `packages/inference-discovery-openai/sessions/opencode-zen/${entry.model}/${entry.capability}`,
     );
   });
 
@@ -155,16 +144,16 @@ describe("getFixtureDir", () => {
     );
     expect(noFixture).toBeDefined();
     if (noFixture === undefined) return;
-    expect(getFixtureDir(noFixture)).toBeNull();
+    expect(getSessionDir(noFixture)).toBeNull();
   });
 
-  test("throws for a fixture-bearing entry whose provider has no wire root", () => {
+  test("throws for a fixture-bearing entry whose provider has no root", () => {
     const entry: SupportEntry = {
       provider: "made-up-provider",
       model: "some-model",
       capability: "plain-text",
       outcome: "captured",
     };
-    expect(() => getFixtureDir(entry)).toThrow(/no fixture root/);
+    expect(() => getSessionDir(entry)).toThrow(/no session root/);
   });
 });

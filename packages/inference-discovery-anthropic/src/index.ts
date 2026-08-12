@@ -25,15 +25,14 @@ import {
   buildRedactedThinkingTurn2Body,
   buildRequestBody,
 } from "./request-body";
-import { extractReasoningTrace } from "./reasoning";
 import { extractContentBlocksFromSSE } from "./sse";
 
 const PROVIDER_NAME = "anthropic";
 
 const MODELS = [
   "claude-sonnet-5",
-  "claude-sonnet-4-5-20250929",
-  "claude-opus-4-1-20250805",
+  "claude-opus-5",
+  "claude-fable-5",
   "claude-haiku-4-5-20251001",
 ] as const;
 
@@ -160,7 +159,6 @@ function buildFilesUploadStep(intent: CapabilityIntent): {
   return {
     step: {
       kind: "raw",
-      subdir: "upload",
       url: buildFilesURL(),
       method: "POST",
       contentType: multipart.contentType,
@@ -189,12 +187,10 @@ function extractFileId(parsed: unknown): string {
 
 function makeJsonStep(opts: {
   capability: Capability;
-  subdir: string | null;
   body: unknown;
 }): CaptureStep {
   return withPerCapabilityHeaders(opts.capability, {
     kind: "json",
-    subdir: opts.subdir,
     url: buildMessagesURL(),
     body: opts.body,
   });
@@ -226,7 +222,6 @@ export function* iterateCaptureSteps(
     });
     yield makeJsonStep({
       capability,
-      subdir: "generate",
       body: generateBody,
     });
     return;
@@ -236,7 +231,6 @@ export function* iterateCaptureSteps(
     const turn1Body = buildRequestBody({ model, capability, intent });
     const turn1Response = yield makeJsonStep({
       capability,
-      subdir: "turn-1",
       body: turn1Body,
     });
     const turn2Body = buildFunctionCallingTurn2Body({
@@ -251,7 +245,6 @@ export function* iterateCaptureSteps(
     });
     yield makeJsonStep({
       capability,
-      subdir: "turn-2",
       body: turn2Body,
     });
     return;
@@ -266,7 +259,6 @@ export function* iterateCaptureSteps(
     const turn1Body = buildRequestBody({ model, capability, intent });
     const turn1Response = yield makeJsonStep({
       capability,
-      subdir: "turn-1",
       body: turn1Body,
     });
     const turn2Body = buildRedactedThinkingTurn2Body({
@@ -280,7 +272,6 @@ export function* iterateCaptureSteps(
     });
     yield makeJsonStep({
       capability,
-      subdir: "turn-2",
       body: turn2Body,
     });
     return;
@@ -288,7 +279,6 @@ export function* iterateCaptureSteps(
 
   yield makeJsonStep({
     capability,
-    subdir: null,
     body: buildRequestBody({ model, capability, intent }),
   });
 }
@@ -303,7 +293,6 @@ export function createAnthropicPlugin(
     redactRequestHeaders: REDACT_REQUEST_HEADERS,
     redactResponseHeaders: REDACT_RESPONSE_HEADERS,
     buildAuthHeaders: () => buildAuthHeaders(apiKey),
-    extractReasoningTrace,
     iterateCaptureSteps,
   };
 }

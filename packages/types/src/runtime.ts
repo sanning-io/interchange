@@ -551,6 +551,43 @@ export const ApprovalSnapshot = type({
 export type ApprovalSnapshot = typeof ApprovalSnapshot.infer;
 
 /**
+ * The kind of a control-plane park: a step suspended awaiting an external
+ * event. `"approval"` and `"input"` park on a reserved
+ * `signalName(correlationId)` channel; `"signal-relay"` parks on an
+ * author-chosen name.
+ *
+ * - `"approval"` -- the step parked on a tool/authz gate and REQUIRES an
+ *   {@link ApprovalSnapshot}; the runtime notifies the host (`env.onPark`) so
+ *   the sidecar co-writes the approval/correlation rows the hub registers.
+ * - `"input"` -- the step parked awaiting its next input (e.g. a long-lived
+ *   agent run awaiting the next mail so it can take another turn). It carries
+ *   NO snapshot and does NOT notify the host: the run's owner delivers the
+ *   input on the same channel and the step re-arms. It is a runtime-local
+ *   concept -- deliberately NOT a {@link SignalKind}, so it never touches the
+ *   approval-routing machinery (IPC register frames, the hub co-write, the
+ *   approval columns).
+ * - `"signal-relay"` -- an onTrigger section container parked on an
+ *   author-named signal so a body child's `awaitSignal` on that name is
+ *   serviced through the deployment run: the external signal is delivered to
+ *   the parent run and the runtime relays it down into the live body child.
+ *   The channel name is the author's free-form signal name, NOT a reserved
+ *   `signalName(correlationId)`, so recovery must branch on this kind BEFORE
+ *   assuming the awaited name is a reserved control-plane channel. Carries no
+ *   snapshot and is not hub-registered.
+ *
+ * The kinds are distinguished by an EXPLICIT discriminant everywhere the kind
+ * flows -- never inferred from the presence or absence of a snapshot, which
+ * would silently reclassify a malformed snapshot-less approval as another
+ * park kind rather than failing loud.
+ */
+export const ControlParkKind = type.enumerated(
+  "approval",
+  "input",
+  "signal-relay",
+);
+export type ControlParkKind = typeof ControlParkKind.infer;
+
+/**
  * Maximum serialized size, in UTF-8 bytes, of an {@link ApprovalSnapshot} that
  * crosses a trust boundary. A tool `inputSchema` is normally single-digit KB;
  * a snapshot approaching this bound is malformed or hostile and is rejected at
@@ -699,7 +736,15 @@ export type LastCycleSource = typeof LastCycleSource.infer;
  *
  * (INFERENCE.md § Message Format › Content Types)
  */
-const TextBlock = type({ type: "'text'", text: "string" });
+const TextBlock = type({
+  type: "'text'",
+  text: "string",
+  // Opaque provider signature authenticating this block, echoed back
+  // verbatim on follow-up turns. Gemini attaches a `thoughtSignature` to
+  // output parts (including plain text); absent for providers that do not
+  // sign this block kind.
+  "signature?": "string",
+});
 
 /**
  * How a media payload is carried by a content block. One of three
@@ -740,6 +785,10 @@ export type MediaSource = typeof MediaSource.infer;
 export const ImageBlock = type({
   type: "'image'",
   source: MediaSource,
+  // Opaque provider signature authenticating this block, echoed back
+  // verbatim on follow-up turns. Gemini rides a `thoughtSignature` on the
+  // inlineData part; absent otherwise.
+  "signature?": "string",
 });
 export type ImageBlock = typeof ImageBlock.infer;
 
@@ -756,6 +805,8 @@ const VideoBlock = type({
 const DocumentBlock = type({
   type: "'document'",
   source: MediaSource,
+  "title?": "string",
+  "context?": "string",
 });
 
 const ThinkingBlock = type({
@@ -816,6 +867,10 @@ const ToolCallBlock = type({
   id: "string",
   name: "string",
   arguments: "Record<string, unknown>",
+  // Opaque provider signature authenticating this block, echoed back
+  // verbatim on follow-up turns. Gemini rides a `thoughtSignature` on the
+  // functionCall part; absent otherwise.
+  "signature?": "string",
 });
 /**
  * Location of a citation's cited span within its source document.
@@ -876,6 +931,46 @@ export const CitationBlock = type({
 export type CitationBlock = typeof CitationBlock.infer;
 
 /**
+ * A structured safety signal on model output or request filtering.
+ *
+ * The name `SafetyRatingBlock` follows the issue vocabulary; the
+ * payload is derived from the first real Gemini capture that engaged
+ * the structured classifier (2026-07-28). That wire shape is
+ * prompt-level only:
+ *
+ *   `promptFeedback: { blockReason: "PROHIBITED_CONTENT" }`
+ *
+ * with no candidates and no per-category `safetyRatings` arrays. So
+ * this block carries `blockReason` and does **not** invent category /
+ * probability / blocked fields. When a future capture surfaces
+ * candidate-level ratings, extend the type from those bytes rather
+ * than from the API reference.
+ *
+ * Deliberately excluded from ToolResultBlock.content — safety
+ * signals annotate model/request filtering, not tool output.
+ *
+ * Exported because `inference.safety_rating` events reference it by
+ * name.
+ */
+export const SafetyRatingBlock = type({
+  type: "'safety_rating'",
+  // Provider-native block reason string (observed: "PROHIBITED_CONTENT").
+  // Open string so a new reason token does not force a type bump.
+  blockReason: "string > 0",
+});
+export type SafetyRatingBlock = typeof SafetyRatingBlock.infer;
+
+/**
+ * Human-readable rendering of a SafetyRatingBlock for reply text,
+ * timeline summaries, and request-history rewrites when a provider
+ * has no input wire shape for safety_rating. Single owner of the
+ * display string so reply / history / transform stay in lockstep.
+ */
+export function formatSafetyRatingText(block: SafetyRatingBlock): string {
+  return `Request blocked: ${block.blockReason}`;
+}
+
+/**
  * The model's request to execute code via a server-side execution tool.
  * Paired with a CodeExecutionResultBlock carrying the same `id` as the
  * result's `requestId`. Streaming order within a single execution is
@@ -902,6 +997,10 @@ export const CodeExecutionRequestBlock = type({
   // adapters MUST NOT default this — callers narrow on its
   // presence rather than fall through to a guessed language.
   "language?": "string",
+  // Opaque provider signature authenticating this block, echoed back
+  // verbatim on follow-up turns. Gemini rides a `thoughtSignature` on the
+  // executableCode part; absent otherwise.
+  "signature?": "string",
 });
 export type CodeExecutionRequestBlock = typeof CodeExecutionRequestBlock.infer;
 
@@ -956,9 +1055,10 @@ const ToolResultBlock = type({
   type: "'tool_result'",
   callId: "string",
   // Deliberately narrow: tool results carry user-facing media, not
-  // CitationBlocks (citations annotate the model's text output) and
-  // not CodeExecution blocks (server-side code execution is a
-  // distinct lifecycle from the user-tool round-trip).
+  // CitationBlocks (citations annotate the model's text output), not
+  // SafetyRatingBlocks (safety signals annotate model/request
+  // filtering), and not CodeExecution blocks (server-side code
+  // execution is a distinct lifecycle from the user-tool round-trip).
   content: TextBlock.or(ImageBlock)
     .or(AudioBlock)
     .or(VideoBlock)
@@ -976,6 +1076,7 @@ export const ContentBlock = TextBlock.or(ThinkingBlock)
   .or(VideoBlock)
   .or(DocumentBlock)
   .or(CitationBlock)
+  .or(SafetyRatingBlock)
   .or(CodeExecutionRequestBlock)
   .or(CodeExecutionResultBlock)
   .or(ToolCallBlock)
@@ -1110,7 +1211,7 @@ export const InferenceEvent = type({
     },
   })
   .or({
-    type: "'inference.thinking.signature'",
+    type: "'inference.block.signature'",
     seq: "number",
     data: { signature: "string", "index?": "number" },
   })
@@ -1209,6 +1310,15 @@ export const InferenceEvent = type({
     // `content[]` and consumers attribute them to the nearest
     // preceding TextBlock per the CitationBlock docstring.
     data: { citation: CitationBlock, "index?": "number" },
+  })
+  .or({
+    type: "'inference.safety_rating'",
+    seq: "number",
+    // Prompt-level structured safety signal (observed Gemini
+    // `promptFeedback.blockReason`). No candidate index: the first
+    // capture has zero candidates. Harness appends the block to the
+    // finalized turn's `content[]`.
+    data: { safetyRating: SafetyRatingBlock },
   })
   .or({
     type: "'inference.code_execution.start'",
@@ -1373,7 +1483,7 @@ export type InferenceEvent =
       data: { token: string; partial: PartialMessage; index?: number };
     }
   | {
-      type: "inference.thinking.signature";
+      type: "inference.block.signature";
       seq: number;
       data: { signature: string; index?: number };
     }
@@ -1465,6 +1575,11 @@ export type InferenceEvent =
       type: "inference.citation";
       seq: number;
       data: { citation: CitationBlock; index?: number };
+    }
+  | {
+      type: "inference.safety_rating";
+      seq: number;
+      data: { safetyRating: SafetyRatingBlock };
     }
   | {
       type: "inference.code_execution.start";
@@ -2326,10 +2441,10 @@ export type InferenceOptions = {
    * Modalities the caller wants the model to emit. Adapters translate
    * to the provider-native shape (Gemini's
    * `generationConfig.responseModalities` accepts `"TEXT"` / `"IMAGE"`
-   * uppercase; see `packages/inference-discovery-google-genai/wire/
-   * google-genai/gemini-2.5-flash-image/image-output/request.json` for
-   * the captured
-   * shape). Providers that do not expose a modality switch ignore the
+   * uppercase; see `packages/inference-discovery-google-genai/sessions/
+   * google-genai/gemini-2.5-flash-image/image-output/exchanges/0/request.json`
+   * for the captured shape). Providers that do not expose a modality
+   * switch ignore the
    * field. When omitted the provider's default modalities apply.
    */
   responseModalities?: ("text" | "image" | "audio")[];

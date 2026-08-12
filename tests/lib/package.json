@@ -14,13 +14,36 @@
       "types": "./db-harness.ts",
       "default": "./db-harness.ts"
     },
+    "./db-provision": {
+      "types": "./db-provision.ts",
+      "default": "./db-provision.ts"
+    },
+    "./grants": {
+      "types": "./grants.ts",
+      "default": "./grants.ts"
+    },
+    "./http": {
+      "types": "./http.ts",
+      "default": "./http.ts"
+    },
+    "./bun-server": {
+      "types": "./bun-server.ts",
+      "default": "./bun-server.ts"
+    },
     "./seed": {
       "types": "./seed.ts",
       "default": "./seed.ts"
+    },
+    "./crypto": {
+      "types": "./crypto.ts",
+      "default": "./crypto.ts"
     }
   },
   "dependencies": {
+    "@intx/crypto": "workspace:*",
     "@intx/db": "workspace:*",
-    "drizzle-orm": "catalog:"
+    "@intx/types": "workspace:*",
+    "drizzle-orm": "catalog:",
+    "postgres": "catalog:"
   }
 }

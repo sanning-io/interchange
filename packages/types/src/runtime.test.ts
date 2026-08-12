@@ -5,6 +5,7 @@ import {
   APPROVAL_SNAPSHOT_MAX_BYTES,
   BoundedApprovalSnapshot,
   ContentBlock,
+  formatSafetyRatingText,
   InferenceEvent,
   MediaSource,
   TransformRecord,
@@ -737,6 +738,73 @@ describe("inference.citation event", () => {
   });
 });
 
+describe("SafetyRatingBlock", () => {
+  // Captured Gemini shape (2026-07-28): promptFeedback.blockReason only.
+  test("accepts a block with the captured PROHIBITED_CONTENT reason", () => {
+    const result = ContentBlock({
+      type: "safety_rating",
+      blockReason: "PROHIBITED_CONTENT",
+    });
+    expect(result instanceof type.errors).toBe(false);
+  });
+
+  test("rejects a safety_rating block missing blockReason", () => {
+    const result = ContentBlock({ type: "safety_rating" });
+    expect(result instanceof type.errors).toBe(true);
+  });
+
+  test("rejects an empty blockReason", () => {
+    const result = ContentBlock({
+      type: "safety_rating",
+      blockReason: "",
+    });
+    expect(result instanceof type.errors).toBe(true);
+  });
+
+  test("rejects a safety_rating block inside a tool_result content array", () => {
+    const result = ContentBlock({
+      type: "tool_result",
+      callId: "call_abc",
+      content: [{ type: "safety_rating", blockReason: "PROHIBITED_CONTENT" }],
+    });
+    expect(result instanceof type.errors).toBe(true);
+  });
+
+  test("formatSafetyRatingText owns the display string", () => {
+    expect(
+      formatSafetyRatingText({
+        type: "safety_rating",
+        blockReason: "PROHIBITED_CONTENT",
+      }),
+    ).toBe("Request blocked: PROHIBITED_CONTENT");
+  });
+});
+
+describe("inference.safety_rating event", () => {
+  test("accepts an inference.safety_rating event wrapping a SafetyRatingBlock", () => {
+    const result = InferenceEvent({
+      type: "inference.safety_rating",
+      seq: 3,
+      data: {
+        safetyRating: {
+          type: "safety_rating",
+          blockReason: "PROHIBITED_CONTENT",
+        },
+      },
+    });
+    expect(result instanceof type.errors).toBe(false);
+  });
+
+  test("rejects an inference.safety_rating event missing the payload", () => {
+    const result = InferenceEvent({
+      type: "inference.safety_rating",
+      seq: 3,
+      data: {},
+    });
+    expect(result instanceof type.errors).toBe(true);
+  });
+});
+
 describe("CodeExecutionRequestBlock and CodeExecutionResultBlock", () => {
   test("accepts a minimal code_execution_request", () => {
     const result = ContentBlock({
@@ -960,8 +1028,8 @@ describe("optional index on delta event variants", () => {
         data: { token: "x", partial },
       },
       {
-        name: "inference.thinking.signature",
-        type: "inference.thinking.signature",
+        name: "inference.block.signature",
+        type: "inference.block.signature",
         data: { signature: "sig_abc" },
       },
       {

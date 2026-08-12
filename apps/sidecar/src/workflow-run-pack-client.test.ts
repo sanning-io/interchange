@@ -1,6 +1,7 @@
 import { describe, test, expect } from "bun:test";
 
 import type { InferenceSource } from "@intx/types/runtime";
+import type { CredentialDelivery } from "@intx/types/sidecar";
 import type { RepoId, RepoStore } from "@intx/hub-sessions";
 
 import {
@@ -9,6 +10,7 @@ import {
   createMultistepMailRouter,
   createMultistepSignalRouter,
   createMultistepSourcesRouter,
+  createMultistepCredentialsRouter,
   createWorkflowRunPackClient,
   createWorkflowRunPackPushingRepoStore,
 } from "./workflow-run-pack-client";
@@ -564,64 +566,171 @@ describe("createWorkflowRunPackPushingRepoStore", () => {
 });
 
 describe("createMultistepMailRouter", () => {
-  test("tryRoute returns false when no handler is registered", () => {
+  test("tryRoute returns null when no handler is registered", () => {
     const router = createMultistepMailRouter();
     expect(
       router.tryRoute("dep@integration.interchange", new Uint8Array([1])),
-    ).toBe(false);
+    ).toBeNull();
   });
 
-  test("a registered handler receives the inbound message and tryRoute returns true", () => {
+  test("a registered handler receives the inbound message and tryRoute returns its settlement", async () => {
     const router = createMultistepMailRouter();
     const received: Uint8Array[] = [];
-    router.register("dep@integration.interchange", (msg) => {
+    router.register("dep@integration.interchange", async (msg) => {
       received.push(msg);
     });
     const message = new Uint8Array([1, 2, 3, 4]);
-    const claimed = router.tryRoute("dep@integration.interchange", message);
-    expect(claimed).toBe(true);
+    const durable = router.tryRoute("dep@integration.interchange", message);
+    expect(durable).not.toBeNull();
+    await durable;
     expect(received).toHaveLength(1);
     expect(received[0]).toEqual(message);
+  });
+
+  test("tryRoute propagates the handler's rejection as the withhold signal", async () => {
+    const router = createMultistepMailRouter();
+    router.register("dep@integration.interchange", async () => {
+      throw new Error("durable write failed");
+    });
+    const durable = router.tryRoute(
+      "dep@integration.interchange",
+      new Uint8Array([1]),
+    );
+    expect(durable).not.toBeNull();
+    await expect(durable).rejects.toThrow(/durable write failed/);
   });
 
   test("registration is per-address; an unrelated address falls through", () => {
     const router = createMultistepMailRouter();
     const received: Uint8Array[] = [];
-    router.register("dep-a@integration.interchange", (msg) => {
+    router.register("dep-a@integration.interchange", async (msg) => {
       received.push(msg);
     });
     expect(
       router.tryRoute("dep-b@integration.interchange", new Uint8Array([9])),
-    ).toBe(false);
+    ).toBeNull();
     expect(received).toHaveLength(0);
   });
 
   test("unregister removes the handler", () => {
     const router = createMultistepMailRouter();
     const received: Uint8Array[] = [];
-    router.register("dep@integration.interchange", (msg) => {
+    router.register("dep@integration.interchange", async (msg) => {
       received.push(msg);
     });
     router.unregister("dep@integration.interchange");
     expect(
       router.tryRoute("dep@integration.interchange", new Uint8Array([1])),
-    ).toBe(false);
+    ).toBeNull();
     expect(received).toHaveLength(0);
   });
 
-  test("re-registering an address replaces the prior handler", () => {
+  test("re-registering an address replaces the prior handler", async () => {
     const router = createMultistepMailRouter();
     const first: Uint8Array[] = [];
     const second: Uint8Array[] = [];
-    router.register("dep@integration.interchange", (msg) => {
+    router.register("dep@integration.interchange", async (msg) => {
       first.push(msg);
     });
-    router.register("dep@integration.interchange", (msg) => {
+    router.register("dep@integration.interchange", async (msg) => {
       second.push(msg);
     });
-    router.tryRoute("dep@integration.interchange", new Uint8Array([7]));
+    await router.tryRoute("dep@integration.interchange", new Uint8Array([7]));
     expect(first).toHaveLength(0);
     expect(second).toHaveLength(1);
+  });
+});
+
+describe("createMultistepCredentialsRouter", () => {
+  const delivery = {
+    bindings: [
+      {
+        handle: "example-api",
+        credentialId: "cred_1",
+        consumer: "tool:@intx/tools-example",
+      },
+    ],
+    materials: [
+      {
+        credentialId: "cred_1",
+        providerKey: "http",
+        origin: "https://api.example.com",
+        secret: "sk-secret",
+      },
+    ],
+  };
+  const frame = {
+    type: "credentials.update" as const,
+    agentAddress: "dep@integration.interchange",
+    delivery,
+  };
+
+  test("tryRoute returns false when no handler is registered", async () => {
+    const router = createMultistepCredentialsRouter();
+    expect(await router.tryRoute(frame)).toBe(false);
+  });
+
+  test("a registered handler receives the delivery and tryRoute returns true", async () => {
+    const router = createMultistepCredentialsRouter();
+    const received: { delivery: typeof delivery }[] = [];
+    router.register("dep@integration.interchange", async (args) => {
+      received.push(args);
+    });
+    expect(await router.tryRoute(frame)).toBe(true);
+    expect(received).toHaveLength(1);
+    expect(received[0]?.delivery).toEqual(delivery);
+  });
+
+  test("registration is per-address; an unrelated address falls through", async () => {
+    const router = createMultistepCredentialsRouter();
+    router.register("dep-a@integration.interchange", async () => undefined);
+    expect(
+      await router.tryRoute({
+        ...frame,
+        agentAddress: "dep-b@integration.interchange",
+      }),
+    ).toBe(false);
+  });
+
+  test("unregister removes the handler", async () => {
+    const router = createMultistepCredentialsRouter();
+    router.register("dep@integration.interchange", async () => undefined);
+    router.unregister("dep@integration.interchange");
+    expect(await router.tryRoute(frame)).toBe(false);
+  });
+
+  test("rejects a malformed delivery for a registered address without dispatching", async () => {
+    const router = createMultistepCredentialsRouter();
+    let called = false;
+    router.register("dep@integration.interchange", async () => {
+      called = true;
+    });
+    // A malformed delivery would crash the child's control-channel receiver on
+    // its `CredentialsUpdateFrame` narrow, so the router rejects before
+    // dispatch and the hub-link turns the throw into a truthful session.error.
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- deliberately malformed delivery to exercise the pre-dispatch validation
+    const malformed = {
+      bindings: [{ handle: "x" }],
+      materials: [],
+    } as unknown as CredentialDelivery;
+    await expect(
+      router.tryRoute({
+        type: "credentials.update",
+        agentAddress: "dep@integration.interchange",
+        delivery: malformed,
+      }),
+    ).rejects.toThrow();
+    expect(called).toBe(false);
+  });
+
+  test("propagates the handler's rejection (deliverCredentials throwing) verbatim", async () => {
+    const router = createMultistepCredentialsRouter();
+    router.register("dep@integration.interchange", async () => {
+      throw new Error("deliverCredentials failed in a recycling phase");
+    });
+    await expect(router.tryRoute(frame)).rejects.toThrow(
+      /deliverCredentials failed/,
+    );
   });
 });
 

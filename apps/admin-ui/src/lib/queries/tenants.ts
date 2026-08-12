@@ -65,42 +65,10 @@ type RoleResponse = {
   updatedAt: string;
 };
 
-type CredentialRequirement = {
-  providerName: string;
-  scopes?: string[];
-  source: "tenant" | "creator" | "invoker";
-  name?: string;
-};
-
-type GrantRequirement = {
-  resource: string;
-  action: string;
-  effect?: "allow" | "deny" | "ask";
-  source: "tenant" | "creator" | "invoker";
-  conditions?: Record<string, unknown> | null;
-};
-
-export type AgentResponse = {
+export type WorkflowRunResponse = {
   id: string;
-  tenantId: string;
-  creatorPrincipalId: string;
-  name: string;
-  description: string | null;
-  systemPrompt: string | null;
-  status: "deployed" | "stopped";
-  currentVersion: string;
-  capabilities: Record<string, unknown> | null;
-  credentialRequirements?: CredentialRequirement[];
-  grantRequirements?: GrantRequirement[];
-  roles?: { id: string; name: string }[];
-  createdAt: string;
-  updatedAt: string;
-};
-
-export type AgentInstanceResponse = {
-  id: string;
-  agentId: string;
-  agentName: string;
+  definitionId: string;
+  definitionName: string;
   tenantId: string;
   address: string;
   status: "deployed" | "running" | "updating" | "error" | "stopped";
@@ -190,6 +158,19 @@ export type WorkflowAssetResponse = {
 
 export type WorkflowDefinitionResponse = WorkflowAssetResponse & {
   origin: { tenantId: string; direct: boolean };
+};
+
+// A row from GET /workflows/definitions -- a first-class workflow_definition,
+// distinct from the workflow *asset* WorkflowDefinitionResponse above describes.
+export type WorkflowDefinitionListItem = {
+  id: string;
+  tenantId: string;
+  name: string;
+  description: string | null;
+  currentVersion: string;
+  status: string;
+  createdAt: string;
+  updatedAt: string;
 };
 
 export type { WorkflowDeployment, WorkflowRunEvent, WorkflowRunEvents };
@@ -307,34 +288,16 @@ export function tenantRolesInfiniteQuery(tenantId: string) {
   );
 }
 
-export function tenantAgentsQuery(tenantId: string) {
+export function tenantDefinitionsQuery(tenantId: string) {
   return queryOptions({
-    queryKey: ["tenants", tenantId, "agents"],
+    queryKey: ["tenants", tenantId, "definitions"],
     queryFn: async () => {
-      const res = await api<{ data: AgentResponse[] }>(
+      const res = await api<{ data: WorkflowDefinitionListItem[] }>(
         "GET",
-        `/api/tenants/${tenantId}/agents/definitions`,
+        `/api/tenants/${tenantId}/workflows/definitions`,
       );
       return res.data;
     },
-  });
-}
-
-export function tenantAgentsInfiniteQuery(tenantId: string) {
-  return infiniteListQuery<AgentResponse>(
-    ["tenants", tenantId, "agents", INFINITE_LIST_KEY],
-    `/api/tenants/${tenantId}/agents/definitions`,
-  );
-}
-
-export function agentDetailQuery(tenantId: string, agentId: string) {
-  return queryOptions({
-    queryKey: ["tenants", tenantId, "agents", agentId],
-    queryFn: () =>
-      api<AgentResponse>(
-        "GET",
-        `/api/tenants/${tenantId}/agents/definitions/${agentId}`,
-      ),
   });
 }
 
@@ -375,46 +338,33 @@ export function approvalDetailQuery(tenantId: string, approvalId: string) {
   });
 }
 
-export function tenantInstancesQuery(tenantId: string) {
+export function tenantRunsQuery(tenantId: string) {
   return queryOptions({
-    queryKey: ["tenants", tenantId, "instances", { status: "running" }],
+    queryKey: ["tenants", tenantId, "runs", { status: "running" }],
     queryFn: async () => {
-      const res = await api<{ data: AgentInstanceResponse[] }>(
+      const res = await api<{ data: WorkflowRunResponse[] }>(
         "GET",
-        `/api/tenants/${tenantId}/agents/instances?status=running`,
+        `/api/tenants/${tenantId}/workflows/runs?status=running`,
       );
       return res.data;
     },
   });
 }
 
-export function tenantInstancesInfiniteQuery(tenantId: string) {
-  return infiniteListQuery<AgentInstanceResponse>(
-    ["tenants", tenantId, "instances", INFINITE_LIST_KEY],
-    `/api/tenants/${tenantId}/agents/instances?status=running`,
+export function tenantRunsInfiniteQuery(tenantId: string) {
+  return infiniteListQuery<WorkflowRunResponse>(
+    ["tenants", tenantId, "runs", INFINITE_LIST_KEY],
+    `/api/tenants/${tenantId}/workflows/runs?status=running`,
   );
 }
 
-export function agentAllInstancesQuery(tenantId: string, agentId: string) {
+export function runDetailQuery(tenantId: string, runId: string) {
   return queryOptions({
-    queryKey: ["tenants", tenantId, "instances", { agentId }],
-    queryFn: async () => {
-      const res = await api<{ data: AgentInstanceResponse[] }>(
-        "GET",
-        `/api/tenants/${tenantId}/agents/instances?agentId=${agentId}`,
-      );
-      return res.data;
-    },
-  });
-}
-
-export function instanceDetailQuery(tenantId: string, instanceId: string) {
-  return queryOptions({
-    queryKey: ["tenants", tenantId, "instances", instanceId],
+    queryKey: ["tenants", tenantId, "runs", runId],
     queryFn: () =>
-      api<AgentInstanceResponse>(
+      api<WorkflowRunResponse>(
         "GET",
-        `/api/tenants/${tenantId}/agents/instances/${instanceId}`,
+        `/api/tenants/${tenantId}/workflows/runs/${runId}`,
       ),
     refetchInterval: 3000,
   });
@@ -728,92 +678,14 @@ export function deletePrincipalMutation(
   };
 }
 
-// Agents
-
-type CreateAgentBody = {
-  name: string;
-  description?: string;
-  systemPrompt?: string;
-};
-
-type UpdateAgentBody = {
-  name?: string;
-  description?: string;
-  systemPrompt?: string;
-  credentialRequirements?: CredentialRequirement[];
-  grantRequirements?: GrantRequirement[];
-  roleIds?: string[];
-};
-
-export function createAgentMutation(tenantId: string, qc: QueryClient) {
+export function stopRunMutation(tenantId: string, qc: QueryClient) {
   return {
-    mutationFn: (body: CreateAgentBody) =>
-      api<AgentResponse>(
-        "POST",
-        `/api/tenants/${tenantId}/agents/definitions`,
-        body,
-      ),
-    onSuccess: () => invalidate(qc, tenantId, "agents"),
-  };
-}
-
-export function updateAgentMutation(
-  tenantId: string,
-  agentId: string,
-  qc: QueryClient,
-) {
-  return {
-    mutationFn: (body: UpdateAgentBody) =>
-      api<AgentResponse>(
-        "PATCH",
-        `/api/tenants/${tenantId}/agents/definitions/${agentId}`,
-        body,
-      ),
-    onSuccess: () => invalidate(qc, tenantId, "agents"),
-  };
-}
-
-export function deleteAgentMutation(
-  tenantId: string,
-  agentId: string,
-  qc: QueryClient,
-) {
-  return {
-    mutationFn: () =>
+    mutationFn: (runId: string) =>
       api<undefined>(
         "DELETE",
-        `/api/tenants/${tenantId}/agents/definitions/${agentId}`,
+        `/api/tenants/${tenantId}/workflows/runs/${runId}`,
       ),
-    onSuccess: () => invalidate(qc, tenantId, "agents"),
-  };
-}
-
-export function deployInstanceMutation(tenantId: string, qc: QueryClient) {
-  return {
-    mutationFn: (body: { agentId: string }) =>
-      api<AgentInstanceResponse>(
-        "POST",
-        `/api/tenants/${tenantId}/agents/instances`,
-        body,
-      ),
-    onSuccess: () => {
-      void invalidate(qc, tenantId, "instances");
-      void invalidate(qc, tenantId, "agents");
-    },
-  };
-}
-
-export function stopInstanceMutation(tenantId: string, qc: QueryClient) {
-  return {
-    mutationFn: (instanceId: string) =>
-      api<undefined>(
-        "DELETE",
-        `/api/tenants/${tenantId}/agents/instances/${instanceId}`,
-      ),
-    onSuccess: () => {
-      void invalidate(qc, tenantId, "instances");
-      void invalidate(qc, tenantId, "agents");
-    },
+    onSuccess: () => invalidate(qc, tenantId, "runs"),
   };
 }
 

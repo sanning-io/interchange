@@ -34,6 +34,8 @@ const AnthropicContentBlock = type({
   // AnthropicMediaSourceBase64 / AnthropicMediaSourceFile at each
   // test site rather than baking the union here.
   "source?": "unknown",
+  "title?": "string",
+  "context?": "string",
   "cache_control?": { type: "string" },
 });
 
@@ -60,7 +62,11 @@ const AnthropicMessage = type({
 
 const AnthropicThinking = type({
   type: "string",
-  budget_tokens: "number",
+  "budget_tokens?": "number",
+});
+
+const AnthropicOutputConfig = type({
+  effort: "string",
 });
 
 const AnthropicTool = type({
@@ -83,6 +89,7 @@ const AnthropicRequestBody = type({
   stream: "boolean",
   "system?": AnthropicSystemBlock.array(),
   "thinking?": AnthropicThinking,
+  "output_config?": AnthropicOutputConfig,
   "tools?": AnthropicTool.array(),
   "temperature?": "number",
 });
@@ -194,7 +201,7 @@ describe("Anthropic adapter: buildRequest", () => {
     ]);
   });
 
-  test("includes thinking config when enabled", () => {
+  test("includes classic thinking config when enabled on budget-token models", () => {
     const messages: ConversationTurn[] = [
       {
         role: "user",
@@ -209,6 +216,30 @@ describe("Anthropic adapter: buildRequest", () => {
     const body = AnthropicRequestBody.assert(JSON.parse(req.body));
     expect(body.thinking?.type).toBe("enabled");
     expect(body.thinking?.budget_tokens).toBe(2048);
+    expect(body.output_config).toBeUndefined();
+  });
+
+  test("uses adaptive thinking for sonnet-5, opus-5, and fable-5", () => {
+    const messages: ConversationTurn[] = [
+      {
+        role: "user",
+        content: [{ type: "text", text: "Think deeply." }],
+        timestamp: 1000,
+      },
+    ];
+    for (const model of [
+      "claude-sonnet-5",
+      "claude-opus-5",
+      "claude-fable-5",
+    ] as const) {
+      const req = adapter.buildRequest(messages, model, {
+        thinking: { enabled: true, budgetTokens: 2048 },
+      });
+      const body = AnthropicRequestBody.assert(JSON.parse(req.body));
+      expect(body.thinking).toEqual({ type: "adaptive" });
+      expect(body.thinking).not.toHaveProperty("budget_tokens");
+      expect(body.output_config).toEqual({ effort: "high" });
+    }
   });
 
   test("echoes thinking block signature back in the request body", () => {
@@ -515,6 +546,77 @@ describe("Anthropic adapter: buildRequest", () => {
     expect(source.data).toBe("JVBERi0xLjQK");
   });
 
+  test("emits document title and context when present", () => {
+    // Grounded against a live Anthropic probe that accepted title and
+    // context as siblings of source on the document content block.
+    const messages: ConversationTurn[] = [
+      {
+        role: "user",
+        content: [
+          {
+            type: "document",
+            source: {
+              kind: "base64",
+              mimeType: "application/pdf",
+              data: "JVBERi0xLjQK",
+            },
+            title: "Q3 Invoice",
+            context:
+              "Internal accounting document used to test citation grounding.",
+          },
+        ],
+        timestamp: 1000,
+      },
+    ];
+
+    const req = adapter.buildRequest(
+      messages,
+      "claude-3-5-sonnet-20241022",
+      {},
+    );
+    const body = AnthropicRequestBody.assert(JSON.parse(req.body));
+    const block = body.messages[0]?.content[0];
+    if (block?.type !== "document") {
+      throw new Error("expected document block in the request");
+    }
+    expect(block.title).toBe("Q3 Invoice");
+    expect(block.context).toBe(
+      "Internal accounting document used to test citation grounding.",
+    );
+  });
+
+  test("drops document title and context when absent", () => {
+    const messages: ConversationTurn[] = [
+      {
+        role: "user",
+        content: [
+          {
+            type: "document",
+            source: {
+              kind: "base64",
+              mimeType: "application/pdf",
+              data: "JVBERi0xLjQK",
+            },
+          },
+        ],
+        timestamp: 1000,
+      },
+    ];
+
+    const req = adapter.buildRequest(
+      messages,
+      "claude-3-5-sonnet-20241022",
+      {},
+    );
+    const body = AnthropicRequestBody.assert(JSON.parse(req.body));
+    const block = body.messages[0]?.content[0];
+    if (block?.type !== "document") {
+      throw new Error("expected document block in the request");
+    }
+    expect(block).not.toHaveProperty("title");
+    expect(block).not.toHaveProperty("context");
+  });
+
   test("emits a file-reference document as { type: file, file_id }", () => {
     const messages: ConversationTurn[] = [
       {
@@ -612,6 +714,49 @@ describe("Anthropic adapter: buildRequest", () => {
       );
     },
   );
+
+  test("rewrites safety_rating history to text for request marshaling", () => {
+    const messages: ConversationTurn[] = [
+      {
+        role: "user",
+        content: [{ type: "text", text: "blocked prompt" }],
+        timestamp: 1,
+      },
+      {
+        role: "assistant",
+        content: [{ type: "safety_rating", blockReason: "PROHIBITED_CONTENT" }],
+        model: "gemini-2.5-flash",
+        timestamp: 2,
+      },
+      {
+        role: "user",
+        content: [{ type: "text", text: "try again" }],
+        timestamp: 3,
+      },
+    ];
+    const req = adapter.buildRequest(
+      messages,
+      "claude-3-5-sonnet-20241022",
+      {},
+    );
+    const body = AnthropicRequestBody.assert(JSON.parse(req.body));
+    expect(body.messages).toHaveLength(3);
+    expect(body.messages.map((m) => m.role)).toEqual([
+      "user",
+      "assistant",
+      "user",
+    ]);
+    const assistant = body.messages[1];
+    if (assistant === undefined || !Array.isArray(assistant.content)) {
+      throw new Error("expected assistant content array");
+    }
+    const TextBlock = type({ type: "'text'", text: "string" });
+    const texts = assistant.content.flatMap((b) => {
+      const parsed = TextBlock(b);
+      return parsed instanceof type.errors ? [] : [parsed.text];
+    });
+    expect(texts).toContain("Request blocked: PROHIBITED_CONTENT");
+  });
 
   test("echoes a redacted_thinking content block back verbatim", () => {
     // Anthropic delivers redacted_thinking as a one-shot start event
@@ -877,7 +1022,7 @@ describe("Anthropic adapter: parseResponse", () => {
     }
   });
 
-  test("parses signature_delta into inference.thinking.signature", async () => {
+  test("parses signature_delta into inference.block.signature", async () => {
     // Anthropic emits the thinking-block signature after the thinking
     // content stream. The signature must be propagated end-to-end —
     // without it, follow-up turns that echo the thinking block are
@@ -891,8 +1036,8 @@ describe("Anthropic adapter: parseResponse", () => {
       }),
     ]);
     expect(events).toHaveLength(1);
-    expect(events[0]?.type).toBe("inference.thinking.signature");
-    if (events[0]?.type === "inference.thinking.signature") {
+    expect(events[0]?.type).toBe("inference.block.signature");
+    if (events[0]?.type === "inference.block.signature") {
       expect(events[0].data.signature).toBe("sig_abc123");
     }
   });

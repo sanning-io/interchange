@@ -60,7 +60,7 @@ import {
   grant as grantTable,
   principal as principalTable,
   tenant as tenantTable,
-  workflowDeployment as workflowDeploymentTable,
+  workflowDefinition as workflowDefinitionTable,
   workflowRun as workflowRunTable,
 } from "@intx/db/schema";
 import { createSSHSignature, generateKeyPair } from "@intx/crypto";
@@ -72,6 +72,8 @@ import {
   createRepoStore,
   workflowAuthorize,
   workflowKindHandler,
+  workflowRunAuthorize,
+  workflowRunKindHandler,
   type AuthorizeFn,
   type EventCollectorRegistry,
   type RepoStore,
@@ -209,6 +211,7 @@ function createRoutingSidecarRouter(): SidecarRouter {
     sendAgentDeploy: () => notImplRouter("sendAgentDeploy"),
     sendAgentUndeploy: () => notImplRouter("sendAgentUndeploy"),
     sendSourcesUpdate: () => notImplRouter("sendSourcesUpdate"),
+    sendCredentialsUpdate: () => notImplRouter("sendCredentialsUpdate"),
     sendPack: () => notImplRouter("sendPack"),
     sendProvisionStep: () => notImplRouter("sendProvisionStep"),
     bindStepRoute: () => notImplRouter("bindStepRoute"),
@@ -236,12 +239,18 @@ async function createWorkflowRepoStore(): Promise<RepoStore> {
     if (repoId.kind === "workflow") {
       return workflowAuthorize(principal, repoId, ref, act);
     }
+    if (repoId.kind === "workflow-run") {
+      return workflowRunAuthorize(principal, repoId, ref, act);
+    }
     return { allowed: false, reason: `no authorize for ${repoId.kind}` };
   };
   return createRepoStore({
     dataDir,
     signingKey,
-    handlers: { workflow: workflowKindHandler },
+    handlers: {
+      workflow: workflowKindHandler,
+      "workflow-run": workflowRunKindHandler,
+    },
     authorize,
     signingCallback: () => signer,
   });
@@ -339,13 +348,21 @@ describe.skipIf(!harnessDbEnvAvailable())(
           principalId: CREATOR_PRINCIPAL_ID,
         });
       }
-      await h.db.insert(workflowDeploymentTable).values({
+      // The deployment's first-class definition and its anchor run: the trigger
+      // route reads the workflow asset and the run's definition off the anchor.
+      await h.db.insert(workflowDefinitionTable).values({
+        id: `wfd_${opts.deploymentId}`,
+        tenantId: TENANT_ID,
+        name: opts.deploymentId,
+        assetId,
+      });
+      await h.db.insert(workflowRunTable).values({
         id: opts.deploymentId,
         tenantId: TENANT_ID,
-        definitionAssetId: assetId,
+        deploymentId: opts.deploymentId,
+        definitionId: `wfd_${opts.deploymentId}`,
         address,
-        publicKey: null,
-        status: "deployed",
+        status: "running",
       });
 
       await repoStore.initRepo({ kind: "workflow", id: assetId });
@@ -396,7 +413,10 @@ describe.skipIf(!harnessDbEnvAvailable())(
         );
       }
       const json = TriggerResponse.assert(await res.json());
-      const runId = json.messageId;
+      // The run is keyed on the deployment's mail address (the stable
+      // runId the route returns as `address`), not this message's
+      // Message-ID.
+      const runId = json.address;
 
       // The run principal and run row committed.
       const principals = await h.db
@@ -470,8 +490,11 @@ describe.skipIf(!harnessDbEnvAvailable())(
         );
       expect(runPrincipals).toHaveLength(0);
 
+      // Only the deployment's seeded anchor run (id == deploymentId) exists;
+      // the rejected trigger committed no child run of its own.
       const runs = await h.db.select().from(workflowRunTable);
-      expect(runs).toHaveLength(0);
+      const childRuns = runs.filter((r) => r.id !== r.deploymentId);
+      expect(childRuns).toHaveLength(0);
 
       // The only grants present are the seeded caller manage grant; no run
       // grant row was committed.

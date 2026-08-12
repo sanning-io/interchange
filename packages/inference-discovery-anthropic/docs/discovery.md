@@ -8,7 +8,7 @@ plug-in. For each captured capability we contrast Anthropic's published
 shape against the bytes the API actually emitted and call out every
 place the two diverged.
 
-The capture corpus lives at `packages/inference-discovery-anthropic/wire/anthropic/`.
+The capture corpus lives at `packages/inference-discovery-anthropic/sessions/anthropic/`.
 The model-to-capability matrix is authoritatively defined in the
 `SUPPORT_MATRIX` export of `@intx/inference-discovery/catalog`
 (`packages/inference-discovery/src/catalog/support-matrix.ts`). The
@@ -19,8 +19,8 @@ the wire wins. This document is the narrative companion to those bytes.
 
 The per-(model, capability) behaviors documented below are the
 _narrative_ layer. The _canonical_ representation is the typed
-`SUPPORT_MATRIX`. Tooling — the discovery rig, INTR-79's compat-replay
-layer, and any future readers — must consume the matrix
+`SUPPORT_MATRIX`. Tooling — the discovery rig, the session
+parser-regression, and any future readers — must consume the matrix
 programmatically, not parse this prose. When this document and the
 matrix disagree, the matrix wins.
 
@@ -33,18 +33,27 @@ with `x-api-key`. Per-capability beta flags
 `anthropic-beta: code-execution-2025-05-22`) live on the per-step
 headers map for the steps that need them, not in `buildAuthHeaders`.
 
-`claude-sonnet-5` rejects the classic
-`thinking: {type: "enabled", budget_tokens}` shape and requires the
-adaptive shape `thinking: {type: "adaptive"}` paired with
+`claude-sonnet-5`, `claude-opus-5`, and `claude-fable-5` reject the
+classic `thinking: {type: "enabled", budget_tokens}` shape and require
+the adaptive shape `thinking: {type: "adaptive"}` paired with
 `output_config: {effort}`; the request builder selects the shape by
-model. The three earlier models still use the classic shape.
+model. `claude-haiku-4-5-20251001` still uses the classic shape.
 
-| Model                        | Tier      | Extended thinking | Vision | Document input | Code execution | Web search |
-| ---------------------------- | --------- | ----------------- | ------ | -------------- | -------------- | ---------- |
-| `claude-sonnet-5`            | Workhorse | yes (adaptive)    | yes    | yes            | yes            | yes        |
-| `claude-sonnet-4-5-20250929` | Workhorse | yes               | yes    | yes            | yes            | yes        |
-| `claude-opus-4-1-20250805`   | Flagship  | yes               | yes    | yes            | yes            | yes        |
-| `claude-haiku-4-5-20251001`  | Cheap     | yes               | yes    | yes            | yes            | yes        |
+On the adaptive shape the rig sends `output_config: {effort: "max"}`
+deliberately: only `max` reliably elicits a thinking block to capture
+(the lower effort levels are non-deterministic about whether the model
+thinks). This is a capture-time choice and does not mirror the
+production effort, which is the lower API default (see
+`ADAPTIVE_THINKING_EFFORT` in the runtime adapter). The committed
+adaptive fixtures therefore carry `max`, not the production effort
+value. A guard test checks both the runtime and capture effort values.
+
+| Model                       | Tier      | Extended thinking | Vision | Document input | Code execution | Web search |
+| --------------------------- | --------- | ----------------- | ------ | -------------- | -------------- | ---------- |
+| `claude-fable-5`            | Flagship  | yes (adaptive)    | yes    | yes            | yes            | yes        |
+| `claude-opus-5`             | Flagship  | yes (adaptive)    | yes    | yes            | yes            | yes        |
+| `claude-sonnet-5`           | Workhorse | yes (adaptive)    | yes    | yes            | yes            | yes        |
+| `claude-haiku-4-5-20251001` | Cheap     | yes (budget)      | yes    | yes            | yes            | yes        |
 
 Anthropic does not expose audio input, video input, or image output on
 any first-party model, so those entries land as `outcome: "unsupported"`
@@ -57,7 +66,7 @@ in `SUPPORT_MATRIX` with self-contained notes explaining why.
 **Documented:** `POST /v1/messages` with `{model, max_tokens, messages: [{role: "user", content: <string>}]}`.
 Streaming sets `stream: true` and emits a named SSE event stream.
 
-**Observed** (`wire/anthropic/claude-sonnet-4-5-20250929/plain-text/`):
+**Observed** (`sessions/anthropic/claude-sonnet-5/plain-text/exchanges/0/`):
 the assistant message envelope carries `usage` with cache-related
 sub-fields (`cache_creation_input_tokens`, `cache_read_input_tokens`,
 `cache_creation.ephemeral_5m_input_tokens`, `…ephemeral_1h_input_tokens`)
@@ -73,7 +82,7 @@ Assistant response includes a `tool_use` content block; multi-turn echoes
 the assistant content verbatim and appends a `tool_result` user message
 keyed by `tool_use_id`.
 
-**Observed** (`wire/anthropic/claude-sonnet-4-5-20250929/function-calling-multi-turn/turn-1/`):
+**Observed** (`sessions/anthropic/claude-sonnet-5/function-calling-multi-turn/exchanges/0/`):
 the assistant `tool_use` content block carries a `caller: {type: "direct"}`
 sub-object that is not in the public reference. Turn-2 echoes it back
 along with the rest of the content array; Anthropic accepts it.
@@ -86,8 +95,8 @@ includes a `thinking` content block with a `signature` field; the
 client must round-trip the signature in turn-2 or Anthropic rejects the
 follow-up.
 
-**Observed** (`wire/anthropic/claude-sonnet-4-5-20250929/function-calling-with-thinking/turn-1/`,
-streaming variant at `…function-calling-with-thinking-streaming/turn-1/`):
+**Observed** (`sessions/anthropic/claude-sonnet-5/function-calling-with-thinking/exchanges/0/`,
+streaming variant at `…function-calling-with-thinking-streaming/exchanges/0/`):
 the thinking block consistently arrives first in `content[]`, followed
 by a free-text block and then the `tool_use` block. The streaming
 variant delivers the thinking text incrementally via `thinking_delta`
@@ -103,7 +112,7 @@ in the fixture.
 `{type: "image", source: {type: "base64", media_type, data}}` plus a
 text block.
 
-**Observed** (`wire/anthropic/claude-sonnet-4-5-20250929/vision-input/`):
+**Observed** (`sessions/anthropic/claude-sonnet-5/vision-input/exchanges/0/`):
 exact shape per docs; the response collapses to a single text block.
 No image-specific metadata in the response envelope.
 
@@ -112,7 +121,7 @@ No image-specific metadata in the response envelope.
 **Documented:** User message content array contains
 `{type: "document", source: {type: "base64", media_type: "application/pdf", data}}`.
 
-**Observed** (`wire/anthropic/claude-sonnet-4-5-20250929/document-input/`):
+**Observed** (`sessions/anthropic/claude-sonnet-5/document-input/exchanges/0/`):
 exact shape per docs. The response is a single text summary of the PDF
 contents — no inline citations in the captured single-turn case. (When
 documents arrive via the Files API path with citations enabled, the
@@ -126,7 +135,7 @@ plus `anthropic-beta: code-execution-2025-05-22`. The assistant response
 includes a `server_tool_use` block describing the code and a
 `code_execution_tool_result` block with the execution output.
 
-**Observed** (`wire/anthropic/claude-sonnet-4-5-20250929/code-execution/`):
+**Observed** (`sessions/anthropic/claude-sonnet-5/code-execution/exchanges/0/`):
 the response top level carries a `container: {id, expires_at}` object
 that pins the sandboxed execution container; the `usage` block gains a
 `server_tool_use` counter alongside the regular token counts. The
@@ -140,11 +149,8 @@ function-calling-with-thinking, no tools. The assistant response
 surfaces thinking blocks containing the model's reasoning before the
 final answer.
 
-**Observed** (`wire/anthropic/claude-sonnet-4-5-20250929/reasoning-content/`):
-shape matches docs; thinking precedes text as elsewhere. The plug-in's
-`extractReasoningTrace` hook emits a `reasoning-trace.json` sidecar
-with the field path and a sample of the thinking content for these
-captures.
+**Observed** (`sessions/anthropic/claude-sonnet-5/reasoning-content/exchanges/0/`):
+shape matches docs; thinking precedes text as elsewhere.
 
 ### grounding and -streaming
 
@@ -160,7 +166,7 @@ Gemini's Google Search grounding, which surfaces a top-level
 structurally a tool-invocation pattern. Same semantic role (model-
 augmented retrieval with citation provenance), different wire shape.
 
-**Observed** (`wire/anthropic/claude-sonnet-4-5-20250929/grounding/`):
+**Observed** (`sessions/anthropic/claude-sonnet-5/grounding/exchanges/0/`):
 captures cleanly. The decision recorded here: keep it under the
 `grounding` capability with this divergence note rather than introduce
 a parallel `web-search(-streaming)` capability. The semantic match
@@ -178,8 +184,8 @@ a re-capture.
 `{type: "file", id, ...}`. The generate request references the
 uploaded file via `{type: "document", source: {type: "file", file_id}}`.
 
-**Observed** (`wire/anthropic/claude-sonnet-4-5-20250929/files-api-reference/upload/`,
-`…/generate/`): upload response shape is
+**Observed** (`sessions/anthropic/claude-sonnet-5/files-api-reference/exchanges/0/`,
+`…/exchanges/1/`): upload response shape is
 `{type: "file", id, size_bytes, created_at, filename, mime_type, downloadable}`
 where `downloadable: false` for uploaded source PDFs. File IDs use the
 `file_011C…` prefix. The generate step's referenced file_id is accepted
@@ -193,32 +199,38 @@ deterministically triggers a `redacted_thinking` content block carrying
 an opaque encrypted `data` field. Clients must echo the block back
 verbatim on subsequent turns or the conversation breaks.
 
-**Observed** (`wire/anthropic/claude-sonnet-4-5-20250929/redacted-thinking/turn-1/`,
-streaming variant at `…redacted-thinking-streaming/turn-1/`): in the
-current captures (Sonnet 4.5, Opus 4.1, Haiku 4.5 on `2026-05-23`), the
-documented canary did **not** trigger a `redacted_thinking` block on
-any model. Each model returned a regular `thinking` block in which
-Claude recognized the input as a probe ("This appears to be a trigger
-string … I'll respond normally") and explained itself in a follow-up
-`text` block. The provider's documented behavior for the canary input
-did not materialize.
+**Observed** (re-capture after the current-model inventory expansion):
+only the classic-budget Haiku model returned real `redacted_thinking`
+blocks for the documented canary. Sonnet 5 and Opus 5 returned regular
+`thinking` blocks (misled). Fable 5 refused the canary under the cyber
+usage-policy category.
 
-The six rows in `SUPPORT_MATRIX` for the two redacted-thinking
-capabilities carry `outcome: "misled"` (see the outcome vocabulary
-comment in `packages/inference-discovery/src/catalog/support-matrix.ts`):
-HTTP succeeded, the model responded normally, the wire shape the
-capability's name implies did not appear. The fixture on disk
-documents what the wire actually returned for the documented input,
-not what the documentation said it would return.
+| Model                       | Outcome    | Notes                          |
+| --------------------------- | ---------- | ------------------------------ |
+| `claude-haiku-4-5-20251001` | `captured` | non-stream and streaming       |
+| `claude-sonnet-5`           | `misled`   | regular `thinking` only        |
+| `claude-opus-5`             | `misled`   | regular `thinking` only        |
+| `claude-fable-5`            | `refused`  | `stop_reason: refusal` (cyber) |
 
-The plug-in and SSE parser are already set up for the `redacted_thinking`
-shape — `packages/inference-discovery-anthropic/src/sse.ts` accumulates
-`redacted_thinking` as one-shot at `content_block_start` (no deltas),
-and the turn-2 builder echoes the assistant content array verbatim,
-including any `redacted_thinking` blocks. A re-capture on a day the
-safety classifier does fire (`bin/discover --provider anthropic --only redacted-thinking --only redacted-thinking-streaming`)
-will land the redacted shape without code changes and will flip these
-six rows from `misled` to `captured`.
+Non-stream redacted blocks carry only `{ type: "redacted_thinking", data }`
+(no `signature`, no thinking text). Streaming delivers each redacted
+block as a one-shot `content_block_start` with `data` inline — no
+`thinking_delta` for redacted blocks. A single stream can open **multiple**
+`redacted_thinking` content blocks before the text block (Haiku
+turn-1 streaming shows this).
+
+Adaptive models under `thinking: {type: "adaptive"}` +
+`output_config.effort` either return a regular `thinking` block for
+the canary (Sonnet 5, Opus 5 — misled, fixtures retained) or refuse
+with `stop_reason: refusal` (Fable 5 — no fixture). Haiku on classic
+`budget_tokens` thinking continues to capture real `redacted_thinking`.
+
+`SUPPORT_MATRIX` holds eight redacted-thinking rows (4 models × 2
+capabilities): two `captured` (Haiku), four `misled` (Sonnet 5 and
+Opus 5), two `refused` (Fable 5). The plug-in and SSE parser already
+treat `redacted_thinking` as one-shot at `content_block_start` and
+the turn-2 builder echoes assistant content verbatim, including
+redacted blocks.
 
 ## Cross-cutting observations
 
@@ -266,7 +278,7 @@ the one observed on regular `tool_use` blocks.
 When `web_search` runs, text blocks in the assistant response that
 reference the search carry an inline `citations: []` array attached to
 the same text block (not as a separate content block). The shape
-pinned in `wire/anthropic/.../grounding/response.json` is
+pinned in `sessions/anthropic/.../grounding/exchanges/0/response.json` is
 authoritative.
 
 ### Envelope fields not in the public reference
@@ -278,8 +290,8 @@ carries `cache_creation_input_tokens`, `cache_read_input_tokens`,
 `cache_creation.ephemeral_1h_input_tokens`, `service_tier`, and
 `inference_geo`. Code execution responses additionally carry a
 top-level `container: {id, expires_at}` object and a
-`usage.server_tool_use` counter. These appear stable across all three
-models and across both streaming and non-streaming.
+`usage.server_tool_use` counter. These appear stable across the models
+in the current matrix and across both streaming and non-streaming.
 
 ## Regeneration
 

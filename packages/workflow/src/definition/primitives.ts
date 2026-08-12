@@ -7,22 +7,26 @@
 // reuse the same constructor result under different keys without
 // repeating themselves.
 //
-// `drainBehavior` defaults differ per primitive: `step` and `sleep`
-// default to `"cancel"` because long compute should not block a
-// redeploy past `drainTimeout`; `awaitSignal` defaults to `"wait"`
-// because human-in-the-loop pauses are the canonical case the spec
-// calls out and operators do not want them silently cancelled at
-// redeploy. `map`'s outer node carries no `drainBehavior` -- its inner
-// step carries its own.
+// `drainBehavior` defaults differ per primitive: `sleep` and
+// `childWorkflow` default to `"cancel"` because long compute should not
+// block a redeploy past `drainTimeout`; `awaitSignal` defaults to
+// `"wait"` because human-in-the-loop pauses are the canonical case the
+// spec calls out and operators do not want them silently cancelled at
+// redeploy. A `step` defaults to `"cancel"` when its trigger budget is
+// `1` (batch) and `"wait"` when the budget is larger (multi-turn or
+// unbounded) -- a long-lived step is definitionally interactive.
+// `map`'s outer node carries no `drainBehavior` -- its inner step
+// carries its own.
 
 import type { AgentDefinition, BaseEnv } from "@intx/agent";
 import type { Type } from "arktype";
 
 import type { Selector } from "./selectors";
-// Type-only import: a loop body is a full WorkflowDefinition. This is a
-// type-level cycle (workflow.ts imports Primitive from here), erased at
-// runtime by `import type`, so there is no runtime import cycle.
+// Type-only import: a loop or onTrigger body is a full WorkflowDefinition.
+// This is a type-level cycle (workflow.ts imports Primitive from here),
+// erased at runtime by `import type`, so there is no runtime import cycle.
 import type { WorkflowDefinition } from "./workflow";
+import type { Trigger } from "./triggers";
 
 export type DrainBehavior = "cancel" | "wait";
 
@@ -74,6 +78,29 @@ export interface StepPrimitive extends PrimitiveBase {
   /** Per-step timeout in milliseconds; enforced via an `AbortSignal`. */
   timeout?: number;
   drainBehavior?: DrainBehavior;
+  /**
+   * How many triggers this step services before it completes.
+   *
+   * - A positive integer `N`: the step services N triggers, then completes.
+   *   `1` (the default when absent) is the ordinary batch step -- one trigger,
+   *   one turn, done. A terminal top-level run is not fired again; another
+   *   batch execution requires a new deployment.
+   * - `"unbounded"`: the step never completes on its own; it absorbs every
+   *   trigger as another turn (a long-lived interactive agent) until the run
+   *   is torn down.
+   *
+   * Between triggers the runtime re-arms the step on a snapshot-less input
+   * control-plane park; each delivered trigger is the next turn's input.
+   * Absent means `1` -- read through `stepTriggerBudget`, the single point of
+   * that default.
+   *
+   * A step whose budget is not exactly `1` may not carry a `retry` policy
+   * with `maxAttempts > 1` (`validateRetryTriggerCombination` rejects the
+   * combination): a retried attempt re-invokes the step with its launch
+   * input and starts with no resume, so a mid-run failure would re-service
+   * the launch trigger and never re-service the consumed one.
+   */
+  triggers?: number | "unbounded";
 }
 
 export interface MapPrimitive extends PrimitiveBase {
@@ -179,11 +206,53 @@ export interface LoopPrimitive extends PrimitiveBase {
   drainBehavior?: DrainBehavior;
 }
 
+/**
+ * Long-lived, event-driven section. The workflow subscribes to `on` and
+ * runs `body` -- a full sub-DAG -- once per occurrence of that trigger,
+ * each occurrence a separate child run of `body` (own run id, own event
+ * log), all WITHIN the one living workflow run. Between occurrences the
+ * runtime re-arms the section on a snapshot-less input control-plane park
+ * (the same machinery a signal resume uses); each delivered occurrence is
+ * the next body run's input, surfaced to the body as its
+ * `trigger.payload`.
+ *
+ * The section never self-completes: the workflow stays running while
+ * subscribed and terminates only on a body error or an explicit
+ * end-of-workflow, and a terminated run is final -- never relaunched. The
+ * first occurrence is the run's own firing trigger (its
+ * `RunStarted.trigger.payload`); each later occurrence arrives as an input
+ * signal carrying the next payload. `defineWorkflow` collects every `on`
+ * into the workflow's `triggers`, so `on` is the first-class binding
+ * between a trigger and the section it drives.
+ *
+ * `drainBehavior` defaults to `"wait"`: a live interactive section is not
+ * abandoned mid-conversation at redeploy unless the author opts into
+ * `"cancel"`.
+ */
+export interface OnTriggerPrimitive extends PrimitiveBase {
+  kind: "onTrigger";
+  on: Trigger;
+  body: OnTriggerBody;
+  drainBehavior?: DrainBehavior;
+}
+
+/**
+ * The section body, in one of its two lifecycle forms. Authored inline
+ * (the constructor wraps the author's `WorkflowDefinition` as `{ inline }`);
+ * the deploy step materializes that inline body into its own workflow asset
+ * and rewrites it to `{ ref }`, so the runtime spawns each event's body as
+ * a child run resolved by ref. Exactly one arm is present -- a discriminated
+ * union, not two optionals, so neither "both" nor "neither" is
+ * representable and the runtime switches exhaustively.
+ */
+export type OnTriggerBody = { inline: WorkflowDefinition } | { ref: string };
+
 export type Primitive =
   | StepPrimitive
   | MapPrimitive
   | ActionPrimitive
   | LoopPrimitive
+  | OnTriggerPrimitive
   | GatePrimitive
   | AwaitSignalPrimitive
   | SleepPrimitive
@@ -203,12 +272,74 @@ export interface StepOpts<EnvReq extends BaseEnv> {
   timeout?: number;
   drainBehavior?: DrainBehavior;
   after?: readonly string[];
+  /** See {@link StepPrimitive.triggers}. Absent means `1` (batch). */
+  triggers?: number | "unbounded";
+}
+
+/**
+ * The trigger budget a step services before it completes -- the single point
+ * of the absent-means-`1` default. `1` is the ordinary batch step;
+ * `"unbounded"` is the long-lived interactive agent that never self-completes.
+ *
+ * Validates the declared value on every read: `step()` rejects a bad value at
+ * authoring time, but a definition hydrated from `workflow.json` never passes
+ * through `step()` (the envelope schema checks structure only), so this read
+ * point is where a persisted `triggers: 0`/`-1`/`1.5` fails loud instead of
+ * silently coercing (a non-positive budget would behave as `1`; a fractional
+ * one would service an extra trigger).
+ */
+export function stepTriggerBudget(step: StepPrimitive): number | "unbounded" {
+  if (step.triggers === undefined) return 1;
+  validateTriggers(step.triggers);
+  return step.triggers;
+}
+
+/**
+ * Validate a `triggers` value: a positive integer, or the literal
+ * `"unbounded"`. Fails loud on anything else (a zero/negative/fractional count
+ * is a definition bug, not a value to silently coerce).
+ */
+function validateTriggers(triggers: number | "unbounded"): void {
+  if (triggers === "unbounded") return;
+  if (!Number.isInteger(triggers) || triggers < 1) {
+    throw new Error(
+      `step triggers must be a positive integer or "unbounded", got ${String(triggers)}`,
+    );
+  }
+}
+
+/**
+ * Validate the retry/budget combination: a step whose resolved trigger
+ * budget is not exactly `1` may not carry a `retry` policy with
+ * `maxAttempts > 1`. A retried attempt re-invokes the step with its
+ * original launch input and starts with no resume, so a mid-run failure
+ * would re-service the launch trigger and never re-service the
+ * already-consumed one -- a wrong conversation reported as success.
+ * `step()` enforces this at authoring time; the runtime re-applies it at
+ * `runStep` entry because a definition hydrated from `workflow.json` never
+ * passes through `step()`.
+ */
+export function validateRetryTriggerCombination(step: StepPrimitive): void {
+  const retry = step.retry;
+  if (retry === undefined || retry.maxAttempts <= 1) return;
+  if (stepTriggerBudget(step) !== 1) {
+    throw new Error(
+      `step retry policy with maxAttempts ${String(retry.maxAttempts)} cannot combine with a trigger budget other than 1: a retried attempt re-invokes the step with its launch input and cannot re-service an already-consumed trigger`,
+    );
+  }
 }
 
 export function step<EnvReq extends BaseEnv>(
   opts: StepOpts<EnvReq>,
 ): StepPrimitive {
-  const drainBehavior: DrainBehavior = opts.drainBehavior ?? "cancel";
+  // A step with a trigger budget other than 1 (multi-turn or unbounded)
+  // is definitionally long-lived; cancelling it during drain would discard
+  // in-flight work the operator likely wants to preserve. The default is
+  // "wait" for long-lived steps, "cancel" for batch steps (budget 1 or
+  // absent). An explicit `drainBehavior` always wins.
+  const defaultDrain: DrainBehavior =
+    opts.triggers !== undefined && opts.triggers !== 1 ? "wait" : "cancel";
+  const drainBehavior: DrainBehavior = opts.drainBehavior ?? defaultDrain;
   // The narrower `EnvReq` requirements (tool factories that need
   // `transport`, an author-supplied director with extra env keys) live
   // on the agent's tool-factory metadata. The workflow runtime hands
@@ -219,6 +350,7 @@ export function step<EnvReq extends BaseEnv>(
   // juggling per-step EnvReq parameters.
   // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- the agent's env requirements are checked at StepInvoker time by createAgent's validateEnv; the runtime body itself does not read AgentDefinition.toolFactories
   const agent = opts.agent as AgentDefinition<BaseEnv>;
+  if (opts.triggers !== undefined) validateTriggers(opts.triggers);
   const primitive: StepPrimitive = {
     kind: "step",
     id: "",
@@ -230,7 +362,9 @@ export function step<EnvReq extends BaseEnv>(
     ...(opts.retry !== undefined ? { retry: opts.retry } : {}),
     ...(opts.timeout !== undefined ? { timeout: opts.timeout } : {}),
     ...(opts.after !== undefined ? { after: opts.after } : {}),
+    ...(opts.triggers !== undefined ? { triggers: opts.triggers } : {}),
   };
+  validateRetryTriggerCombination(primitive);
   return primitive;
 }
 
@@ -242,6 +376,17 @@ export interface MapOpts {
 }
 
 export function map(opts: MapOpts): MapPrimitive {
+  // The map's retry applies to each fan-out instance of the inner step when
+  // the inner declares none (mirroring the runtime's scoped-step injection),
+  // so the retry/budget cross-field guard must see that COMPOSED shape --
+  // `step()` alone never sees a map-level retry, and without this check the
+  // forbidden combination would surface only at the run's first execution.
+  validateRetryTriggerCombination({
+    ...opts.step,
+    ...(opts.step.retry === undefined && opts.retry !== undefined
+      ? { retry: opts.retry }
+      : {}),
+  });
   return {
     kind: "map",
     id: "",
@@ -400,6 +545,26 @@ export function loop(opts: LoopOpts): LoopPrimitive {
     onExhausted: opts.onExhausted,
     drainBehavior,
     ...(opts.input !== undefined ? { input: opts.input } : {}),
+    ...(opts.after !== undefined ? { after: opts.after } : {}),
+  };
+}
+
+export interface OnTriggerOpts {
+  on: Trigger;
+  body: WorkflowDefinition;
+  drainBehavior?: DrainBehavior;
+  after?: readonly string[];
+}
+
+export function onTrigger(opts: OnTriggerOpts): OnTriggerPrimitive {
+  const drainBehavior: DrainBehavior = opts.drainBehavior ?? "wait";
+  return {
+    kind: "onTrigger",
+    id: "",
+    on: opts.on,
+    // Authored inline; the deploy step rewrites this to `{ ref }`.
+    body: { inline: opts.body },
+    drainBehavior,
     ...(opts.after !== undefined ? { after: opts.after } : {}),
   };
 }

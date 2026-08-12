@@ -1,4 +1,11 @@
-import { createDB, createGrantStore } from "@intx/db";
+import {
+  createDB,
+  createGrantStore,
+  createSidecarAllocationStore,
+  createWorkflowRunDispatchStore,
+} from "@intx/db";
+import { createEnvKeyCredentialCipher } from "@intx/crypto";
+import { hexDecode } from "@intx/types";
 import {
   createApp,
   createAuth,
@@ -11,8 +18,12 @@ import {
   createHubSessionLookups,
   createHubSessionOrchestrator,
   createSessionService,
+  createSidecarAllocationReconciler,
+  createSidecarPluginRegistry,
   createSidecarRouter,
-  createSidecarTokenAuthenticator,
+  createSidecarCredentialResolver,
+  createWorkflowAllocationService,
+  createWorkflowDispatchService,
   WORKSPACE_BUILTINS_REGISTRY,
   type WsHandle,
 } from "@intx/hub-sessions";
@@ -24,6 +35,7 @@ import { setup, getLogger } from "@intx/log";
 await setup();
 
 const log = getLogger(["hub"]);
+const port = Number(process.env["PORT"] ?? 3000);
 
 // PG_SCHEMA pins the hub to a specific postgres schema. The
 // integration-test harness sets this so each spawned hub gets a
@@ -45,6 +57,21 @@ const hubDataDir = process.env["HUB_DATA_DIR"];
 if (!hubDataDir) {
   throw new Error("HUB_DATA_DIR environment variable is required");
 }
+
+// Credential secrets are encrypted at rest under this operator-provided key.
+// Required at boot: a missing or wrong-length key fails loudly here rather than
+// letting the hub run and store secrets it cannot protect. 32 bytes, hex --
+// e.g. `openssl rand -hex 32`, the same shape as BETTER_AUTH_SECRET.
+const credentialEncryptionKeyHex = process.env["CREDENTIAL_ENCRYPTION_KEY"];
+if (
+  credentialEncryptionKeyHex === undefined ||
+  credentialEncryptionKeyHex.trim() === ""
+) {
+  throw new Error("CREDENTIAL_ENCRYPTION_KEY environment variable is required");
+}
+const credentialCipher = createEnvKeyCredentialCipher(
+  hexDecode(credentialEncryptionKeyHex),
+);
 
 // 10 MiB is the production cap for tool-package tarballs uploaded via
 // the package-registry PUT endpoint. The npm registry's own per-tarball
@@ -152,9 +179,11 @@ const lookups = {
   }),
 };
 
+const sidecarCredentials = createSidecarCredentialResolver({ db });
 const sidecarRouter = createSidecarRouter({
   hubPublicKey: hexEncode(hubSigningKey.publicKey),
-  authenticateSidecar: createSidecarTokenAuthenticator({ db }),
+  authenticateSidecar: async ({ token }) => sidecarCredentials.resolve(token),
+  validateSidecarIdentity: sidecarCredentials.isCurrent,
   lookups,
 });
 
@@ -187,6 +216,7 @@ createHubSessionOrchestrator({
 
 const sessionService = createSessionService({
   sidecarRouter,
+  sidecarAllocationRouter: sidecarRouter,
   agentRepoStore,
   assetService,
   db,
@@ -206,6 +236,93 @@ const sessionService = createSessionService({
   },
 });
 
+// Provisioner plugins are injected at the application composition boundary.
+// The in-tree Hub ships without an infrastructure backend; deployments that
+// require exclusive placement therefore fail closed until an operator build
+// registers a provisioner here.
+const sidecarPlugins = createSidecarPluginRegistry({ provisioners: [] });
+const workflowAllocationService = createWorkflowAllocationService({
+  db,
+  plugins: sidecarPlugins,
+  preparedDeployer: sessionService,
+  credentialCipher,
+  allocationRouter: sidecarRouter,
+});
+const sidecarAllocationStore = createSidecarAllocationStore(db);
+const workflowDispatchService = createWorkflowDispatchService({
+  dispatchStore: createWorkflowRunDispatchStore(db),
+  allocationStore: sidecarAllocationStore,
+  router: sidecarRouter,
+  resolveAnchorAddress: async (anchorRunId) => {
+    const row = await db.query.workflowRun.findFirst({
+      where: (run, { eq }) => eq(run.id, anchorRunId),
+      columns: { address: true },
+    });
+    return row?.address ?? null;
+  },
+});
+const sidecarAllocationReconciler = createSidecarAllocationReconciler({
+  allocationStore: sidecarAllocationStore,
+  plugins: sidecarPlugins,
+  router: sidecarRouter,
+  hubWebSocketUrl:
+    process.env["HUB_SIDECAR_WEBSOCKET_URL"] ??
+    `ws://127.0.0.1:${String(port)}/api/sidecars/ws`,
+  onReady: async (allocation) => {
+    await workflowAllocationService.deployReadyAllocation(allocation);
+    await workflowDispatchService.requeueForReadyAllocation(
+      allocation.anchorRunId,
+    );
+  },
+});
+
+await sidecarAllocationReconciler.initialize();
+sidecarRouter.events.on("sidecar.disconnect", ({ allocated }) => {
+  if (allocated === undefined) return;
+  return sidecarAllocationReconciler.handleDisconnect(allocated);
+});
+sidecarRouter.events.on("sidecar.allocated.connected", (allocated) =>
+  sidecarAllocationReconciler.handleConnected(allocated),
+);
+sidecarRouter.events.on(
+  "mail.inbound.acknowledged",
+  ({ messageId, allocated }) => {
+    if (allocated === undefined) return;
+    return workflowDispatchService.acknowledge({ ...allocated, messageId });
+  },
+);
+
+const ALLOCATION_RECONCILIATION_INTERVAL_MS = 1_000;
+const ALLOCATION_CONNECTION_REPAIR_INTERVAL_MS = 30_000;
+let nextAllocationConnectionRepairAt =
+  Date.now() + ALLOCATION_CONNECTION_REPAIR_INTERVAL_MS;
+function scheduleAllocationReconciliation(delayMs: number): void {
+  const timer = setTimeout(() => {
+    void reconcileSidecarAllocations();
+  }, delayMs);
+  timer.unref?.();
+}
+
+async function reconcileSidecarAllocations(): Promise<void> {
+  try {
+    await sidecarAllocationReconciler.reconcileUntilIdle();
+    await workflowDispatchService.reconcileUntilIdle();
+    if (Date.now() >= nextAllocationConnectionRepairAt) {
+      nextAllocationConnectionRepairAt =
+        Date.now() + ALLOCATION_CONNECTION_REPAIR_INTERVAL_MS;
+      await sidecarAllocationReconciler.repairUnscheduledConnections();
+    }
+  } catch (error) {
+    log.error`Sidecar allocation reconciliation failed: ${error instanceof Error ? error.message : String(error)}`;
+  } finally {
+    scheduleAllocationReconciliation(ALLOCATION_RECONCILIATION_INTERVAL_MS);
+  }
+}
+
+// Start after module initialization so the websocket endpoint can accept a
+// newly provisioned sidecar while reconciliation waits for its connection.
+scheduleAllocationReconciliation(0);
+
 const app = createApp({
   getSession: async (headers) => {
     const result = await auth.api.getSession({ headers });
@@ -215,7 +332,10 @@ const app = createApp({
   db,
   sidecarRouter,
   sessionService,
+  workflowAllocationService,
+  workflowDispatchService,
   eventCollectors,
+  credentialCipher,
   assetService,
   repoStore: agentRepoStore.repoStore,
   maxTarballBytes: hubMaxTarballBytes,
@@ -244,8 +364,6 @@ const app = createApp({
     };
   }),
 });
-
-const port = Number(process.env["PORT"] ?? 3000);
 
 log.info("Starting server on port {port}", { port });
 

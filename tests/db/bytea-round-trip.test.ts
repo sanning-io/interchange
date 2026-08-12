@@ -8,13 +8,19 @@ import {
 } from "bun:test";
 import { eq } from "drizzle-orm";
 
-import { agentSession, gitToken, sessionMail, user } from "@intx/db/schema";
+import {
+  agentSession,
+  gitToken,
+  sessionMail,
+  user,
+  workflowDefinition,
+} from "@intx/db/schema";
 import {
   createTestDb,
   harnessDbEnvAvailable,
   type TestDb,
 } from "@intx/test-harness/db-harness";
-import { seedAgent, seedPrincipal, seedTenants } from "@intx/test-harness/seed";
+import { seedPrincipal, seedTenants } from "@intx/test-harness/seed";
 
 // The bytea columns serialize through a Uint8Array customType; postgres.js
 // hex-encodes on the way out and parses back to a driver Buffer the
@@ -88,15 +94,15 @@ describe.skipIf(!harnessDbEnvAvailable())("bytea round-trip (real DB)", () => {
       test(`round-trips ${c.name}`, async () => {
         await seedTenants(h.db, [{ id: "tnt_1" }]);
         await seedPrincipal(h.db, { id: "prc_1", tenantId: "tnt_1" });
-        await seedAgent(h.db, {
-          id: "agt_1",
+        await h.db.insert(workflowDefinition).values({
+          id: "wfd_1",
           tenantId: "tnt_1",
-          creatorPrincipalId: "prc_1",
+          name: "agt_1",
         });
         await h.db.insert(agentSession).values({
           id: "ses_1",
           tenantId: "tnt_1",
-          agentId: "agt_1",
+          agentId: "wfd_1",
           principalId: "prc_1",
         });
         await h.db.insert(sessionMail).values({

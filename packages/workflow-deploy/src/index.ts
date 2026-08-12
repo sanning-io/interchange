@@ -24,7 +24,11 @@ export {
   type ApprovalSource,
   type CapabilityApprovalGate,
 } from "./capability-approval";
+export { extractFoldedBody, type FoldedBody } from "./fold-synthesis";
 export {
+  assertChainHeadIsDefault,
+  isSourceApproved,
+  buildSingleStepAgentDefinition,
   createWorkflowDeployOrchestrator,
   deriveDeploymentAddress,
   deriveStepAddress,
@@ -44,6 +48,7 @@ export {
   type DeployWorkflowResult,
   type LaunchSessionFn,
   type MultiStepDeployResult,
+  type ReferencedBodyDefinition,
   type SendMultiStepDeployFn,
   type WorkflowDeployOrchestrator,
   type WorkflowDeployOrchestratorDeps,

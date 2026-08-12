@@ -9,7 +9,11 @@
 
 import { canonicalizeForHash } from "@intx/agent";
 import type { AgentDefinition, BaseEnv } from "@intx/agent";
-import type { GrantRequirement } from "@intx/types";
+import {
+  SidecarPlacementRequirement,
+  type CredentialBinding,
+  type GrantRequirement,
+} from "@intx/types";
 
 import { normalizeSingularShorthand } from "./shorthand";
 import {
@@ -20,6 +24,8 @@ import {
   type StepPrimitive,
 } from "./primitives";
 import type { Trigger } from "./triggers";
+
+export type { SidecarPlacementRequirement } from "@intx/types";
 
 export interface WorkflowDefinition {
   id: string;
@@ -33,6 +39,11 @@ export interface WorkflowDefinition {
   stepOrder: readonly string[];
   state?: { schema?: StateSchema };
   /**
+   * Requires an exclusive sidecar for this workflow. This is a placement
+   * guarantee, not a process, filesystem, network, or host boundary.
+   */
+  sidecarPlacement?: SidecarPlacementRequirement;
+  /**
    * The grant requirements a run resolves against the creator's and
    * invoker's authority at trigger time. Each entry declares a resource,
    * action, and source (`creator` or `invoker`); the trigger route
@@ -40,6 +51,15 @@ export interface WorkflowDefinition {
    * Mirrors an agent definition's `grantRequirements`.
    */
   grantRequirements?: readonly GrantRequirement[];
+  /**
+   * The credential bindings a launch resolves against tenant-owned
+   * credentials, each mapping a tool package's declared handle to a
+   * concrete provider and authorizing the delegation against the
+   * binding's authority. The launch reads these from the folded body and
+   * materializes a consumer-scoped `credential:{id}` / `use` grant per
+   * binding. Mirrors an agent definition's `credentialBindings`.
+   */
+  credentialBindings?: readonly CredentialBinding[];
 }
 
 export interface WorkflowConfig {
@@ -48,7 +68,9 @@ export interface WorkflowConfig {
   triggers?: readonly Trigger[];
   steps: Record<string, Primitive>;
   state?: { schema?: StateSchema };
+  sidecarPlacement?: SidecarPlacementRequirement;
   grantRequirements?: readonly GrantRequirement[];
+  credentialBindings?: readonly CredentialBinding[];
 }
 
 export interface SingularWorkflowConfig<EnvReq extends BaseEnv> {
@@ -57,7 +79,9 @@ export interface SingularWorkflowConfig<EnvReq extends BaseEnv> {
   trigger?: Trigger;
   triggers?: readonly Trigger[];
   state?: { schema?: StateSchema };
+  sidecarPlacement?: SidecarPlacementRequirement;
   grantRequirements?: readonly GrantRequirement[];
+  credentialBindings?: readonly CredentialBinding[];
 }
 
 /**
@@ -93,8 +117,6 @@ function normalize(config: WorkflowConfig): WorkflowDefinition {
   if (!config.id) {
     throw new Error("defineWorkflow requires a non-empty id");
   }
-
-  const triggers = resolveTriggers(config);
 
   const stepEntries = Object.entries(config.steps);
   if (stepEntries.length === 0) {
@@ -140,6 +162,12 @@ function normalize(config: WorkflowConfig): WorkflowDefinition {
   // already known to name a real step; this pass only rejects cycles.
   validateAcyclic(steps);
   validateLoopBody(steps);
+  validateOnTriggerBody(steps);
+
+  // An onTrigger section's `on` is the first-class binding between a
+  // trigger and the section it drives, so each section contributes its
+  // trigger to the workflow's subscription set.
+  const triggers = resolveTriggers(config, collectSectionTriggers(steps));
 
   const definition: WorkflowDefinition = {
     id: config.id,
@@ -147,27 +175,66 @@ function normalize(config: WorkflowConfig): WorkflowDefinition {
     steps,
     stepOrder,
     ...(config.state !== undefined ? { state: config.state } : {}),
+    ...(config.sidecarPlacement !== undefined
+      ? { sidecarPlacement: normalizeSidecarPlacement(config.sidecarPlacement) }
+      : {}),
     ...(config.grantRequirements !== undefined
       ? { grantRequirements: config.grantRequirements }
+      : {}),
+    ...(config.credentialBindings !== undefined
+      ? { credentialBindings: config.credentialBindings }
       : {}),
   };
   return definition;
 }
 
-function resolveTriggers(config: WorkflowConfig): readonly Trigger[] {
+function normalizeSidecarPlacement(
+  placement: SidecarPlacementRequirement,
+): SidecarPlacementRequirement {
+  const validated = SidecarPlacementRequirement.assert(placement);
+  return {
+    sharing: "exclusive",
+    reuse: validated.reuse ?? "never",
+  };
+}
+
+function resolveTriggers(
+  config: WorkflowConfig,
+  sectionTriggers: readonly Trigger[],
+): readonly Trigger[] {
   if (config.trigger !== undefined && config.triggers !== undefined) {
     throw new Error("defineWorkflow accepts `trigger` or `triggers`, not both");
   }
-  if (config.trigger !== undefined) {
-    return [config.trigger];
+  if (config.triggers !== undefined && config.triggers.length === 0) {
+    throw new Error("`triggers` must be non-empty");
   }
-  if (config.triggers !== undefined) {
-    if (config.triggers.length === 0) {
-      throw new Error("`triggers` must be non-empty");
-    }
-    return config.triggers;
+  const declared: readonly Trigger[] =
+    config.trigger !== undefined ? [config.trigger] : (config.triggers ?? []);
+  // Dedupe by structural identity so a section whose `on` restates an
+  // explicitly-declared trigger does not double-subscribe.
+  const merged: Trigger[] = [];
+  const seen = new Set<string>();
+  for (const trigger of [...declared, ...sectionTriggers]) {
+    const key = JSON.stringify(trigger);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(trigger);
   }
-  return [{ type: "manual" }];
+  // A workflow that declares no trigger and has no onTrigger section is
+  // manually invoked -- the same default the singular/plural configs carry
+  // when `trigger`/`triggers` are omitted.
+  if (merged.length === 0) return [{ type: "manual" }];
+  return merged;
+}
+
+function collectSectionTriggers(
+  steps: Record<string, Primitive>,
+): readonly Trigger[] {
+  const out: Trigger[] = [];
+  for (const primitive of Object.values(steps)) {
+    if (primitive.kind === "onTrigger") out.push(primitive.on);
+  }
+  return out;
 }
 
 /**
@@ -200,6 +267,7 @@ function applyDefaultInput(
       };
     case "action":
     case "loop":
+    case "onTrigger":
     case "awaitSignal":
     case "sleep":
     case "gate":
@@ -293,6 +361,35 @@ function validateAfterRefs(steps: Record<string, Primitive>): void {
         );
       }
     }
+    if (primitive.kind === "awaitSignal" && primitive.onTimeout !== undefined) {
+      // onTimeout routes to a successor when the gate's timer fires, so it is
+      // only meaningful WITH a timeout; a timeout WITHOUT onTimeout stays legal
+      // (the gate fails on timeout, the pre-existing behavior).
+      if (primitive.timeout === undefined) {
+        throw new Error(
+          `awaitSignal ${stepId} names onTimeout ${primitive.onTimeout} but sets no timeout; onTimeout only routes when a timer fires`,
+        );
+      }
+      if (!ids.has(primitive.onTimeout)) {
+        throw new Error(
+          `awaitSignal ${stepId} names onTimeout ${primitive.onTimeout} which is not a known step`,
+        );
+      }
+      if (primitive.onTimeout === stepId) {
+        throw new Error(
+          `awaitSignal ${stepId} cannot name itself as onTimeout`,
+        );
+      }
+      // onTimeout routes only on a fired timer, so it must depend on the gate.
+      // Without `after: [gate]` it would be schedulable from RunStarted and
+      // fire on every run.
+      const target = steps[primitive.onTimeout];
+      if (target !== undefined && !(target.after?.includes(stepId) ?? false)) {
+        throw new Error(
+          `awaitSignal ${stepId} onTimeout ${primitive.onTimeout} must name ${stepId} in its after`,
+        );
+      }
+    }
   }
 }
 
@@ -307,6 +404,7 @@ const LOOP_BODY_FORBIDDEN = new Set<Primitive["kind"]>([
   "awaitSignal",
   "sleep",
   "childWorkflow",
+  "onTrigger",
 ]);
 
 /**
@@ -325,7 +423,44 @@ function validateLoopBody(steps: Record<string, Primitive>): void {
       if (LOOP_BODY_FORBIDDEN.has(bodyPrimitive.kind)) {
         throw new Error(
           `loop ${stepId} body step ${bodyStepId} is a ${bodyPrimitive.kind}; ` +
-            `a loop body may not contain a loop, awaitSignal, sleep, or childWorkflow`,
+            `a loop body may not contain a loop, awaitSignal, sleep, ` +
+            `childWorkflow, or onTrigger`,
+        );
+      }
+    }
+  }
+}
+
+/**
+ * Reject an onTrigger section whose body nests another onTrigger. An
+ * onTrigger body is otherwise unrestricted at DEFINITION time -- unlike a
+ * loop body it may await signals, sleep, spawn child workflows, and so on --
+ * because an onTrigger section IS the sanctioned long-lived input loop. The
+ * single restriction is one subscription layer per run: a section may not
+ * contain a section.
+ *
+ * PENDING INTR-310: a body agent `step` is accepted here but is not yet
+ * EXECUTABLE -- per-step agent invocation inside a body is stubbed, so a body
+ * runs only non-inference primitives (awaitSignal, sleep, childWorkflow) at
+ * runtime today. INTR-310 wires the body invoker + per-body sources, after
+ * which "run agent steps" becomes true at runtime as well.
+ *
+ * A separate pass from `validateAcyclic`, which does not recurse into the
+ * body's own (already-normalized) `WorkflowDefinition`.
+ */
+function validateOnTriggerBody(steps: Record<string, Primitive>): void {
+  for (const [stepId, primitive] of Object.entries(steps)) {
+    if (primitive.kind !== "onTrigger") continue;
+    // Only an inline (authored) body carries steps to constrain here; a
+    // deployed `{ ref }` body was validated at its own deploy.
+    if (!("inline" in primitive.body)) continue;
+    for (const [bodyStepId, bodyPrimitive] of Object.entries(
+      primitive.body.inline.steps,
+    )) {
+      if (bodyPrimitive.kind === "onTrigger") {
+        throw new Error(
+          `onTrigger ${stepId} body step ${bodyStepId} is itself an ` +
+            `onTrigger; an onTrigger body may not nest another section`,
         );
       }
     }
@@ -411,6 +546,13 @@ function buildDependencyAdjacency(
       // ancestor closes a cycle. Include it so a back-edge is rejected.
       addEdge(stepId, primitive.onExhausted);
     }
+    if (primitive.kind === "awaitSignal" && primitive.onTimeout !== undefined) {
+      // An awaitSignal's onTimeout is a routing target like a loop's
+      // onExhausted: on a timeout the gate routes to it instead of failing.
+      // Same shape -- include the edge so an onTimeout naming an ancestor is
+      // rejected as a cycle rather than corrupting branch pruning at runtime.
+      addEdge(stepId, primitive.onTimeout);
+    }
   }
   return adjacency;
 }
@@ -437,8 +579,17 @@ function projectForHash(definition: WorkflowDefinition): unknown {
     id: definition.id,
     triggers: definition.triggers,
     ...(definition.state !== undefined ? { state: definition.state } : {}),
+    ...(definition.sidecarPlacement !== undefined
+      ? { sidecarPlacement: definition.sidecarPlacement }
+      : {}),
     ...(definition.grantRequirements !== undefined
       ? { grantRequirements: definition.grantRequirements }
+      : {}),
+    // Bindings change launch-time authorization, so two definitions differing
+    // only in their bindings must hash differently -- include them exactly as
+    // grantRequirements is included, or the deploy substrate would dedupe them.
+    ...(definition.credentialBindings !== undefined
+      ? { credentialBindings: definition.credentialBindings }
       : {}),
     steps: Object.fromEntries(
       Object.entries(definition.steps).map(([id, primitive]) => [

@@ -60,6 +60,7 @@ import {
 import {
   AgentDeployWorkflow,
   type AgentDeployFrame,
+  type CredentialDelivery,
 } from "@intx/types/sidecar";
 import { STEP_ID_PATTERN } from "@intx/workflow";
 import { deriveWorkflowRunRepoId } from "@intx/workflow-deploy";
@@ -70,6 +71,7 @@ import type {
   MultistepMailRouter,
   MultistepSignalRouter,
   MultistepSourcesRouter,
+  MultistepCredentialsRouter,
 } from "./workflow-run-pack-client";
 import {
   deleteWorkflowDeploymentRecord,
@@ -499,6 +501,12 @@ export type CreateSidecarWorkflowSupervisorOpts = {
   /** Deployment id baked into principal claims and address derivation. */
   deploymentId: string;
   /**
+   * Decrypted credential material for the deployment's tools (from the deploy
+   * frame). Delivered to the child on the pre-trigger barrier. Absent when the
+   * deployment binds no credentials.
+   */
+  credentialDelivery?: CredentialDelivery;
+  /**
    * Step count of the deployed `WorkflowDefinition` (`stepOrder.length`).
    * Threaded into the child's spawn-time env so its deploy-tree read
    * collapses onto the head for a single-step deployment.
@@ -596,8 +604,13 @@ export type CreateSidecarWorkflowSupervisorOpts = {
 
 export type SidecarWorkflowSupervisor = {
   supervisor: WorkflowSupervisor;
-  /** Hand a delivered inbound message off to the supervisor's mail subscription. */
-  routeInbound(message: Uint8Array): void;
+  /**
+   * Hand a delivered inbound message off to the supervisor's mail
+   * subscription. The returned promise resolves once the message is durably
+   * accepted and rejects when it was not, so the hub-link can send a
+   * `mail.inbound.ack` only on resolution (resolve = ack, reject = withhold).
+   */
+  routeInbound(message: Uint8Array): Promise<void>;
   /** Snapshot accessor that proxies the supervisor's credentials view. */
   getCredentialsSnapshot(): CredentialsSnapshot | null;
   /**
@@ -1026,6 +1039,15 @@ export function createSidecarDeployRouter(deps: {
    */
   multistepSourcesRouter?: MultistepSourcesRouter;
   /**
+   * Optional per-deployment credential-delivery handler registry. Every
+   * deployment with a supervisor registers a handler after `spawn` (not only
+   * warm single-step ones -- the material cell is per-child and read by every
+   * step's tool capabilities), and an inbound `credentials.update` for an
+   * unregistered (torn-down) address is unrouted. Optional so tests without a
+   * credential-delivery loop can omit the binding.
+   */
+  multistepCredentialsRouter?: MultistepCredentialsRouter;
+  /**
    * Optional per-message dispatch-timing observer the multi-step branch
    * forwards to each supervisor it constructs. Resolved at the sidecar
    * boot edge from the Phase 4.7 latency-gate env gate; absent in
@@ -1224,6 +1246,64 @@ export function createSidecarDeployRouter(deps: {
   }
 
   /**
+   * Materialize an extracted onTrigger body's per-step inference-source pins to
+   * `${dataDir}/assets/workflow/<bodyRef>/sources.json`, co-located with the
+   * body's `workflow.json`. A body child runs in-process with no process env
+   * and loses its env across a restart, so its sources must be durable on disk
+   * beside the body definition; the body invoker reads this file to build the
+   * body's inference-source resolver (INTR-310). Mirrors
+   * `materializeWorkflowJson`: same per-body dir, idempotent content-compare
+   * write.
+   */
+  async function materializeWorkflowSources(
+    sidecarDataDir: string | undefined,
+    definitionId: string,
+    sources: NonNullable<AgentDeployFrame["workflow"]>["sources"],
+  ): Promise<void> {
+    if (typeof sidecarDataDir !== "string" || sidecarDataDir.length === 0) {
+      throw new Error(
+        "sidecar deploy router: SIDECAR_DATA_DIR must be present in the multi-step substrate env; the workflow-process child resolves the workflow-asset repo dir against this data dir",
+      );
+    }
+    const sourcesAssetPath = pathJoin(
+      sidecarDataDir,
+      "assets",
+      "workflow",
+      definitionId,
+      "sources.json",
+    );
+    const sourcesAssetBytes = JSON.stringify(sources, null, 2);
+    try {
+      await mkdir(dirname(sourcesAssetPath), { recursive: true });
+      // Idempotent: only rewrite when the on-disk content differs. Treats a
+      // missing file as different.
+      let existing: string | null = null;
+      try {
+        existing = await readFile(sourcesAssetPath, "utf8");
+      } catch (cause) {
+        if (
+          !(
+            cause instanceof Error &&
+            "code" in cause &&
+            (cause as { code: unknown }).code === "ENOENT"
+          )
+        ) {
+          throw cause;
+        }
+      }
+      if (existing !== sourcesAssetBytes) {
+        await writeFile(sourcesAssetPath, sourcesAssetBytes, "utf8");
+      }
+    } catch (cause) {
+      const reason = cause instanceof Error ? cause.message : String(cause);
+      throw new Error(
+        `sidecar deploy router: failed to materialize sources.json at ${sourcesAssetPath}: ${reason}`,
+        { cause },
+      );
+    }
+  }
+
+  /**
    * Read a workflow definition back off the sidecar's local substrate for a
    * boot-time restore. Mirrors `materializeWorkflowJson`'s path derivation
    * (`${dataDir}/assets/workflow/<definitionId>/workflow.json`). Returns the
@@ -1306,6 +1386,13 @@ export function createSidecarDeployRouter(deps: {
    */
   async function spawnWorkflowDeployment(
     spec: WorkflowDeploySpec,
+    // Decrypted credential material from the deploy frame, delivered to the
+    // child on the pre-trigger barrier. Threaded as a separate arg rather than
+    // on `spec` so it never reaches the on-disk deployment record (the sidecar
+    // holds no cipher; a persisted credential would be plaintext at rest). The
+    // boot-restore path passes none -- a restored in-flight deployment gets its
+    // material from the hub's reconnect re-push, not off disk.
+    credentialDelivery?: CredentialDelivery,
   ): Promise<DeployRouterResult> {
     // Fail loud if this address already has a live supervisor. Both single-
     // and multi-step now register on the transport, so both carry the
@@ -1393,6 +1480,7 @@ export function createSidecarDeployRouter(deps: {
         stepCount: spec.definition.stepOrder.length,
         stepOrder: spec.definition.stepOrder,
         deploymentMailAddress: spec.agentAddress,
+        ...(credentialDelivery !== undefined ? { credentialDelivery } : {}),
         deriveStepAddress: stepStrategy.deriveStepAddress,
         deriveStepRepoId: stepStrategy.deriveStepRepoId,
         isRunPoisoned: (runId) => poisonedRunIds.has(runId),
@@ -1537,9 +1625,9 @@ export function createSidecarDeployRouter(deps: {
       // supervisor's mail-bus subscription. Registration happens after
       // `spawn` succeeds so a spawn-time rejection leaves the registry
       // untouched.
-      deps.multistepMailRouter?.register(spec.agentAddress, (message) => {
-        wired.routeInbound(message);
-      });
+      deps.multistepMailRouter?.register(spec.agentAddress, (message) =>
+        wired.routeInbound(message),
+      );
       // Register the signal-delivery handler so a hub `signal.deliver` frame
       // dispatches through the supervisor's `deliverSignal`.
       deps.multistepSignalRouter?.register(spec.agentAddress, async (args) => {
@@ -1656,6 +1744,21 @@ export function createSidecarDeployRouter(deps: {
           },
         );
       }
+
+      // Register the credential-delivery handler for EVERY deployment (not only
+      // warm single-step ones): the material cell is per-child and read by
+      // every step's tool capabilities. The handler hands the delivery to the
+      // supervisor's `deliverCredentials`, which sends a `credentials-updated`
+      // control frame to the child where the material cell is swapped. No
+      // durable persist -- credential material never touches disk.
+      deps.multistepCredentialsRouter?.register(
+        spec.agentAddress,
+        async (args) => {
+          await wired.supervisor.deliverCredentials({
+            delivery: args.delivery,
+          });
+        },
+      );
       routersRegistered = true;
 
       succeeded = true;
@@ -1674,6 +1777,7 @@ export function createSidecarDeployRouter(deps: {
           // an address that never registered one, so a multi-step unwind
           // safely calls it too.
           deps.multistepSourcesRouter?.unregister(spec.agentAddress);
+          deps.multistepCredentialsRouter?.unregister(spec.agentAddress);
         }
         if (supervisorRegistered) {
           activeSupervisors.delete(spec.agentAddress);
@@ -1872,6 +1976,23 @@ export function createSidecarDeployRouter(deps: {
       // and skips this; both land before the shared spawn core runs.
       await materializeWorkflowJson(dataDir, projection.definition);
 
+      // Materialize each extracted onTrigger section body as its own
+      // `assets/workflow/<bodyRef>/workflow.json` (the body id IS the ref) plus
+      // a co-located `sources.json`, so a body child's spawn-child resolves the
+      // body definition AND its inference sources off disk without a hub
+      // round-trip. The hub also stores each body, but that copy is not on the
+      // sidecar; the deploy frame carries them here for exactly this reason. The
+      // sources ride on disk (not through env) because the body child is
+      // in-process and loses its env across a restart.
+      for (const referenced of projection.referencedDefinitions ?? []) {
+        await materializeWorkflowJson(dataDir, referenced.definition);
+        await materializeWorkflowSources(
+          dataDir,
+          referenced.definition.id,
+          referenced.sources,
+        );
+      }
+
       // Grants bridge: the spawned child does not see the frame; it reads
       // each step's grants out of `state/grants.json` in the step's
       // agent-state repo while the supervisor assembles the
@@ -1887,7 +2008,7 @@ export function createSidecarDeployRouter(deps: {
       });
 
       // Hand off to the shared spawn core.
-      return await spawnWorkflowDeployment(spec);
+      return await spawnWorkflowDeployment(spec, projection.credentials);
     } catch (cause) {
       // Soft failure (this process survived, the deploy threw): drop the
       // record and release the slug so the failed deploy is neither restored
@@ -1951,6 +2072,7 @@ export function createSidecarDeployRouter(deps: {
       // Unregister unconditionally (a no-op for a multi-step address that
       // registered no sources handler), matching the sibling routers.
       deps.multistepSourcesRouter?.unregister(frame.agentAddress);
+      deps.multistepCredentialsRouter?.unregister(frame.agentAddress);
       // Shut the per-deployment supervisor down so the workflow-process
       // child, its IPC pipes, and its event-channel fd are released.
       // The supervisor's `shutdown()` is idempotent (returns early when
@@ -2221,6 +2343,9 @@ export function createSidecarWorkflowSupervisor(
     readPrincipal: supervisorPrincipal,
     deriveStepAddress: opts.deriveStepAddress,
     onRunStart,
+    ...(opts.credentialDelivery !== undefined
+      ? { credentialDelivery: opts.credentialDelivery }
+      : {}),
     ...(opts.onSuspensionRegister !== undefined
       ? { onSuspensionRegister: opts.onSuspensionRegister }
       : {}),
@@ -2244,7 +2369,7 @@ export function createSidecarWorkflowSupervisor(
   return {
     supervisor,
     routeInbound(message) {
-      mailBus.routeInbound(opts.deploymentMailAddress, message);
+      return mailBus.routeInbound(opts.deploymentMailAddress, message);
     },
     getCredentialsSnapshot: () => supervisor.getCredentialsSnapshot(),
     onRunStart,

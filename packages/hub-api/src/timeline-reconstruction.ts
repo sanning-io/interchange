@@ -6,7 +6,10 @@ import {
   listMail,
   type MailDirection,
 } from "@intx/storage-isogit";
-import type { ConversationTurn } from "@intx/types/runtime";
+import {
+  formatSafetyRatingText,
+  type ConversationTurn,
+} from "@intx/types/runtime";
 import {
   ErrorRecord,
   type ErrorRecord as ErrorRecordType,
@@ -96,18 +99,19 @@ function isToolResultTurn(msg: ConversationTurn): boolean {
 }
 
 function extractTextContent(msg: ConversationTurn): string {
-  // Treat refusal blocks as text for timeline-summary purposes. A
-  // refusal-only assistant turn carries human-readable model output
-  // (the model declined a structured-output request and explained
-  // why); summarising it as the empty string would render the turn
-  // invisible on the timeline even though the model produced
-  // coherent content. The structural "this was a refusal" signal is
-  // preserved on the persisted turn-part kind for any consumer that
-  // wants to render policy declines differently.
+  // Treat refusal and safety_rating blocks as text for timeline-
+  // summary purposes. A refusal-only or safety-only assistant turn
+  // carries human-readable model/filter output; summarising it as
+  // the empty string would render the turn invisible on the timeline.
+  // Structural part kinds stay on the persisted turn-part for any
+  // consumer that wants to render policy declines differently.
   return msg.content
     .map((b) => {
       if (b.type === "text") return b.text;
       if (b.type === "refusal") return b.reason;
+      if (b.type === "safety_rating") {
+        return formatSafetyRatingText(b);
+      }
       return "";
     })
     .join("");

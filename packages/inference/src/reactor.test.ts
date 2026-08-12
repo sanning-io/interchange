@@ -1978,6 +1978,42 @@ describe("createReactor — abort handling", () => {
     // No messages should have been processed.
     expect(events.some((e) => e.type === "message.received")).toBe(false);
   });
+
+  test("abort signals an in-flight inference before the loop can dequeue it", async () => {
+    const inferenceStarted = Promise.withResolvers<boolean>();
+    const { reactor, waitFor } = createTestReactor({
+      director: directorFromTable({
+        "message.received": (_e, _s, caps) => caps.infer(),
+      }),
+      inferenceRunner: async function* (opts) {
+        inferenceStarted.resolve(true);
+        await new Promise<void>((resolve) => {
+          if (opts.signal?.aborted === true) {
+            resolve();
+            return;
+          }
+          opts.signal?.addEventListener("abort", () => resolve(), {
+            once: true,
+          });
+        });
+        yield {
+          type: "inference.error",
+          seq: opts.nextSeq(),
+          data: {
+            error: { category: "aborted", message: "aborted" },
+            partial: { text: "" },
+          },
+        };
+      },
+    });
+
+    reactor.start();
+    reactor.deliver(makeInboundMessage());
+    await inferenceStarted.promise;
+    reactor.abort("user_disconnect");
+
+    await waitFor("reactor.done");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -3741,6 +3777,87 @@ describe("createReactor — before-tool suspension on ask grant", () => {
     );
 
     await second.waitFor("reactor.done");
+  });
+
+  test("buffers an approval delivered before startup until its correlation is rehydrated", async () => {
+    const correlationId = "cold-start-correlation";
+    const cell: PersistedCell = {
+      turns: [],
+      pendingOperations: [
+        {
+          correlationId,
+          kind: "approval",
+          registeredAt: Date.now(),
+          gateId: `pending-${correlationId}`,
+          timeoutAt: Date.now() + 60_000,
+          suspendedCall: {
+            id: "call-ask",
+            name: "charge_card",
+            arguments: {},
+          },
+        },
+      ],
+      tokenUsage: emptyUsage(),
+    };
+    const persistedStore = makePersistingContextStore(cell);
+    const loadGate = Promise.withResolvers<boolean>();
+    const loadStarted = Promise.withResolvers<boolean>();
+    const delayedStore: ContextStore = {
+      ...persistedStore,
+      async load() {
+        loadStarted.resolve(true);
+        await loadGate.promise;
+        return persistedStore.load();
+      },
+    };
+    const askExtension = createAuthzExtension({
+      authorize: async () => ({
+        effect: "ask" as const,
+        matchingGrants: [],
+        resolvedBy: null,
+      }),
+      approvalTimeoutMs: 60_000,
+    });
+    const toolsRun: string[] = [];
+    const { reactor, events, waitFor } = createTestReactor({
+      contextStore: delayedStore,
+      director: directorFromTable(
+        {
+          "resume.execute_tools": (event, _state, caps) =>
+            caps.executeTools(event.calls, false, true),
+          "tool.done": (_event, _state, caps) => caps.done(),
+        },
+        "wait",
+      ),
+      toolRunner: makeToolRunner(async (call) => {
+        toolsRun.push(call.name);
+        return { callId: call.id, content: "charged" };
+      }),
+      beforeToolExtensions: [askExtension],
+    });
+
+    reactor.start();
+    await loadStarted.promise;
+    reactor.deliver(makeApprovalMessage(correlationId));
+    await Promise.resolve();
+
+    expect(events.some((event) => event.type === "message.received")).toBe(
+      false,
+    );
+
+    loadGate.resolve(true);
+
+    const toolDone = await waitFor("tool.done");
+    if (toolDone.type !== "tool.done") throw new Error("unreachable");
+    expect(toolDone.data.result.callId).toBe("call-ask");
+    expect(toolsRun).toEqual(["charge_card"]);
+    expect(events.some((event) => event.type === "message.received")).toBe(
+      false,
+    );
+
+    const correlated = getEvent(events, "message.correlated");
+    expect(correlated.data.correlationId).toBe(correlationId);
+    await waitFor("reactor.done");
   });
 });
 
@@ -5513,15 +5630,16 @@ describe("createReactor — source failover", () => {
     expect(done.data.source.sourceId).toBe("s1");
   });
 
-  test("retries the same source on a rate limit before failing over", async () => {
+  test("fails over on quota exhaustion already retried by the harness", async () => {
     const { reactor, events, waitFor, attemptedSourceIds } = multiSourceReactor(
       {
         sourceIds: ["s0", "s1"],
-        // s0 is always rate-limited (short Retry-After so the test stays
-        // fast); s1 succeeds.
+        // s0 is quota-exhausted; the harness wrapper owns quota retry and
+        // has exhausted it by the time the reactor sees the error, so the
+        // reactor fails over rather than re-running s0.
         resultFor: (id) =>
           id === "s0"
-            ? { category: "quota_exhausted", message: "429", retryAfterMs: 1 }
+            ? { category: "quota_exhausted", message: "quota exhausted" }
             : "done",
       },
     );
@@ -5529,8 +5647,7 @@ describe("createReactor — source failover", () => {
     reactor.deliver(makeInboundMessage());
     await waitFor("reactor.done");
 
-    // s0 gets its same-source budget (2 attempts) before failover to s1.
-    expect(attemptedSourceIds).toEqual(["s0", "s0", "s1"]);
+    expect(attemptedSourceIds).toEqual(["s0", "s1"]);
     expect(getEvent(events, "inference.done").data.source.sourceId).toBe("s1");
   });
 

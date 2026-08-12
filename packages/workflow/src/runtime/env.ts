@@ -8,7 +8,7 @@
 // source-level test in `run.test.ts` asserts the discipline.
 
 import type { AgentDefinition, BaseEnv, DirectorRegistry } from "@intx/agent";
-import type { ApprovalSnapshot } from "@intx/types/runtime";
+import type { ApprovalSnapshot, ControlParkKind } from "@intx/types/runtime";
 
 import type {
   AuthorizeContext,
@@ -165,23 +165,42 @@ export interface StepInvokeRequest {
   signal: AbortSignal;
   /**
    * Present only on a resume re-invocation of a step that previously
-   * suspended. The invoker rebuilds the agent against the same context,
-   * delivers an inbound carrying `correlationId` and a body derived from
-   * `decision`, and drives the resumed reactor to its reply. Absent on the
-   * first invocation, where the invoker drives a plain `agent.send`.
+   * suspended. `kind` carries the park kind the step suspended on, so the
+   * invoker synthesizes the right inbound: an `"approval"` resume delivers a
+   * body stamped with `correlationId` so the reactor's `tryCorrelate` matches
+   * the rehydrated gate; an `"input"` resume delivers the `decision` as a
+   * plain next user turn (there is no gate to match). Absent on the first
+   * invocation, where the invoker drives a plain `agent.send`.
    */
-  resume?: { correlationId: string; decision: unknown };
+  resume?: { correlationId: string; decision: unknown; kind: ControlParkKind };
 }
 
 /**
- * The outcome of a single `invokeStep`. A step either produces its
- * `output` (the agent replied) or suspends: the reactor parked on a gate
- * awaiting an external decision, handing back the `correlationId` the
- * runtime parks the step on until the correlated decision is delivered.
+ * The outcome of a single `invokeStep`. A step either produces its `output`
+ * (the agent replied) or suspends on a tool/authz gate, handing back the
+ * `correlationId` the runtime parks the step on until the correlated decision
+ * is delivered. The suspend carries an explicit `kind: "approval"`
+ * discriminant and a REQUIRED snapshot (the sidecar->hub co-write treats it
+ * as mandatory), so a snapshot-less approval is unrepresentable here rather
+ * than resting on the runtime guard alone.
+ *
+ * An invoker can ONLY suspend as an approval. The `"input"` control-plane
+ * park (a long-lived step awaiting its next trigger) is minted exclusively by
+ * the RUNTIME's trigger-budget re-arm -- never by an invoker -- which is what
+ * keeps the finite-budget respawn seed sound: every input `SignalAwaited` in
+ * the durable log is a runtime re-arm, so counting them counts turns
+ * serviced. Offering an input arm here would let a host invoker emit input
+ * parks that inflate that count.
  */
 export type StepInvokeResult =
   | { output: unknown }
-  | { suspend: { correlationId: string; approvalSnapshot?: ApprovalSnapshot } };
+  | {
+      suspend: {
+        correlationId: string;
+        kind: "approval";
+        approvalSnapshot: ApprovalSnapshot;
+      };
+    };
 
 /**
  * Per-action deterministic effect handler invocation, the effect analog
@@ -300,6 +319,77 @@ export type SpawnChildWorkflow = (input: {
 }>;
 
 /**
+ * An approval park surfaced from a suspendable child body: the reserved
+ * correlation the child parked on and the approver-facing snapshot, so the
+ * parent (runOnTrigger) can proxy the approval up its OWN run's park
+ * machinery on the same correlation. A child body's `input` parks are the
+ * section's re-arm, not surfaced here.
+ */
+export type SuspendableChildPark = {
+  correlationId: string;
+  approvalSnapshot?: ApprovalSnapshot;
+};
+
+/**
+ * A live handle to a running suspendable child body. `next` resolves each
+ * time the child parks on an approval (the caller proxies it up and, once
+ * granted, calls `resume`), parks on an author `awaitSignal` gate (surfaced as
+ * `signal-park` so the caller proxies it up as a signal-relay await and
+ * `deliverSignal`s the resolved signal back), or reaches a terminal. `resume`
+ * delivers the granted decision to the child's reserved correlation channel;
+ * `deliverSignal` delivers a signal on the body's own author-chosen name.
+ * Both unblock the body's awaiter so it continues.
+ */
+export type SuspendableChildHandle = {
+  next(): Promise<
+    | { kind: "park"; park: SuspendableChildPark }
+    | { kind: "signal-park"; name: string }
+    | { kind: "terminal"; terminalStatus: "completed" | "failed" | "cancelled" }
+  >;
+  resume(correlationId: string, decision: unknown): Promise<void>;
+  /**
+   * Deliver a signal on the body's author-chosen name (a non-reserved
+   * `awaitSignal` gate the body parked on), carrying the ORIGINAL `signalId`
+   * so the body's run-lifetime dedup makes a redelivered relay idempotent.
+   * Distinct from `resume`, which targets a reserved correlation channel.
+   */
+  deliverSignal(
+    name: string,
+    payload: unknown,
+    signalId: string,
+  ): Promise<void>;
+};
+
+/**
+ * Spawn a body sub-DAG as a child run that MAY suspend on an approval park.
+ * Unlike `spawnChild` (which awaits a terminal), this returns a live handle
+ * the caller drives across parks: the child's control-plane approval parks
+ * surface via `handle.next()` so the caller proxies them up its own run's
+ * park machinery, and `handle.resume` relays the granted decision back into
+ * the child. onTrigger runs every event's body through this seam, so a body
+ * step's approval is serviced without the body child ever needing to reach a
+ * terminal to unblock the parent.
+ *
+ * `resumeFromEvents` re-adopts a body child that was mid-flight when the
+ * process crashed: the seam drives `runtimeRun` from the supplied durable log
+ * instead of a fresh `triggerPayload`, so a body step that was parked on an
+ * approval re-parks on its reserved channel. A re-park does NOT re-fire
+ * `onPark` (the park is already durable), so the caller does not observe the
+ * in-flight park via `next()` on resume; it relays the eventual grant via
+ * `resume` on the correlation it recovered from its own log, and `next()`
+ * resumes surfacing the body's subsequent parks and terminal as normal.
+ */
+export type SpawnSuspendableChild = (input: {
+  definitionRef: string;
+  childRunId: string;
+  input: unknown;
+  parentRunId: string;
+  parentStepId: string;
+  signal: AbortSignal;
+  resumeFromEvents?: readonly WorkflowEvent[];
+}) => Promise<SuspendableChildHandle>;
+
+/**
  * Run one loop iteration as a child run. Distinct from `spawnChild`:
  * loop iterations run the inline `bodyDefinition` against a SHARED store
  * (the parent's repoStore + blobs + effects) under a caller-supplied
@@ -354,12 +444,7 @@ export type LoopFnRegistry = (ref: string) => LoopFn;
 export type WorkflowPark = {
   runId: string;
   correlationId: string;
-  // A one-arm discriminated union, not `kind: SignalKind`: `approval` is the
-  // only control-plane kind today and it REQUIRES an `approvalSnapshot`. A
-  // second `SignalKind` must add its own arm here and declare its own snapshot
-  // policy rather than silently inheriting approval's -- the same discipline
-  // `signalKindToGateType`'s `assertNever` enforces at the gate switch.
-  kind: "approval";
+  parkKind: ControlParkKind;
   /**
    * Approver-facing snapshot of the parked tool call, forwarded from the
    * reactor so the host can register it alongside the correlation. Required on
@@ -367,8 +452,27 @@ export type WorkflowPark = {
    * snapshot-less one, because the sidecar->hub co-write treats the snapshot as
    * mandatory (the register frame requires it and the approval columns are NOT
    * NULL). A resume-from-park does not re-fire the notify.
+   *
+   * Absent for input parks, which carry no snapshot.
    */
-  approvalSnapshot: ApprovalSnapshot;
+  approvalSnapshot?: ApprovalSnapshot;
+};
+
+/**
+ * The notify a suspendable child body fires when a step parks on an author
+ * `awaitSignal` gate -- a NON-reserved, author-chosen `name` (not a reserved
+ * `signalName(correlationId)` control channel). Distinct from {@link
+ * WorkflowPark}: an author gate carries no correlation and no snapshot, so the
+ * host cannot register it at the hub. The suspendable-child seam surfaces it up
+ * to `runOnTrigger`, which proxies the body's await as a signal-relay await on
+ * its own run and relays the resolved signal back down. A host that is not a
+ * suspendable-child body (the container run, runLocal) leaves `onSignalPark`
+ * unset, so an author gate outside a section body parks with no notify exactly
+ * as before.
+ */
+export type WorkflowSignalPark = {
+  runId: string;
+  name: string;
 };
 
 /**
@@ -436,6 +540,20 @@ export interface WorkflowRuntimeEnv {
   /** Spawn callback for `childWorkflow`. */
   spawnChild: SpawnChildWorkflow;
   /**
+   * Spawn callback for an onTrigger section's per-event body: a child run
+   * driven across approval parks via a live handle (see
+   * {@link SpawnSuspendableChild}). Optional: a host that does not wire it
+   * does not support onTrigger sections, and `runOnTrigger` fails loudly.
+   *
+   * This is a second child-drive seam alongside the terminal-only
+   * `spawnChild` that `childWorkflow` uses, rather than one unified
+   * park-aware seam. The two are kept separate because unifying them would
+   * require migrating `childWorkflow`'s terminal-only path onto the
+   * park-aware drive; that is a deliberate, separate decision, not an
+   * oversight.
+   */
+  spawnSuspendableChild?: SpawnSuspendableChild;
+  /**
    * Run one loop iteration as a child run against the shared store.
    * Optional: a host that does not wire it does not support `loop`, and
    * `runLoop` fails loudly. runLocal wires it.
@@ -481,6 +599,19 @@ export interface WorkflowRuntimeEnv {
    * does not wire it does not register suspensions -- runLocal leaves it unset.
    */
   onPark?: (park: WorkflowPark) => void;
+  /**
+   * Optional author-signal park sink, the non-reserved-channel sibling of
+   * `onPark`. Fired once each time a step parks on an author `awaitSignal`
+   * gate (a plain, author-chosen `name`, not a reserved
+   * `signalName(correlationId)` channel), on the fresh park only -- a re-park
+   * resume that finds the step already `awaiting-signal` does not re-fire, the
+   * same discipline as `onPark`. The suspendable-child seam wires it so a
+   * section body's author gate surfaces up to `runOnTrigger`; every other host
+   * -- the container run, runLocal -- leaves it unset, so an author gate there
+   * parks silently on the signal channel exactly as before (no behavior change
+   * off the section-body path).
+   */
+  onSignalPark?: (park: WorkflowSignalPark) => void;
   /**
    * Optional read-only recovery hook: enumerate the durable pending approval
    * operations a step left behind, keyed by `{ runId, stepId, attempt }`. The

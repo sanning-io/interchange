@@ -4,12 +4,21 @@ import { wire } from "@intx/inference-testing";
 import {
   parseSSE,
   ProtocolMismatchError,
+  runInference,
+  createDefaultScheduler,
   type ProviderAdapter,
+  type Dependencies,
 } from "@intx/inference";
-import { createOpenAIAdapter } from "@intx/inference/providers";
+import {
+  createOpenAIAdapter,
+  createBuiltinRegistry,
+} from "@intx/inference/providers";
 import type {
+  AssistantTurn,
+  ContentBlock,
   ConversationTurn,
   InferenceEvent,
+  InferenceSource,
   LastCycleSource,
 } from "@intx/types/runtime";
 
@@ -67,6 +76,7 @@ const OpenAIRequestBody = type({
   "temperature?": "number",
   "tools?": "unknown[]",
   "response_format?": "unknown",
+  "reasoning_effort?": "'none'",
 });
 
 // Drives a sequence of wire DSL chunks (full SSE-framed Uint8Arrays) through
@@ -127,6 +137,34 @@ describe("OpenAI adapter: buildRequest", () => {
     expect(body.messages).toHaveLength(1);
     expect(body.messages[0]?.role).toBe("user");
     expect(body.messages[0]?.content).toBe("What is 2+2?");
+  });
+
+  test("rewrites safety_rating history to assistant text content", () => {
+    const messages: ConversationTurn[] = [
+      {
+        role: "user",
+        content: [{ type: "text", text: "blocked prompt" }],
+        timestamp: 1,
+      },
+      {
+        role: "assistant",
+        content: [{ type: "safety_rating", blockReason: "PROHIBITED_CONTENT" }],
+        model: "gemini-2.5-flash",
+        timestamp: 2,
+      },
+      {
+        role: "user",
+        content: [{ type: "text", text: "try again" }],
+        timestamp: 3,
+      },
+    ];
+    const req = adapter.buildRequest(messages, "gpt-5.5", {});
+    const body = OpenAIRequestBody.assert(JSON.parse(req.body));
+    expect(body.messages).toHaveLength(3);
+    expect(body.messages[1]?.role).toBe("assistant");
+    expect(body.messages[1]?.content).toBe(
+      "Request blocked: PROHIBITED_CONTENT",
+    );
   });
 
   test("converts system messages to system role", () => {
@@ -438,18 +476,14 @@ describe("OpenAI adapter: buildRequest", () => {
     },
   );
 
-  test("rejects a document content block with a message naming the missing capture", () => {
-    // OpenAI's Chat Completions has a `file` content type for PDFs,
-    // but the exact wire shape (field names, required filename
-    // metadata) is version-sensitive and the capture corpus has no
-    // OpenAI document fixtures to verify against. The throw is the
-    // honest answer: surface explicit context rather than emitting
-    // an unverified shape that might silently land as malformed
-    // input the model ignores.
+  test("emits a base64 PDF document as a Chat Completions file part", () => {
+    // Shape grounded on openai/gpt-5.5/document-input capture: typed
+    // text + file parts; file_data is a data URI; filename required.
     const messages: ConversationTurn[] = [
       {
         role: "user",
         content: [
+          { type: "text", text: "Summarize the attached document." },
           {
             type: "document",
             source: {
@@ -463,11 +497,105 @@ describe("OpenAI adapter: buildRequest", () => {
       },
     ];
 
+    const req = adapter.buildRequest(messages, "gpt-5.5", {});
+    const body = OpenAIRequestBody.assert(JSON.parse(req.body));
+    const content = body.messages[0]?.content;
+    if (!Array.isArray(content)) {
+      throw new Error("expected multimodal content array");
+    }
+    expect(content).toEqual([
+      { type: "text", text: "Summarize the attached document." },
+      {
+        type: "file",
+        file: {
+          filename: "document.pdf",
+          file_data: "data:application/pdf;base64,JVBERi0xLjQK",
+        },
+      },
+    ]);
+  });
+
+  test("rejects a non-PDF base64 document mimeType", () => {
+    const messages: ConversationTurn[] = [
+      {
+        role: "user",
+        content: [
+          {
+            type: "document",
+            source: {
+              kind: "base64",
+              mimeType: "text/plain",
+              data: "aGVsbG8=",
+            },
+          },
+        ],
+        timestamp: 1000,
+      },
+    ];
+
     expect(() => adapter.buildRequest(messages, "gpt-5.5", {})).toThrow(
-      /document content blocks/,
+      /application\/pdf only/,
     );
     expect(() => adapter.buildRequest(messages, "gpt-5.5", {})).toThrow(
-      /captured fixture/,
+      /text\/plain/,
+    );
+  });
+
+  test("emits a file-reference document as file_id", () => {
+    const messages: ConversationTurn[] = [
+      {
+        role: "user",
+        content: [
+          {
+            type: "document",
+            source: {
+              kind: "file-reference",
+              mimeType: "application/pdf",
+              reference: "file-abc123",
+            },
+          },
+        ],
+        timestamp: 1000,
+      },
+    ];
+
+    const req = adapter.buildRequest(messages, "gpt-5.5", {});
+    const body = OpenAIRequestBody.assert(JSON.parse(req.body));
+    const content = body.messages[0]?.content;
+    if (!Array.isArray(content)) {
+      throw new Error("expected multimodal content array");
+    }
+    expect(content).toEqual([
+      {
+        type: "file",
+        file: { file_id: "file-abc123" },
+      },
+    ]);
+  });
+
+  test("rejects a url document source with a message naming the url", () => {
+    const messages: ConversationTurn[] = [
+      {
+        role: "user",
+        content: [
+          {
+            type: "document",
+            source: {
+              kind: "url",
+              mimeType: "application/pdf",
+              url: "https://example.com/report.pdf",
+            },
+          },
+        ],
+        timestamp: 1000,
+      },
+    ];
+
+    expect(() => adapter.buildRequest(messages, "gpt-5.5", {})).toThrow(
+      /url document sources/,
+    );
+    expect(() => adapter.buildRequest(messages, "gpt-5.5", {})).toThrow(
+      /https:\/\/example\.com\/report\.pdf/,
     );
   });
 
@@ -751,6 +879,29 @@ describe("OpenAI adapter: parseResponse", () => {
     }
   });
 
+  test("usage riding a choice-bearing chunk carries cacheRead and thinking", async () => {
+    // Some OpenAI-compatible relays attach the final usage object to the
+    // last content-bearing chunk (one that still carries a choice) instead
+    // of a separate choices-empty chunk. That usage must still surface
+    // cacheRead/thinking from the detail sub-objects rather than be zeroed.
+    const events = await parseWire(adapter, [
+      wire.openai.raw(
+        'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],' +
+          '"usage":{"prompt_tokens":50,"completion_tokens":20,' +
+          '"prompt_tokens_details":{"cached_tokens":30},' +
+          '"completion_tokens_details":{"reasoning_tokens":8}}}\n\n',
+      ),
+    ]);
+    const usage = events.find((e) => e.type === "inference.usage");
+    expect(usage?.type).toBe("inference.usage");
+    if (usage?.type === "inference.usage") {
+      expect(usage.data.usage.input).toBe(50);
+      expect(usage.data.usage.output).toBe(20);
+      expect(usage.data.usage.cacheRead).toBe(30);
+      expect(usage.data.usage.thinking).toBe(8);
+    }
+  });
+
   test("parses Fireworks-shaped tool-call deltas with null name/id on follow-up fragments", async () => {
     // Fireworks (and other OpenAI-compatible deployments routing through
     // opencode-zen) emits `id: null` and `function.name: null` on every
@@ -955,6 +1106,33 @@ describe("OpenAI adapter: responseFormat translation", () => {
     const req = adapter.buildRequest(conversation, "gpt-5.5", {});
     const body = OpenAIRequestBody.assert(JSON.parse(req.body));
     expect(body.response_format).toBeUndefined();
+  });
+
+  test("sets reasoning_effort none for gpt-5.6 tool calls and omits it for gpt-5.5", () => {
+    const tools = [
+      {
+        name: "get_weather",
+        description: "Look up weather",
+        inputSchema: {
+          type: "object",
+          properties: { location: { type: "string" } },
+          required: ["location"],
+        },
+      },
+    ];
+    for (const model of [
+      "gpt-5.6-sol",
+      "gpt-5.6-terra",
+      "gpt-5.6-luna",
+    ] as const) {
+      const req = adapter.buildRequest(conversation, model, { tools });
+      const body = OpenAIRequestBody.assert(JSON.parse(req.body));
+      expect(body.reasoning_effort).toBe("none");
+      expect(body.tools).toBeDefined();
+    }
+    const legacy = adapter.buildRequest(conversation, "gpt-5.5", { tools });
+    const legacyBody = OpenAIRequestBody.assert(JSON.parse(legacy.body));
+    expect(legacyBody.reasoning_effort).toBeUndefined();
   });
 
   test("translates responseFormat.kind=text to { type: 'text' }", () => {
@@ -1229,5 +1407,337 @@ describe("OpenAI adapter: quirks", () => {
     if (events[0]?.type === "inference.thinking.delta") {
       expect(events[0].data.token).toBe("xyz");
     }
+  });
+});
+
+const JSON_SOURCE: InferenceSource = {
+  id: "openai:test-model",
+  provider: "openai",
+  baseURL: "https://test.invalid/v1",
+  apiKey: "test",
+  model: "test-model",
+};
+
+// Drives a response body through the real harness accumulator and returns the
+// assembled turn plus every event. The content-type selects the decode path
+// (JSON body vs SSE stream), so one helper drives both parseJSONResponse and
+// parseResponse. Asserting the decoded turn (not the raw events) is deliberate:
+// the accumulator silently drops unmodeled events and unmatched tool deltas.
+async function driveTurn(
+  body: string,
+  contentType = "application/json",
+): Promise<{ turn: AssistantTurn | undefined; events: InferenceEvent[] }> {
+  const deps: Dependencies = {
+    fetch: () =>
+      Promise.resolve(
+        new Response(body, {
+          status: 200,
+          headers: { "content-type": contentType },
+        }),
+      ),
+    scheduler: createDefaultScheduler(),
+    adapters: createBuiltinRegistry(),
+  };
+  let seq = 0;
+  const events: InferenceEvent[] = [];
+  for await (const ev of runInference({
+    turns: [
+      { role: "user", content: [{ type: "text", text: "hi" }], timestamp: 0 },
+    ],
+    source: JSON_SOURCE,
+    nextSeq: () => ++seq,
+    deps,
+  })) {
+    events.push(ev);
+  }
+  const done = events.find(
+    (e): e is Extract<InferenceEvent, { type: "inference.done" }> =>
+      e.type === "inference.done",
+  );
+  return { turn: done?.data.turn, events };
+}
+
+function blocksOfType<T extends ContentBlock["type"]>(
+  turn: AssistantTurn,
+  blockType: T,
+): Extract<ContentBlock, { type: T }>[] {
+  return turn.content.filter(
+    (b): b is Extract<ContentBlock, { type: T }> => b.type === blockType,
+  );
+}
+
+function requireTurn(turn: AssistantTurn | undefined): AssistantTurn {
+  if (turn === undefined) throw new Error("expected an inference.done turn");
+  return turn;
+}
+
+function sseBody(parts: Uint8Array[]): string {
+  const dec = new TextDecoder();
+  return parts.map((p) => dec.decode(p)).join("");
+}
+
+describe("createOpenAIAdapter — parseJSONResponse (non-streaming)", () => {
+  test("decodes plain text and the full usage detail sub-objects", async () => {
+    const body = JSON.stringify({
+      object: "chat.completion",
+      model: "test-model",
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: "assistant",
+            content: "The capital of France is Paris.",
+          },
+          finish_reason: "stop",
+        },
+      ],
+      usage: {
+        prompt_tokens: 19,
+        completion_tokens: 23,
+        prompt_tokens_details: { cached_tokens: 5 },
+        completion_tokens_details: { reasoning_tokens: 7 },
+      },
+    });
+    const { turn, events } = await driveTurn(body);
+    const t = requireTurn(turn);
+    expect(blocksOfType(t, "text").map((b) => b.text)).toEqual([
+      "The capital of France is Paris.",
+    ]);
+    const done = events.find(
+      (e): e is Extract<InferenceEvent, { type: "inference.done" }> =>
+        e.type === "inference.done",
+    );
+    // cacheRead and thinking prove the full toInferenceUsage mapping is used,
+    // not the lossy in-chunk mapping that zeroes them.
+    expect(done?.data.usage.input).toBe(19);
+    expect(done?.data.usage.output).toBe(23);
+    expect(done?.data.usage.cacheRead).toBe(5);
+    expect(done?.data.usage.thinking).toBe(7);
+  });
+
+  test("decodes tool_calls with empty content into a tool call at index 0", async () => {
+    const body = JSON.stringify({
+      object: "chat.completion",
+      model: "test-model",
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: "assistant",
+            content: "",
+            tool_calls: [
+              {
+                index: 0,
+                id: "call_1",
+                type: "function",
+                function: {
+                  name: "get_weather",
+                  arguments: '{"location":"Boston, MA"}',
+                },
+              },
+            ],
+          },
+          finish_reason: "tool_calls",
+        },
+      ],
+      usage: { prompt_tokens: 5, completion_tokens: 3 },
+    });
+    const t = requireTurn((await driveTurn(body)).turn);
+    // Empty content must not produce a text block or claim an index.
+    expect(blocksOfType(t, "text")).toHaveLength(0);
+    const calls = blocksOfType(t, "tool_call");
+    expect(calls).toHaveLength(1);
+    const call = calls[0];
+    if (call === undefined) throw new Error("expected a tool call");
+    expect(call.name).toBe("get_weather");
+    expect(call.id).toBe("call_1");
+    expect(call.arguments).toEqual({ location: "Boston, MA" });
+  });
+
+  test("reasoning precedence: an empty reasoning_content shadows a populated reasoning", async () => {
+    // Mirrors the streaming quirk exactly: the first non-null reasoning field
+    // claims the slot and stops the search, then the non-empty length gate
+    // drops the empty value, so reasoning is emitted from neither field.
+    const body = JSON.stringify({
+      object: "chat.completion",
+      model: "test-model",
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: "assistant",
+            reasoning_content: "",
+            reasoning: "should be shadowed",
+            content: "answer",
+          },
+          finish_reason: "stop",
+        },
+      ],
+      usage: { prompt_tokens: 5, completion_tokens: 3 },
+    });
+    const t = requireTurn((await driveTurn(body)).turn);
+    expect(blocksOfType(t, "thinking")).toHaveLength(0);
+    expect(blocksOfType(t, "text").map((b) => b.text)).toEqual(["answer"]);
+  });
+
+  test("surfaces a protocol mismatch on a non-completion body", async () => {
+    // A streaming chunk shape (object chat.completion.chunk, no usage) must
+    // not decode as a non-streaming completion.
+    const body = JSON.stringify({
+      object: "chat.completion.chunk",
+      choices: [{ index: 0, delta: { content: "x" } }],
+    });
+    const { events } = await driveTurn(body);
+    const error = events.find(
+      (e): e is Extract<InferenceEvent, { type: "inference.error" }> =>
+        e.type === "inference.error",
+    );
+    if (error === undefined) throw new Error("expected inference.error");
+    expect(error.data.error.category).toBe("protocol_mismatch");
+  });
+});
+
+describe("createOpenAIAdapter — streaming vs non-streaming parity", () => {
+  // The point of parseJSONResponse is that a replayed non-streaming capture
+  // decodes to the same turn its streaming sibling would. Drive one
+  // logically-equivalent reasoning + text + tool_call response through both
+  // decode paths and assert the turn and usage are identical. The SSE fixture
+  // is built in natural arrival order (reasoning, then content, then the tool
+  // call), which is the order the JSON field-walk reproduces.
+  test("a reasoning + text + tool_call turn decodes identically through both paths", async () => {
+    const jsonBody = JSON.stringify({
+      object: "chat.completion",
+      model: "test-model",
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: "assistant",
+            reasoning_content: "thinking about weather",
+            content: "Let me check.",
+            tool_calls: [
+              {
+                index: 0,
+                id: "call_1",
+                type: "function",
+                function: {
+                  name: "get_weather",
+                  arguments: '{"location":"Boston"}',
+                },
+              },
+            ],
+          },
+          finish_reason: "tool_calls",
+        },
+      ],
+      usage: {
+        prompt_tokens: 20,
+        completion_tokens: 10,
+        prompt_tokens_details: { cached_tokens: 4 },
+        completion_tokens_details: { reasoning_tokens: 6 },
+      },
+    });
+
+    const streamBody = sseBody([
+      wire.openai.chunk({ reasoningContent: "thinking about weather" }),
+      wire.openai.chunk({ content: "Let me check." }),
+      wire.openai.toolCallStart(0, "call_1", "get_weather"),
+      wire.openai.toolCallArgumentsDelta(0, '{"location":"Boston"}'),
+      wire.openai.usageChunk({
+        promptTokens: 20,
+        completionTokens: 10,
+        cachedTokens: 4,
+        reasoningTokens: 6,
+      }),
+      wire.openai.done(),
+    ]);
+
+    const jsonResult = await driveTurn(jsonBody, "application/json");
+    const streamResult = await driveTurn(streamBody, "text/event-stream");
+
+    expect(jsonResult.events.some((e) => e.type === "inference.error")).toBe(
+      false,
+    );
+    expect(streamResult.events.some((e) => e.type === "inference.error")).toBe(
+      false,
+    );
+
+    const jt = requireTurn(jsonResult.turn);
+    const st = requireTurn(streamResult.turn);
+    expect(jt.content).toEqual(st.content);
+
+    const jdone = jsonResult.events.find(
+      (e): e is Extract<InferenceEvent, { type: "inference.done" }> =>
+        e.type === "inference.done",
+    );
+    const sdone = streamResult.events.find(
+      (e): e is Extract<InferenceEvent, { type: "inference.done" }> =>
+        e.type === "inference.done",
+    );
+    expect(jdone?.data.usage).toEqual(sdone?.data.usage);
+  });
+});
+
+describe("createOpenAIAdapter — parseJSONResponse parallel tool calls", () => {
+  // Regression: genuine OpenAI non-streaming responses omit `index` on the
+  // tool_calls[] items. Two parallel calls must land on distinct block
+  // indices (via their array position), not collapse onto slot 0 and collide
+  // in the harness accumulator. The streaming form (distinct wire indices) is
+  // the parity control.
+  test("two indexless parallel tool calls decode to two distinct calls", async () => {
+    const jsonBody = JSON.stringify({
+      object: "chat.completion",
+      model: "test-model",
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: "assistant",
+            content: "",
+            tool_calls: [
+              {
+                id: "call_a",
+                type: "function",
+                function: { name: "get_weather", arguments: '{"city":"A"}' },
+              },
+              {
+                id: "call_b",
+                type: "function",
+                function: { name: "get_time", arguments: '{"tz":"B"}' },
+              },
+            ],
+          },
+          finish_reason: "tool_calls",
+        },
+      ],
+      usage: { prompt_tokens: 5, completion_tokens: 3 },
+    });
+
+    const streamBody = sseBody([
+      wire.openai.toolCallStart(0, "call_a", "get_weather"),
+      wire.openai.toolCallArgumentsDelta(0, '{"city":"A"}'),
+      wire.openai.toolCallStart(1, "call_b", "get_time"),
+      wire.openai.toolCallArgumentsDelta(1, '{"tz":"B"}'),
+      wire.openai.usageChunk({ promptTokens: 5, completionTokens: 3 }),
+      wire.openai.done(),
+    ]);
+
+    const jsonResult = await driveTurn(jsonBody, "application/json");
+    const streamResult = await driveTurn(streamBody, "text/event-stream");
+
+    expect(jsonResult.events.some((e) => e.type === "inference.error")).toBe(
+      false,
+    );
+
+    const jt = requireTurn(jsonResult.turn);
+    const calls = blocksOfType(jt, "tool_call");
+    expect(calls).toHaveLength(2);
+    expect(calls.map((c) => c.name)).toEqual(["get_weather", "get_time"]);
+    expect(calls.map((c) => c.id)).toEqual(["call_a", "call_b"]);
+    expect(calls.map((c) => c.arguments)).toEqual([{ city: "A" }, { tz: "B" }]);
+
+    // Parity with the streaming form (which carries distinct wire indices).
+    const st = requireTurn(streamResult.turn);
+    expect(jt.content).toEqual(st.content);
   });
 });

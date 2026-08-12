@@ -22,7 +22,7 @@ import { first, ts } from "../format";
 import { generateId } from "@intx/hub-common";
 import { idResource } from "../middleware/grant";
 import type { RequireGrant } from "../middleware/grant";
-import { resolveWorkflowPrincipalNames } from "./workflow-principal-name";
+import { resolveWorkflowPrincipalLabels } from "./workflow-principal-name";
 import {
   parsePageParams,
   cursorCondition,
@@ -94,9 +94,6 @@ async function resolveGrantNames(
     const userRefIds = principals
       .filter((p) => p.kind === "user")
       .map((p) => p.refId);
-    const agentRefIds = principals
-      .filter((p) => p.kind === "agent")
-      .map((p) => p.refId);
     const workflowRefIds = principals
       .filter((p) => p.kind === "workflow")
       .map((p) => p.refId);
@@ -112,47 +109,10 @@ async function resolveGrantNames(
       }
     }
 
-    if (agentRefIds.length > 0) {
-      const agents = await db.query.agent.findMany({
-        where: (a, { inArray }) => inArray(a.id, agentRefIds),
-      });
-      for (const a of agents) {
-        refToName.set(a.id, a.name);
-      }
-
-      // Resolve instance principals (refId = agentInstance.id)
-      const unresolvedRefIds = agentRefIds.filter((id) => !refToName.has(id));
-      if (unresolvedRefIds.length > 0) {
-        const instances = await db.query.agentInstance.findMany({
-          where: (i, { inArray }) => inArray(i.id, unresolvedRefIds),
-        });
-        const definitionIds = [...new Set(instances.map((i) => i.agentId))];
-        const definitions =
-          definitionIds.length > 0
-            ? await db.query.agent.findMany({
-                where: (a, { inArray }) => inArray(a.id, definitionIds),
-              })
-            : [];
-        const defNames = new Map(definitions.map((d) => [d.id, d.name]));
-        for (const inst of instances) {
-          const name = defNames.get(inst.agentId);
-          if (name) {
-            refToName.set(inst.id, `${name} (instance)`);
-          }
-        }
-      }
-    }
-
     if (workflowRefIds.length > 0) {
-      // A workflow principal's refId is its run id; the run's deployment
-      // address is the only human-facing label it has, reached by joining the
-      // runId through workflow_run to workflow_deployment.
-      const workflowNames = await resolveWorkflowPrincipalNames(
-        db,
-        workflowRefIds,
-      );
-      for (const [runId, name] of workflowNames) {
-        refToName.set(runId, name);
+      const wfNames = await resolveWorkflowPrincipalLabels(db, workflowRefIds);
+      for (const [refId, name] of wfNames) {
+        refToName.set(refId, name);
       }
     }
 
@@ -272,19 +232,10 @@ export function createGrantRoutes({
     validator("json", CreateGrant),
     async (c) => {
       const tenantCtx = c.get("tenant");
+      // The body validator (CreateGrant) already enforces exactly one target
+      // -- roleId or principalId, not both and not neither -- so a malformed
+      // request is a 400 before this handler runs.
       const body = c.req.valid("json");
-
-      if (!body.roleId && !body.principalId) {
-        return c.json(
-          {
-            error: {
-              code: "bad_request",
-              message: "Either roleId or principalId must be provided",
-            },
-          },
-          400,
-        );
-      }
 
       const now = new Date();
       const row = first(

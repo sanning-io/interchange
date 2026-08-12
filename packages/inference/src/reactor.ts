@@ -267,6 +267,10 @@ export function createReactor(config: ReactorConfig): Reactor {
   let running = false;
   let done = false;
   let shutdownStarted = false;
+  // Correlation state is empty until context loading and gate rehydration
+  // finish. Hold early deliveries so a resumed approval cannot be mistaken
+  // for a new conversation message during that startup window.
+  let startupDeliveries: InboundMessage[] | null = [];
 
   // Per-message run-bracket state. Set when the loop dequeues a
   // message.received and begins per-message work; cleared at the
@@ -636,19 +640,10 @@ export function createReactor(config: ReactorConfig): Reactor {
     }
 
     const p = (async () => {
-      // Per-source attempt budget for transient errors (quota/retryable/
-      // timeout). Kept small because failover, not flogging one source, is
-      // the recovery path: the harness already does its own mechanical
-      // retry under each attempt, so this caps reactor-level same-source
-      // retries at one before moving to the next source.
-      const sameSourceAttempts = 2;
-      const defaultRetryMs = 60_000;
-
       // Each cycle starts at the most-preferred source; a failover in a
       // prior cycle must not leave the agent permanently demoted.
       resetToPreferredSource();
 
-      let attempt = 0;
       for (;;) {
         const harnessOpts = buildHarnessOpts(
           prompt,
@@ -730,48 +725,17 @@ export function createReactor(config: ReactorConfig): Reactor {
           return;
         }
 
-        // A rate limit is the one category worth waiting out on the same
-        // source: it clears with time, and the reactor's backoff is longer
-        // than the harness's own per-call retry. The harness has already
-        // exhausted its internal mechanical retries for retryable/timeout
-        // by the time the reactor sees them, so those fail over rather than
-        // re-running the same source (which would just retry-compound).
-        if (err.category === "quota_exhausted") {
-          attempt += 1;
-          if (attempt < sameSourceAttempts && !signal.aborted) {
-            const delayMs = err.retryAfterMs ?? defaultRetryMs;
-            logger.warn`Rate limited, retrying same source after ${String(delayMs)}ms`;
-            await new Promise<void>((resolve) => {
-              const timer = setTimeout(resolve, delayMs);
-              const onAbort = () => {
-                clearTimeout(timer);
-                resolve();
-              };
-              signal.addEventListener("abort", onAbort, { once: true });
-            });
-            if (signal.aborted) {
-              enqueue({
-                type: "inference.error",
-                error: {
-                  category: "aborted",
-                  message: "inference aborted during rate limit backoff",
-                },
-                partial,
-              });
-              return;
-            }
-            continue;
-          }
-        }
-
-        // Same-source rate-limit budget exhausted, or a source-specific
-        // failure (credential, protocol mismatch, retryable, timeout): fail
-        // over to the next source. A pacing delay the leaving source asked
-        // for must not gate the next source.
+        // Any remaining error (quota, credential, protocol mismatch,
+        // retryable, timeout) is source-specific. The harness wrapper owns
+        // mechanical retry and has already exhausted it against this source
+        // by the time the reactor sees the error, including honoring a
+        // provider Retry-After for quota, so re-running the same source
+        // would only retry-compound. Fail over to the next source instead.
+        // A pacing delay the leaving source asked for must not gate the
+        // next source.
         pendingPacingDelayMs = 0;
         if (failOverToNextSource()) {
           logger.warn`Failing over to next inference source after ${err.category}`;
-          attempt = 0;
           continue;
         }
 
@@ -1524,6 +1488,8 @@ export function createReactor(config: ReactorConfig): Reactor {
         initialOps = loaded.pendingOperations;
         initialUsage = loaded.tokenUsage;
       } catch (cause) {
+        done = true;
+        startupDeliveries = null;
         logger.error`Context store load failed: ${cause}`;
         emitError(
           `Context store load failed: ${cause instanceof Error ? cause.message : String(cause)}`,
@@ -1561,9 +1527,19 @@ export function createReactor(config: ReactorConfig): Reactor {
 
         emit({ type: "reactor.start", seq: nextSeq(), data: {} });
 
+        const bufferedDeliveries = startupDeliveries;
+        startupDeliveries = null;
+        if (bufferedDeliveries !== null) {
+          for (const message of bufferedDeliveries) {
+            processDelivery(message);
+          }
+        }
+
         await loop();
       } catch (cause) {
         const msg = cause instanceof Error ? cause.message : String(cause);
+        done = true;
+        startupDeliveries = null;
         logger.error`Reactor loop threw unexpectedly: ${cause}`;
         emitError(`Internal reactor error: ${msg}`, true);
         closeMessageRun("failed", {
@@ -1577,8 +1553,7 @@ export function createReactor(config: ReactorConfig): Reactor {
     })();
   }
 
-  function deliver(message: InboundMessage): void {
-    if (done) return;
+  function processDelivery(message: InboundMessage): void {
     void (async () => {
       let correlated: boolean;
       try {
@@ -1612,7 +1587,21 @@ export function createReactor(config: ReactorConfig): Reactor {
     })();
   }
 
+  function deliver(message: InboundMessage): void {
+    if (done) return;
+    if (startupDeliveries !== null) {
+      startupDeliveries.push(message);
+      return;
+    }
+    processDelivery(message);
+  }
+
   function abort(reason: AbortReason): void {
+    // The loop cannot dequeue the abort event while it is awaiting an active
+    // inference or tool batch. Signal that operation immediately so it can
+    // settle and return control to the loop, where the queued abort retains
+    // its priority over every other event.
+    operationController.abort();
     enqueue({ type: "abort", reason });
   }
 

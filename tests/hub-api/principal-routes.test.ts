@@ -25,14 +25,13 @@ import {
   seedAsset,
   seedPrincipal,
   seedTenants,
-  seedWorkflowDeployment,
   seedWorkflowRun,
 } from "@intx/test-harness/seed";
 
 // Exercises the principals resolver against a real migrated schema so the
 // `workflow`-kind display-name second pass -- which reads the deployment's
 // `address` by joining a workflow principal's refId (its run id) through
-// `workflow_run` to `workflow_deployment` -- runs end to end rather than
+// `workflow_run` to its anchor run -- runs end to end rather than
 // against a mock.
 
 const TENANT_ID = "tnt_principals";
@@ -80,6 +79,7 @@ function createMockSidecarRouter(): SidecarRouter {
     sendAgentDeploy: () => notImpl("sendAgentDeploy"),
     sendAgentUndeploy: () => notImpl("sendAgentUndeploy"),
     sendSourcesUpdate: () => notImpl("sendSourcesUpdate"),
+    sendCredentialsUpdate: () => notImpl("sendCredentialsUpdate"),
     sendPack: () => notImpl("sendPack"),
     sendProvisionStep: () => notImpl("sendProvisionStep"),
     bindStepRoute: () => notImpl("bindStepRoute"),
@@ -165,20 +165,25 @@ async function setup() {
     kind: "workflow",
     name: "wf",
   });
-  // The workflow principal's refId is its run id; name resolution joins the
-  // runId through workflow_run to the deployment row to derive the display
-  // name from the deployment's address.
+  // The workflow principal's refId is its run id; name resolution self-joins
+  // the run to its anchor run (on the deployment id) to derive the display
+  // name from the anchor run's address.
   await seedPrincipal(h.db, {
     id: WORKFLOW_PRINCIPAL_ID,
     tenantId: TENANT_ID,
     kind: "workflow",
     refId: RUN_ID,
   });
-  await seedWorkflowDeployment(h.db, {
+  // The deployment's anchor run carries the routing address the display name
+  // resolves to; its id is the deployment id and the child run below self-joins
+  // to it on that id. It is inserted first so the child run's deployment_id FK
+  // resolves.
+  await seedWorkflowRun(h.db, {
     id: DEPLOYMENT_ID,
     tenantId: TENANT_ID,
-    definitionAssetId: ASSET_ID,
+    deploymentId: DEPLOYMENT_ID,
     address: DEPLOYMENT_ADDRESS,
+    status: "running",
   });
   await seedWorkflowRun(h.db, {
     id: RUN_ID,

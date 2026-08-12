@@ -2,9 +2,15 @@ import { describe, test, expect } from "bun:test";
 import { type } from "arktype";
 
 import { createInMemoryGrantStore } from "@intx/authz";
-import { ApprovalResponse, ErrorResponse } from "@intx/types";
+import {
+  ApprovalResponse,
+  ErrorResponse,
+  type SidecarAllocationStatus,
+} from "@intx/types";
 import type { GrantRule } from "@intx/types/authz";
 import type { ApprovalStore, SignalCorrelationStore, DB } from "@intx/db";
+import { sidecarAllocation, workflowRun } from "@intx/db/schema";
+import type { WorkflowRunLifecycle } from "@intx/hub-sessions";
 
 import { createApp } from "../app";
 import {
@@ -12,6 +18,7 @@ import {
   type EventCollectorRegistry,
   type SessionService,
   type SidecarRouter,
+  type WorkflowDispatchService,
 } from "@intx/hub-sessions";
 import type { GetSession } from "../session";
 
@@ -92,12 +99,19 @@ function makeGrant(overrides: Partial<GrantRule> = {}): GrantRule {
 
 function createMockDB(
   approvalList: NonNullable<ParsedApproval>[] = [],
+  sidecarAllocationStatus?: SidecarAllocationStatus,
+  allocationLocks: string[] = [],
+  workflowRunStatuses: readonly ("running" | "completed")[] = [
+    "running",
+    "running",
+  ],
+  operationOrder: string[] = [],
 ): DB["db"] {
-  // The resolver only touches the db through `db.transaction`; the stores it
-  // uses are injected as mocks, so the tx handle is never read here. The list
-  // route reads `db.query.approval.findMany`; the mock ignores the where/order
-  // (tenant scoping and keyset ordering are exercised by the real-DB tests) and
-  // returns the supplied rows, which the route parses and formats.
+  // The resolver locks an exclusive allocation inside `db.transaction`; the
+  // injected stores ignore the rest of the tx handle. The list route reads
+  // `db.query.approval.findMany`; the mock ignores the where/order (tenant
+  // scoping and keyset ordering are exercised by the real-DB tests) and returns
+  // the supplied rows, which the route parses and formats.
   // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- drizzle PgDatabase type cannot be structurally satisfied in tests
   return {
     query: {
@@ -105,7 +119,38 @@ function createMockDB(
       principal: { findFirst: async () => testPrincipal },
       approval: { findMany: async () => approvalList },
     },
-    transaction: async (fn: (tx: unknown) => Promise<unknown>) => fn({}),
+    transaction: async (fn: (tx: unknown) => Promise<unknown>) => {
+      let workflowRunLockIndex = 0;
+      return fn({
+        select: () => ({
+          from: (table: unknown) => ({
+            where: () => ({
+              limit: () => ({
+                for: async (lock: string) => {
+                  if (table === sidecarAllocation) {
+                    allocationLocks.push(lock);
+                    operationOrder.push("allocation-lock");
+                    return sidecarAllocationStatus === undefined
+                      ? []
+                      : [{ id: "sal_test", status: sidecarAllocationStatus }];
+                  }
+                  if (table === workflowRun) {
+                    const index = workflowRunLockIndex;
+                    workflowRunLockIndex += 1;
+                    operationOrder.push(
+                      index === 0 ? "anchor-lock" : "target-lock",
+                    );
+                    const status = workflowRunStatuses[index];
+                    return status === undefined ? [] : [{ status }];
+                  }
+                  throw new Error("mock: unexpected table lock");
+                },
+              }),
+            }),
+          }),
+        }),
+      });
+    },
   } as unknown as DB["db"];
 }
 
@@ -116,8 +161,10 @@ type ResolveCall = {
 
 type MockApprovalStoreOpts = {
   approval: NonNullable<ParsedApproval> | null;
+  transactionalApproval?: NonNullable<ParsedApproval> | null;
   resolveResult?: NonNullable<ParsedApproval> | null;
   resolveCalls: ResolveCall[];
+  operationOrder?: string[];
 };
 
 function createMockApprovalStore(opts: MockApprovalStoreOpts): ApprovalStore {
@@ -128,8 +175,14 @@ function createMockApprovalStore(opts: MockApprovalStoreOpts): ApprovalStore {
     create: () => notImpl("create"),
     createIfAbsent: () => notImpl("createIfAbsent"),
     findByCorrelationId: () => notImpl("findByCorrelationId"),
-    findById: async (id) => (id === APPROVAL_ID ? opts.approval : null),
+    findById: async (id, tx) => {
+      if (id !== APPROVAL_ID) return null;
+      return tx !== undefined && opts.transactionalApproval !== undefined
+        ? opts.transactionalApproval
+        : opts.approval;
+    },
     resolve: async (_correlationId, args) => {
+      opts.operationOrder?.push("resolve");
       opts.resolveCalls.push({ status: args.status, scope: args.scope });
       return opts.resolveResult === undefined
         ? {
@@ -148,6 +201,7 @@ type ClaimCall = { correlationId: string; signalId: string | null };
 type MockSignalStoreOpts = {
   claimResult: { agentAddress: string; runId: string } | null;
   claimCalls: ClaimCall[];
+  operationOrder?: string[];
 };
 
 function createMockSignalCorrelationStore(
@@ -161,6 +215,7 @@ function createMockSignalCorrelationStore(
     registerIfAbsent: () => notImpl("registerIfAbsent"),
     resolveRoute: () => notImpl("resolveRoute"),
     claimTerminal: async (correlationId, _resolvedAt, signalId) => {
+      opts.operationOrder?.push("claim");
       opts.claimCalls.push({ correlationId, signalId });
       if (opts.claimResult === null) return null;
       return {
@@ -219,6 +274,7 @@ function createMockSidecarRouter(
     sendAgentDeploy: () => notImpl("sendAgentDeploy"),
     sendAgentUndeploy: () => notImpl("sendAgentUndeploy"),
     sendSourcesUpdate: () => notImpl("sendSourcesUpdate"),
+    sendCredentialsUpdate: () => notImpl("sendCredentialsUpdate"),
     sendPack: () => notImpl("sendPack"),
     sendProvisionStep: () => notImpl("sendProvisionStep"),
     bindStepRoute: () => notImpl("bindStepRoute"),
@@ -270,8 +326,64 @@ function createMockEventCollectors(): EventCollectorRegistry {
   };
 }
 
+type WorkflowSignalDispatchEnqueue = Parameters<
+  WorkflowDispatchService["enqueueSignal"]
+>[0];
+
+function createMockWorkflowDispatchService(
+  enqueues: WorkflowSignalDispatchEnqueue[],
+  transactionalEnqueues: boolean[],
+  wakeCalls: string[],
+  operationOrder: string[] = [],
+): WorkflowDispatchService {
+  function notImpl(name: string): never {
+    throw new Error(`mock: workflowDispatchService.${name} not implemented`);
+  }
+  return {
+    enqueue: () => notImpl("enqueue"),
+    async enqueueSignal(args, tx) {
+      operationOrder.push("enqueue");
+      enqueues.push(args);
+      transactionalEnqueues.push(tx !== undefined);
+      const now = args.now ?? new Date();
+      return {
+        created: true,
+        dispatch: {
+          id: args.id,
+          anchorRunId: args.anchorRunId,
+          messageId: args.signal.signalId,
+          kind: "signal",
+          rawMessage: new TextEncoder().encode(JSON.stringify(args.signal)),
+          stepGrants: [],
+          status: "pending",
+          acknowledgedGeneration: null,
+          attemptCount: 0,
+          nextAttemptAt: now,
+          deliveryLeaseId: null,
+          deliveryLeaseExpiresAt: null,
+          failureCode: null,
+          failureMessage: null,
+          createdAt: now,
+          updatedAt: now,
+          acknowledgedAt: null,
+          settledAt: null,
+        },
+      };
+    },
+    acknowledge: async () => notImpl("acknowledge"),
+    settle: async () => notImpl("settle"),
+    requeueForReadyAllocation: async () => notImpl("requeueForReadyAllocation"),
+    reconcileNext: async () => notImpl("reconcileNext"),
+    reconcileUntilIdle: async () => notImpl("reconcileUntilIdle"),
+    wake: () => {
+      wakeCalls.push("wake");
+    },
+  };
+}
+
 type TestAppOpts = {
   approval?: NonNullable<ParsedApproval> | null;
+  transactionalApproval?: NonNullable<ParsedApproval> | null;
   approvalList?: NonNullable<ParsedApproval>[];
   resolveResult?: NonNullable<ParsedApproval> | null;
   claimResult?: { agentAddress: string; runId: string } | null;
@@ -280,6 +392,18 @@ type TestAppOpts = {
   resolveCalls?: ResolveCall[];
   claimCalls?: ClaimCall[];
   deliverThrows?: boolean;
+  hasSidecarAllocation?: boolean;
+  sidecarAllocationStatus?: SidecarAllocationStatus;
+  workflowSignalEnqueues?: WorkflowSignalDispatchEnqueue[];
+  transactionalEnqueues?: boolean[];
+  dispatchWakeCalls?: string[];
+  allocationLocks?: string[];
+  runLifecycles?: {
+    topLevel: WorkflowRunLifecycle;
+    target: WorkflowRunLifecycle;
+  };
+  workflowRunStatuses?: readonly ("running" | "completed")[];
+  operationOrder?: string[];
 };
 
 function createTestApp(opts: TestAppOpts = {}) {
@@ -292,23 +416,58 @@ function createTestApp(opts: TestAppOpts = {}) {
   return createApp({
     getSession: createMockGetSession(),
     authHandler: () => new Response("", { status: 404 }),
-    db: createMockDB(opts.approvalList ?? []),
+    db: createMockDB(
+      opts.approvalList ?? [],
+      opts.hasSidecarAllocation
+        ? (opts.sidecarAllocationStatus ?? "allocated")
+        : undefined,
+      opts.allocationLocks,
+      opts.workflowRunStatuses,
+      opts.operationOrder,
+    ),
     grantStore: createInMemoryGrantStore(opts.grants ?? [makeGrant()]),
     approvalStore: createMockApprovalStore({
       approval,
+      ...(opts.transactionalApproval !== undefined
+        ? { transactionalApproval: opts.transactionalApproval }
+        : {}),
       ...(opts.resolveResult !== undefined
         ? { resolveResult: opts.resolveResult }
         : {}),
       resolveCalls: opts.resolveCalls ?? [],
+      ...(opts.operationOrder !== undefined
+        ? { operationOrder: opts.operationOrder }
+        : {}),
     }),
     signalCorrelationStore: createMockSignalCorrelationStore({
       claimResult,
       claimCalls: opts.claimCalls ?? [],
+      ...(opts.operationOrder !== undefined
+        ? { operationOrder: opts.operationOrder }
+        : {}),
     }),
     sidecarRouter: createMockSidecarRouter(
       opts.signalCalls ?? [],
       opts.deliverThrows ?? false,
     ),
+    ...(opts.workflowSignalEnqueues !== undefined
+      ? {
+          workflowDispatchService: createMockWorkflowDispatchService(
+            opts.workflowSignalEnqueues,
+            opts.transactionalEnqueues ?? [],
+            opts.dispatchWakeCalls ?? [],
+            opts.operationOrder,
+          ),
+        }
+      : {}),
+    ...(opts.workflowSignalEnqueues !== undefined
+      ? {
+          readRunLifecycles: async () => {
+            opts.operationOrder?.push("git-lifecycle");
+            return opts.runLifecycles ?? { topLevel: "live", target: "live" };
+          },
+        }
+      : {}),
     sessionService: createMockSessionService(),
     eventCollectors: createMockEventCollectors(),
     assetService: null,
@@ -389,6 +548,202 @@ describe("POST /approvals/:approvalId/approve", () => {
     expect(call.payload).toEqual({ outcome: "approved" });
   });
 
+  test("atomically enqueues an exclusive approval decision for replay", async () => {
+    const signalCalls: SignalCall[] = [];
+    const claimCalls: ClaimCall[] = [];
+    const enqueues: WorkflowSignalDispatchEnqueue[] = [];
+    const transactionalEnqueues: boolean[] = [];
+    const wakeCalls: string[] = [];
+    const allocationLocks: string[] = [];
+    const operationOrder: string[] = [];
+    const app = createTestApp({
+      hasSidecarAllocation: true,
+      signalCalls,
+      claimCalls,
+      workflowSignalEnqueues: enqueues,
+      transactionalEnqueues,
+      dispatchWakeCalls: wakeCalls,
+      allocationLocks,
+      operationOrder,
+    });
+
+    const res = await app.fetch(
+      authedPost(`${base()}/${APPROVAL_ID}/approve`, { scope: "once" }),
+    );
+
+    expect(res.status).toBe(200);
+    expect(signalCalls).toHaveLength(0);
+    expect(transactionalEnqueues).toEqual([true]);
+    expect(allocationLocks).toEqual(["update"]);
+    expect(operationOrder).toEqual([
+      "allocation-lock",
+      "git-lifecycle",
+      "anchor-lock",
+      "target-lock",
+      "claim",
+      "resolve",
+      "enqueue",
+    ]);
+    expect(wakeCalls).toEqual(["wake"]);
+    expect(enqueues).toHaveLength(1);
+    const enqueue = enqueues[0];
+    if (enqueue === undefined) throw new Error("missing signal enqueue");
+    expect(enqueue.id).toBe(
+      `dispatch:${DEPLOYMENT_ID}:${claimCalls[0]?.signalId ?? ""}`,
+    );
+    expect(enqueue.anchorRunId).toBe(DEPLOYMENT_ID);
+    expect(enqueue.signal).toMatchObject({
+      agentAddress: AGENT_ADDRESS,
+      runId: RUN_ID,
+      signalName: `__signal__:${CORRELATION_ID}`,
+      signalId: claimCalls[0]?.signalId,
+      payload: { outcome: "approved" },
+    });
+  });
+
+  for (const terminalRun of ["topLevel", "target"] as const) {
+    test(`does not resolve when the durable ${terminalRun} run is terminal`, async () => {
+      const claimCalls: ClaimCall[] = [];
+      const resolveCalls: ResolveCall[] = [];
+      const enqueues: WorkflowSignalDispatchEnqueue[] = [];
+      const operationOrder: string[] = [];
+      const app = createTestApp({
+        hasSidecarAllocation: true,
+        claimCalls,
+        resolveCalls,
+        workflowSignalEnqueues: enqueues,
+        runLifecycles: {
+          topLevel: terminalRun === "topLevel" ? "terminal" : "live",
+          target: terminalRun === "target" ? "terminal" : "live",
+        },
+        operationOrder,
+      });
+
+      const res = await app.fetch(
+        authedPost(`${base()}/${APPROVAL_ID}/approve`, { scope: "once" }),
+      );
+
+      expect(res.status).toBe(409);
+      expect(await errorCode(res)).toBe("workflow_run_not_running");
+      expect(operationOrder).toEqual(["allocation-lock", "git-lifecycle"]);
+      expect(claimCalls).toEqual([]);
+      expect(resolveCalls).toEqual([]);
+      expect(enqueues).toEqual([]);
+    });
+  }
+
+  for (const terminalRun of ["anchor", "target"] as const) {
+    test(`does not resolve when the SQL ${terminalRun} run is terminal`, async () => {
+      const claimCalls: ClaimCall[] = [];
+      const resolveCalls: ResolveCall[] = [];
+      const enqueues: WorkflowSignalDispatchEnqueue[] = [];
+      const operationOrder: string[] = [];
+      const app = createTestApp({
+        hasSidecarAllocation: true,
+        claimCalls,
+        resolveCalls,
+        workflowSignalEnqueues: enqueues,
+        workflowRunStatuses:
+          terminalRun === "anchor"
+            ? ["completed", "running"]
+            : ["running", "completed"],
+        operationOrder,
+      });
+
+      const res = await app.fetch(
+        authedPost(`${base()}/${APPROVAL_ID}/approve`, { scope: "once" }),
+      );
+
+      expect(res.status).toBe(409);
+      expect(await errorCode(res)).toBe("workflow_run_not_running");
+      expect(operationOrder).toEqual([
+        "allocation-lock",
+        "git-lifecycle",
+        "anchor-lock",
+        "target-lock",
+      ]);
+      expect(claimCalls).toEqual([]);
+      expect(resolveCalls).toEqual([]);
+      expect(enqueues).toEqual([]);
+    });
+  }
+
+  test("preserves already-resolved precedence after a terminal lifecycle check", async () => {
+    const claimCalls: ClaimCall[] = [];
+    const resolveCalls: ResolveCall[] = [];
+    const enqueues: WorkflowSignalDispatchEnqueue[] = [];
+    const app = createTestApp({
+      transactionalApproval: pendingApproval({
+        status: "approved",
+        scope: "once",
+        resolvedAt: new Date("2025-01-03"),
+      }),
+      hasSidecarAllocation: true,
+      claimCalls,
+      resolveCalls,
+      workflowSignalEnqueues: enqueues,
+      runLifecycles: { topLevel: "live", target: "terminal" },
+    });
+
+    const res = await app.fetch(
+      authedPost(`${base()}/${APPROVAL_ID}/approve`, { scope: "once" }),
+    );
+
+    expect(res.status).toBe(409);
+    expect(await errorCode(res)).toBe("already_resolved");
+    expect(claimCalls).toEqual([]);
+    expect(resolveCalls).toEqual([]);
+    expect(enqueues).toEqual([]);
+  });
+
+  for (const sidecarAllocationStatus of [
+    "releasing",
+    "released",
+    "failed",
+  ] satisfies SidecarAllocationStatus[]) {
+    test(`does not resolve an approval for a ${sidecarAllocationStatus} allocation`, async () => {
+      const claimCalls: ClaimCall[] = [];
+      const resolveCalls: ResolveCall[] = [];
+      const enqueues: WorkflowSignalDispatchEnqueue[] = [];
+      const app = createTestApp({
+        hasSidecarAllocation: true,
+        sidecarAllocationStatus,
+        claimCalls,
+        resolveCalls,
+        workflowSignalEnqueues: enqueues,
+      });
+
+      const res = await app.fetch(
+        authedPost(`${base()}/${APPROVAL_ID}/approve`, { scope: "once" }),
+      );
+
+      expect(res.status).toBe(409);
+      expect(await errorCode(res)).toBe("deployment_unreachable");
+      expect(claimCalls).toEqual([]);
+      expect(resolveCalls).toEqual([]);
+      expect(enqueues).toEqual([]);
+    });
+  }
+
+  test("does not resolve an exclusive approval without durable dispatch", async () => {
+    const claimCalls: ClaimCall[] = [];
+    const resolveCalls: ResolveCall[] = [];
+    const app = createTestApp({
+      hasSidecarAllocation: true,
+      claimCalls,
+      resolveCalls,
+    });
+
+    const res = await app.fetch(
+      authedPost(`${base()}/${APPROVAL_ID}/approve`, { scope: "once" }),
+    );
+
+    expect(res.status).toBe(503);
+    expect(await errorCode(res)).toBe("workflow_dispatch_unavailable");
+    expect(claimCalls).toHaveLength(0);
+    expect(resolveCalls).toHaveLength(0);
+  });
+
   test("returns 409 and does not deliver on a double approve", async () => {
     const signalCalls: SignalCall[] = [];
     const app = createTestApp({ claimResult: null, signalCalls });
@@ -400,6 +755,37 @@ describe("POST /approvals/:approvalId/approve", () => {
     expect(res.status).toBe(409);
     expect(await errorCode(res)).toBe("already_resolved");
     expect(signalCalls).toHaveLength(0);
+  });
+
+  test("reports an approval resolved before its allocation was released", async () => {
+    const claimCalls: ClaimCall[] = [];
+    const resolveCalls: ResolveCall[] = [];
+    const enqueues: WorkflowSignalDispatchEnqueue[] = [];
+    const allocationLocks: string[] = [];
+    const app = createTestApp({
+      transactionalApproval: pendingApproval({
+        status: "approved",
+        scope: "once",
+        resolvedAt: new Date("2025-01-03"),
+      }),
+      hasSidecarAllocation: true,
+      sidecarAllocationStatus: "released",
+      claimCalls,
+      resolveCalls,
+      workflowSignalEnqueues: enqueues,
+      allocationLocks,
+    });
+
+    const res = await app.fetch(
+      authedPost(`${base()}/${APPROVAL_ID}/approve`, { scope: "once" }),
+    );
+
+    expect(res.status).toBe(409);
+    expect(await errorCode(res)).toBe("already_resolved");
+    expect(allocationLocks).toEqual(["update"]);
+    expect(claimCalls).toEqual([]);
+    expect(resolveCalls).toEqual([]);
+    expect(enqueues).toEqual([]);
   });
 
   test("rejects scope 'always' at the boundary without resolving", async () => {

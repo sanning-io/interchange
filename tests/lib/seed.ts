@@ -9,8 +9,6 @@
 
 import type { DB } from "@intx/db";
 import {
-  agent,
-  agentInstance,
   asset,
   credential,
   grant,
@@ -22,7 +20,7 @@ import {
   provider,
   tenant,
   wallet,
-  workflowDeployment,
+  workflowDefinition,
   workflowRun,
 } from "@intx/db/schema";
 
@@ -94,29 +92,6 @@ export async function seedAsset(db: Db, a: SeedAsset): Promise<void> {
   });
 }
 
-export type SeedWorkflowDeployment = {
-  id: string;
-  tenantId: string;
-  definitionAssetId: string;
-  address?: string;
-  publicKey?: string | null;
-  status?: "deployed" | "error";
-};
-
-export async function seedWorkflowDeployment(
-  db: Db,
-  d: SeedWorkflowDeployment,
-): Promise<void> {
-  await db.insert(workflowDeployment).values({
-    id: d.id,
-    tenantId: d.tenantId,
-    definitionAssetId: d.definitionAssetId,
-    address: d.address ?? `ins_${d.id}@example.test`,
-    publicKey: d.publicKey ?? null,
-    status: d.status ?? "deployed",
-  });
-}
-
 export type SeedPrincipal = {
   id: string;
   tenantId: string;
@@ -140,6 +115,7 @@ export type SeedProvider = {
   tenantId: string;
   name: string;
   plugin?: string;
+  apiBaseUrl?: string;
 };
 
 export async function seedProvider(db: Db, p: SeedProvider): Promise<void> {
@@ -148,6 +124,7 @@ export async function seedProvider(db: Db, p: SeedProvider): Promise<void> {
     tenantId: p.tenantId,
     name: p.name,
     plugin: p.plugin ?? "test-plugin",
+    apiBaseUrl: p.apiBaseUrl ?? null,
   });
 }
 
@@ -181,6 +158,7 @@ export type SeedCredential = {
   name: string;
   type?: "api_key" | "oauth_token" | "certificate" | "other";
   secret?: string;
+  refreshSecret?: string | null;
   status?: "active" | "expired" | "revoked" | "error";
   principalId?: string | null;
   scopes?: string[] | null;
@@ -195,6 +173,7 @@ export async function seedCredential(db: Db, c: SeedCredential): Promise<void> {
     name: c.name,
     type: c.type ?? "api_key",
     secret: c.secret ?? `${c.id}-secret`,
+    refreshSecret: c.refreshSecret ?? null,
     status: c.status ?? "active",
     principalId: c.principalId ?? null,
     scopes: c.scopes ?? null,
@@ -297,63 +276,48 @@ export async function seedModelOffering(
   });
 }
 
-export type SeedAgent = {
-  id: string;
-  tenantId: string;
-  creatorPrincipalId: string;
-  name?: string;
-  modelRequirements?: unknown;
-};
-
-export async function seedAgent(db: Db, a: SeedAgent): Promise<void> {
-  await db.insert(agent).values({
-    id: a.id,
-    tenantId: a.tenantId,
-    creatorPrincipalId: a.creatorPrincipalId,
-    name: a.name ?? a.id,
-    modelRequirements: a.modelRequirements ?? null,
-  });
-}
-
-export type SeedAgentInstance = {
-  id: string;
-  tenantId: string;
-  agentId: string;
-  principalId: string;
-  address?: string;
-};
-
-export async function seedAgentInstance(
-  db: Db,
-  i: SeedAgentInstance,
-): Promise<void> {
-  await db.insert(agentInstance).values({
-    id: i.id,
-    tenantId: i.tenantId,
-    agentId: i.agentId,
-    principalId: i.principalId,
-    address: i.address ?? `${i.id}.agent.test`,
-  });
-}
-
 export type SeedWorkflowRun = {
   id: string;
-  deploymentId: string;
   tenantId: string;
+  deploymentId?: string | null;
+  definitionId?: string;
   principalId?: string | null;
+  address?: string | null;
+  publicKey?: string | null;
   status?: "running" | "completed" | "failed" | "cancelled";
+  createdAt?: Date;
+  endedAt?: Date | null;
 };
+
+// definition_id is NOT NULL on workflow_run. When a caller does not care which
+// definition a seeded run anchors on, anchor it on a per-tenant throwaway
+// definition created once, so the test need not seed one itself.
+async function ensureSeedDefinition(db: Db, tenantId: string): Promise<string> {
+  const id = `wfd_seed_${tenantId}`;
+  await db
+    .insert(workflowDefinition)
+    .values({ id, tenantId, name: `seed-def-${tenantId}` })
+    .onConflictDoNothing({ target: workflowDefinition.id });
+  return id;
+}
 
 export async function seedWorkflowRun(
   db: Db,
   r: SeedWorkflowRun,
 ): Promise<void> {
+  const definitionId =
+    r.definitionId ?? (await ensureSeedDefinition(db, r.tenantId));
   await db.insert(workflowRun).values({
     id: r.id,
-    deploymentId: r.deploymentId,
     tenantId: r.tenantId,
+    deploymentId: r.deploymentId ?? null,
+    definitionId,
     principalId: r.principalId ?? null,
+    address: r.address ?? null,
+    publicKey: r.publicKey ?? null,
     status: r.status ?? "running",
+    ...(r.createdAt !== undefined ? { createdAt: r.createdAt } : {}),
+    ...(r.endedAt !== undefined ? { endedAt: r.endedAt } : {}),
   });
 }
 

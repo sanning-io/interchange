@@ -53,7 +53,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 
 import { defineAgent, createDefaultDirectorRegistry } from "@intx/agent";
-import { base64Encode, deriveMessageId, hexEncode } from "@intx/types";
+import { base64Encode, hexEncode } from "@intx/types";
 import type { HarnessConfig } from "@intx/types/runtime";
 import { defineWorkflow, step, type WorkflowDefinition } from "@intx/workflow";
 import {
@@ -72,11 +72,13 @@ import { DEFAULT_ASSET_REF } from "@intx/hub-sessions";
 import {
   SESSION_ID,
   SIDECAR_ID,
+  dropHubLink,
   listRunIds,
   readClaimCheckDir,
   readWorkflowRunEvents,
   startDeployFlowEnv,
   waitFor,
+  waitForReconnect,
   waitForWorkflowRunComplete,
   type DeployFlowEnv,
 } from "../hub-agent/lib/deploy-flow-env";
@@ -88,6 +90,7 @@ const WORKFLOW_RUN_REF = "refs/heads/main";
 const NO_HEADER_DEPLOYMENT_ID = "mail-edge-no-header-1";
 const MALFORMED_DEPLOYMENT_ID = "mail-edge-malformed-1";
 const DUPLICATE_DEPLOYMENT_ID = "mail-edge-duplicate-1";
+const CONNECTED_WINDOW_DEPLOYMENT_ID = "mail-edge-connected-window-1";
 
 let env: DeployFlowEnv;
 
@@ -104,13 +107,15 @@ describe("mail-handling edge cases", () => {
     expect(env.hub.router.getConnectedSidecars()).toContain(SIDECAR_ID);
   });
 
-  test("mail with no Message-Id header derives a sha256-of-bytes runId; identical bytes collide", async () => {
+  test("mail with no Message-Id header derives a sha256-of-bytes messageId; identical bytes collide", async () => {
     const ctx = await deployEdgeWorkflow(env, NO_HEADER_DEPLOYMENT_ID);
 
     // Construct two byte-identical raw mails with NO Message-Id header.
     // The supervisor's parser walks for a `message-id:` line
     // case-insensitively; without one, `parseMessageIdHeader` returns
     // null and `deriveMessageId` falls back to `sha256(rawMessage)`.
+    // Under the stable-runId model the runId is the deployment address,
+    // but the messageId (used for claim-check dedup) is still sha256.
     const raw = buildMinimalMail({
       from: "edge@integration.interchange",
       to: ctx.deploymentMailAddress,
@@ -118,39 +123,38 @@ describe("mail-handling edge cases", () => {
       body: "no-header edge case body",
     });
 
-    const expectedRunId = await sha256Hex(raw);
+    const messageId = await sha256Hex(raw);
+    const runId = ctx.deploymentMailAddress;
 
-    // Fire the first mail; the supervisor should mint a run with
-    // runId === sha256(raw). Wait for `RunStarted` to land.
+    // Fire the first mail; the supervisor should start a run with
+    // runId === deployment address. Wait for `RunStarted` to land.
     await routeRaw(env, ctx.deploymentMailAddress, raw);
-    await waitForWorkflowRunComplete(
-      env,
-      NO_HEADER_DEPLOYMENT_ID,
-      expectedRunId,
-      { timeoutMs: 30_000, diagnostics: env.sidecarDiagnostics },
-    );
+    await waitForWorkflowRunComplete(env, NO_HEADER_DEPLOYMENT_ID, runId, {
+      timeoutMs: 30_000,
+      diagnostics: env.sidecarDiagnostics,
+    });
 
-    // Verify the canonical chain materialised for the sha256 runId
-    // and the `consumedMessageId` on `RunStarted` equals the sha256.
+    // Verify the canonical chain materialised and the
+    // `consumedMessageId` on `RunStarted` equals the sha256 messageId.
     const events = await readWorkflowRunEvents(
       env,
       NO_HEADER_DEPLOYMENT_ID,
-      expectedRunId,
+      runId,
     );
     const types = events.map((e) => e.type);
     expect(types).toContain("RunStarted");
     expect(types).toContain("RunCompleted");
     const started = events.find((e) => e.type === "RunStarted");
     if (started === undefined) throw new Error("unreachable");
-    expect(started.body["consumedMessageId"]).toBe(expectedRunId);
+    expect(started.body["consumedMessageId"]).toBe(messageId);
 
     // Fire a second byte-identical mail. The supervisor's
     // `deriveMessageId` derives the same sha256 hash; the
     // claim-check substrate sees the messageId is already in
-    // `consumed/` (or `processing/`, depending on timing) and
-    // `enqueueInbox` throws `claim_check_already_*`. The
-    // supervisor's `onMailMessage` swallows the throw -- duplicate
-    // is dropped on the floor.
+    // `consumed/` (or `processing/`, depending on timing), so
+    // `enqueueInbox` returns an `already-present` outcome. The
+    // supervisor acknowledges it (the bytes are durably on disk) but
+    // dispatches no second run -- the duplicate is deduped.
     //
     // We pin the documented behavior: the duplicate must NOT
     // produce a second run. Wait for the supervisor's
@@ -161,13 +165,13 @@ describe("mail-handling edge cases", () => {
       env,
       ctx.workflowRunRepoId,
       ctx.deploymentMailAddress,
-      `${expectedRunId}.json`,
+      `${messageId}.json`,
       { timeoutMs: 30_000, diagnostics: env.sidecarDiagnostics },
     );
-    const consumedRunIds = consumedBefore
+    const consumedMessageIds = consumedBefore
       .map((e) => /^(.+)\.json$/.exec(e.filename)?.[1])
       .filter((v): v is string => v !== undefined);
-    expect(consumedRunIds).toContain(expectedRunId);
+    expect(consumedMessageIds).toContain(messageId);
 
     // Snapshot the sidecar diagnostics buffer before firing the
     // duplicate so the log-substring wait below can scope its match
@@ -175,16 +179,16 @@ describe("mail-handling edge cases", () => {
     const diagBeforeDuplicate = env.sidecarDiagnostics();
     await routeRaw(env, ctx.deploymentMailAddress, raw);
 
-    // The duplicate must produce the supervisor's `enqueueInbox
-    // failed` log line carrying one of the `claim_check_already_*`
-    // reasons. This is the positive signal the test pins instead of
-    // sleeping a fixed beat and re-reading the substrate.
+    // The duplicate must produce the supervisor's `already durably
+    // present` log line carrying one of the already-present reasons.
+    // This is the positive signal the test pins instead of sleeping a
+    // fixed beat and re-reading the substrate.
     await waitFor(
       () => {
         const fresh = env
           .sidecarDiagnostics()
           .slice(diagBeforeDuplicate.length);
-        return /enqueueInbox failed:.*claim_check_already_/.test(fresh);
+        return /already durably present/.test(fresh);
       },
       { timeoutMs: 10_000, diagnostics: env.sidecarDiagnostics },
     );
@@ -199,18 +203,20 @@ describe("mail-handling edge cases", () => {
     expect(consumedAfter.length).toBe(consumedBefore.length);
 
     const runIdsAfter = await listRunIds(env, ctx.workflowRunRepoId);
-    // Exactly one run for the sha256 id; no synthetic second
+    // Exactly one run for the deployment address; no synthetic second
     // run-id materialised.
-    expect(runIdsAfter.filter((r) => r === expectedRunId).length).toBe(1);
+    expect(runIdsAfter.filter((r) => r === runId).length).toBe(1);
   }, 60_000);
 
-  test("mail with malformed Message-Id (no closing bracket) mints the raw value as runId", async () => {
+  test("mail with malformed Message-Id (no closing bracket) mints the raw value as messageId", async () => {
     const ctx = await deployEdgeWorkflow(env, MALFORMED_DEPLOYMENT_ID);
 
     // Construct a mail with a malformed Message-Id header. The
     // parser does NOT validate angle-bracket shape; it returns the
     // trimmed suffix after `Message-Id:`. So `<invalid` becomes
-    // the messageId verbatim.
+    // the messageId verbatim.  Under the stable-runId model the
+    // runId is the deployment address, but the messageId is still
+    // the parsed header value.
     const malformedMessageId = "<invalid";
     const raw = buildMinimalMail({
       from: "edge@integration.interchange",
@@ -220,25 +226,23 @@ describe("mail-handling edge cases", () => {
       body: "malformed message-id edge case body",
     });
 
+    const runId = ctx.deploymentMailAddress;
+
     await routeRaw(env, ctx.deploymentMailAddress, raw);
 
-    await waitForWorkflowRunComplete(
-      env,
-      MALFORMED_DEPLOYMENT_ID,
-      malformedMessageId,
-      { timeoutMs: 30_000, diagnostics: env.sidecarDiagnostics },
-    );
+    await waitForWorkflowRunComplete(env, MALFORMED_DEPLOYMENT_ID, runId, {
+      timeoutMs: 30_000,
+      diagnostics: env.sidecarDiagnostics,
+    });
 
     const events = await readWorkflowRunEvents(
       env,
       MALFORMED_DEPLOYMENT_ID,
-      malformedMessageId,
+      runId,
     );
     const started = events.find((e) => e.type === "RunStarted");
     if (started === undefined) {
-      throw new Error(
-        `malformed edge: run ${malformedMessageId} has no RunStarted`,
-      );
+      throw new Error(`malformed edge: run ${runId} has no RunStarted`);
     }
     expect(started.body["consumedMessageId"]).toBe(malformedMessageId);
     const types = events.map((e) => e.type);
@@ -268,13 +272,15 @@ describe("mail-handling edge cases", () => {
       body: "duplicate edge case body — second send (different body)",
     });
 
+    const runId = ctx.deploymentMailAddress;
+
     await routeRaw(env, ctx.deploymentMailAddress, raw1);
-    await waitForWorkflowRunComplete(env, DUPLICATE_DEPLOYMENT_ID, messageId, {
+    await waitForWorkflowRunComplete(env, DUPLICATE_DEPLOYMENT_ID, runId, {
       timeoutMs: 30_000,
       diagnostics: env.sidecarDiagnostics,
     });
 
-    // First run materialised under runs/<messageId>/. The supervisor's
+    // First run materialised under runs/<runId>/. The supervisor's
     // `markConsumed` lands strictly after the terminal observation
     // above; wait for the dedup entry to surface so the duplicate
     // collides on the consumed/ branch rather than the processing/
@@ -290,23 +296,23 @@ describe("mail-handling edge cases", () => {
     const consumedNamesBefore = new Set(consumedBefore.map((e) => e.filename));
     expect(consumedNamesBefore).toContain(`${messageId}.json`);
 
-    // Fire the duplicate. The supervisor's `enqueueInbox` rejects
-    // with `claim_check_already_consumed`; `onMailMessage` swallows
-    // the rejection. The dedup index stays at one entry; no second
-    // run materialises.
+    // Fire the duplicate. The supervisor's `enqueueInbox` returns an
+    // `already-present` outcome (reason `consumed`); `onMailMessage`
+    // acknowledges it without dispatching a run. The dedup index stays
+    // at one entry; no second run materialises.
     const diagBeforeDuplicate = env.sidecarDiagnostics();
     await routeRaw(env, ctx.deploymentMailAddress, raw2);
 
-    // Wait for the supervisor's `enqueueInbox failed` log line that
-    // carries the `claim_check_already_*` reason; pinning on the
-    // positive log signal beats sleeping a fixed beat and re-reading
-    // the substrate hoping nothing changed.
+    // Wait for the supervisor's `already durably present` log line
+    // carrying the already-present reason; pinning on the positive log
+    // signal beats sleeping a fixed beat and re-reading the substrate
+    // hoping nothing changed.
     await waitFor(
       () => {
         const fresh = env
           .sidecarDiagnostics()
           .slice(diagBeforeDuplicate.length);
-        return /enqueueInbox failed:.*claim_check_already_/.test(fresh);
+        return /already durably present/.test(fresh);
       },
       { timeoutMs: 10_000, diagnostics: env.sidecarDiagnostics },
     );
@@ -335,8 +341,120 @@ describe("mail-handling edge cases", () => {
     expect(processingAfter).toEqual([]);
 
     const runIds = await listRunIds(env, ctx.workflowRunRepoId);
-    expect(runIds.filter((r) => r === messageId).length).toBe(1);
+    // Under the stable-runId model the runId is the deployment address.
+    expect(runIds.filter((r) => r === runId).length).toBe(1);
   }, 60_000);
+
+  test("mail into a connected window that drops before the ack survives reconnect and is processed exactly once", async () => {
+    // The connected-window mail-loss gap, end to end against a real sidecar
+    // subprocess over a real socket. A `mail.inbound` carrying a hub-minted
+    // messageId is delivered over the LIVE link and the link is severed in the
+    // same tick, before the sidecar's durable-write ack round-trips. The hub
+    // retains the un-acked pending mail and redelivers it when the sidecar
+    // reconnects; identical bytes and the same messageId make the delivery
+    // effectively-once. The run reaching terminal completion is NO-LOSS (over a
+    // real socket the severed link drops the in-flight frame, so ONLY the
+    // reconnect redelivery gets the mail to the sidecar; without the retention
+    // the message is lost and the run never starts). A single RunStarted and a
+    // single consumed dedup entry are NO-DOUBLE-PROCESS.
+    //
+    // The run's grants are delivered and allowed to land on the sidecar's disk
+    // BEFORE the connected-window drop: run.grants has no ack handshake, so it
+    // is not part of what this test drops -- only the trigger mail is. The
+    // grants persist on the sidecar across the reconnect.
+    const ctx = await deployEdgeWorkflow(env, CONNECTED_WINDOW_DEPLOYMENT_ID);
+
+    // Keep the deployment stably routable for a beat so the drop lands well
+    // clear of the deploy window (a drop racing the key-ack would fail the
+    // reconnect challenge for reasons unrelated to mail retention).
+    const settleStart = Date.now();
+    let stableSince = Date.now();
+    while (Date.now() - stableSince < 1_000) {
+      if (
+        !env.hub.router
+          .getRoutableAddresses()
+          .includes(ctx.deploymentMailAddress)
+      ) {
+        stableSince = Date.now();
+      }
+      if (Date.now() - settleStart > 20_000) {
+        throw new Error(
+          `deployment never held routable for 1s\n${env.sidecarDiagnostics()}`,
+        );
+      }
+      await new Promise((r) => setTimeout(r, 50));
+    }
+
+    const messageId = "<connected-window-1@integration.interchange>";
+    const raw = buildMinimalMail({
+      from: "edge@integration.interchange",
+      to: ctx.deploymentMailAddress,
+      includeMessageIdHeader: true,
+      messageId,
+      body: "connected-window edge case body",
+    });
+    const runId = ctx.deploymentMailAddress;
+
+    // Deliver the run's grants and let them land durably on the sidecar before
+    // the drop (there is no run.grants ack to wait on, so allow a generous
+    // beat; the frame lands over localhost in well under this window).
+    const grantsDelivered = env.hub.router.sendRunGrants(
+      ctx.deploymentMailAddress,
+      runId,
+      [],
+    );
+    expect(grantsDelivered).toBe(true);
+    await new Promise((r) => setTimeout(r, 2_000));
+
+    // Deliver the trigger mail with its hub-minted messageId (the production
+    // workflow-trigger route carries it; the hub tracks it for redelivery),
+    // then sever the link in the same tick so the ack -- which fires only after
+    // the async durable write -- never round-trips.
+    const base64 = base64Encode(raw);
+    const delivered = env.hub.router.routeMail(
+      ctx.deploymentMailAddress,
+      base64,
+      messageId,
+    );
+    expect(delivered).toBe(true);
+    dropHubLink(env);
+
+    // The sidecar reconnects; the hub redelivers the retained pending mail.
+    await waitForReconnect(env, ctx.deploymentMailAddress, {
+      timeoutMs: 30_000,
+    });
+
+    // NO-LOSS: the run reaches terminal completion -- only the reconnect
+    // redelivery could have gotten the dropped mail to the sidecar.
+    const terminal = await waitForWorkflowRunComplete(
+      env,
+      CONNECTED_WINDOW_DEPLOYMENT_ID,
+      runId,
+      { timeoutMs: 60_000, diagnostics: env.sidecarDiagnostics },
+    );
+    expect(terminal.type).toBe("RunCompleted");
+
+    // NO-DOUBLE-PROCESS: exactly one RunStarted (keyed to this messageId) and
+    // exactly one consumed dedup entry -- a redelivery of a message already
+    // written is deduped, not reprocessed.
+    const events = await readWorkflowRunEvents(
+      env,
+      CONNECTED_WINDOW_DEPLOYMENT_ID,
+      runId,
+    );
+    const runStarts = events.filter((e) => e.type === "RunStarted");
+    expect(runStarts.length).toBe(1);
+    expect(runStarts[0]?.body["consumedMessageId"]).toBe(messageId);
+
+    const consumed = await waitForConsumedFilename(
+      env,
+      ctx.workflowRunRepoId,
+      ctx.deploymentMailAddress,
+      `${messageId}.json`,
+      { timeoutMs: 30_000, diagnostics: env.sidecarDiagnostics },
+    );
+    expect(consumed.map((e) => e.filename)).toEqual([`${messageId}.json`]);
+  }, 180_000);
 });
 
 /**
@@ -539,14 +657,10 @@ async function routeRaw(
   address: string,
   raw: Uint8Array,
 ): Promise<void> {
-  // Deliver the run's grants ahead of the mail under the SAME runId the
-  // sidecar derives from these bytes (the shared `deriveMessageId`: the
-  // Message-ID header when present, else sha256 of the bytes), so the run's
-  // `onRunStart` barrier resolves its grants file rather than failing
-  // closed. These edge-case workflows authorize no tools, so an empty grant
-  // set is sufficient -- what matters is that the file lands under the
-  // derived runId.
-  const runId = await deriveMessageId(raw);
+  // Under the stable-runId model the supervisor expects grants at
+  // runs/<deploymentAddress>/grants.json, regardless of the message's
+  // derived messageId.
+  const runId = address;
   const grantsDelivered = env.hub.router.sendRunGrants(address, runId, []);
   if (!grantsDelivered) {
     throw new Error(

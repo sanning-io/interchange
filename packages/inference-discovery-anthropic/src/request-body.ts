@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import {
+  CapabilityNotBuildableError,
   resolveMediaPath,
   type Capability,
   type CapabilityIntent,
@@ -123,15 +124,27 @@ export interface AnthropicRequestBody {
 // paired with output_config.effort. This is the only model-keyed branch in
 // this file: the adaptive requirement can be selected only by model identity,
 // because the API surfaces it solely as a runtime 400 with no build-time
-// signal. Add a model here when its API rejects the classic shape.
-const ADAPTIVE_THINKING_MODELS: ReadonlySet<string> = new Set([
+// signal. Add a model here when its API rejects the classic shape. This set
+// must match the runtime adapter's ADAPTIVE_THINKING_MODELS, or a captured
+// fixture would stop proving the production wire; a guard test pins them equal.
+export const ADAPTIVE_THINKING_MODELS: ReadonlySet<string> = new Set([
   "claude-sonnet-5",
+  "claude-opus-5",
+  "claude-fable-5",
+  "claude-opus-4-8",
+  "claude-opus-4-6",
+  "claude-opus-4-7",
+  "claude-sonnet-4-6",
 ]);
 
-// Adaptive thinking is the model's own per-request choice; empirically only
-// effort "max" reliably elicits a thinking block to capture (low/medium/high/
-// xhigh are non-deterministic).
-const ADAPTIVE_THINKING_EFFORT: AnthropicEffort = "max";
+// The effort the capture rig sends on the adaptive-thinking wire. Adaptive
+// thinking is the model's own per-request choice, and empirically only effort
+// "max" reliably elicits a thinking block to capture (low/medium/high/xhigh
+// are non-deterministic). Production sends a lower effort (the API default; see
+// ADAPTIVE_THINKING_EFFORT in the runtime adapter), so capturing at "max" is a
+// deliberate capture-time choice: the two efforts are an intentional pair, not
+// drift. A guard test in this package checks both effort values.
+export const ADAPTIVE_THINKING_CAPTURE_EFFORT: AnthropicEffort = "max";
 
 // The adaptive path carries no budget_tokens, so it cannot reuse the
 // budget-derived THINKING_MAX_TOKENS. A flat ceiling sized to let effort:max
@@ -146,7 +159,7 @@ const ADAPTIVE_THINKING_MAX_TOKENS = 4096;
 function applyThinking(body: AnthropicRequestBody, model: string): void {
   if (ADAPTIVE_THINKING_MODELS.has(model)) {
     body.thinking = { type: "adaptive" };
-    body.output_config = { effort: ADAPTIVE_THINKING_EFFORT };
+    body.output_config = { effort: ADAPTIVE_THINKING_CAPTURE_EFFORT };
     body.max_tokens = ADAPTIVE_THINKING_MAX_TOKENS;
     return;
   }
@@ -454,7 +467,9 @@ export function buildRequestBody(opts: {
     case "safety-classification-streaming":
     case "structured-output":
     case "structured-output-streaming":
-      throw new Error(
+    case "structured-output-refusal-streaming":
+      throw new CapabilityNotBuildableError(
+        opts.capability,
         `anthropic: capability ${opts.capability} is not supported by any Anthropic model`,
       );
     default: {
@@ -649,9 +664,9 @@ export function buildFilesApiGenerateBody(opts: {
   return body;
 }
 
-// Capability-keyed model-supports check. Anthropic's three current
-// models (Sonnet, Opus, Haiku) all expose the same surface; if that
-// stops being true, this gate is where to encode the divergence.
+// Capability-keyed model-supports check. The four current Anthropic
+// discovery models (Fable, Opus, Sonnet, Haiku) share this surface; if
+// that stops being true, this gate is where to encode the divergence.
 const SUPPORTED_CAPABILITIES: ReadonlySet<Capability> = new Set<Capability>([
   "plain-text",
   "plain-text-streaming",

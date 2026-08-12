@@ -3,6 +3,7 @@ import { configureSync, getConfig, resetSync } from "@intx/log";
 import { generateKeyPair, signEd25519 } from "@intx/crypto";
 import { hexDecode, hexEncode, parseAgentAddress } from "@intx/types";
 import { chunkPack } from "@intx/pack-transport";
+import { deriveWorkflowRunRepoId } from "@intx/workflow-deploy";
 import type {
   PackRejectReason,
   RepoId,
@@ -20,7 +21,7 @@ import {
 // rather than auth use it so the handshake succeeds; tests that assert
 // auth behavior pass their own authenticator instead.
 const acceptAnySidecar: SidecarAuthenticator = async ({ sidecarId }) => ({
-  kind: "sidecar",
+  kind: "shared",
   sidecarId,
 });
 
@@ -299,7 +300,7 @@ describe("SidecarRouter", () => {
       // token to a different verified id, and routing must key off that.
       const router = createTestRouter({
         authenticateSidecar: async () => ({
-          kind: "sidecar",
+          kind: "shared",
           sidecarId: "verified-sc",
         }),
         lookups: { lookupPublicKey: async () => null },
@@ -327,7 +328,7 @@ describe("SidecarRouter", () => {
       const router = createTestRouter({
         authenticateSidecar: async ({ sidecarId }) => {
           calls += 1;
-          return { kind: "sidecar", sidecarId };
+          return { kind: "shared", sidecarId };
         },
         lookups: { lookupPublicKey: async () => null },
       });
@@ -1450,7 +1451,6 @@ describe("SidecarRouter", () => {
 
     test("materializes grants and sends them before the inbound mail for a workflow recipient", async () => {
       const calls: { agentAddress: string; runId: string }[] = [];
-      let committed = false;
       const router = createTestRouter({
         lookups: {
           lookupPublicKey: async () => null,
@@ -1459,9 +1459,6 @@ describe("SidecarRouter", () => {
             return {
               outcome: "materialized",
               stepGrants: SAMPLE_GRANTS,
-              commit: async () => {
-                committed = true;
-              },
             };
           },
         },
@@ -1474,18 +1471,22 @@ describe("SidecarRouter", () => {
         [WORKFLOW_ADDR],
       );
 
-      // The lookup was invoked with the derived runId (the mail's Message-ID).
+      // The lookup was invoked with the derived runId: the deployment's mail
+      // address (the stable runId), not this mail's Message-ID.
       expect(calls).toEqual([
-        { agentAddress: WORKFLOW_ADDR, runId: "<mail-run-1@tenant.example>" },
+        { agentAddress: WORKFLOW_ADDR, runId: WORKFLOW_ADDR },
       ]);
       // The recipient received the run.grants frame BEFORE the mail.inbound.
       const frames = ws.sent.map((s) => JSON.parse(s));
       expect(frames[0]?.type).toBe("run.grants");
-      expect(frames[0]?.runId).toBe("<mail-run-1@tenant.example>");
+      expect(frames[0]?.runId).toBe(WORKFLOW_ADDR);
       expect(frames[0]?.stepGrants).toEqual(SAMPLE_GRANTS);
       expect(frames[1]?.type).toBe("mail.inbound");
-      // The commit ran only after the mail was accepted for delivery.
-      expect(committed).toBe(true);
+      // The run-committing mail goes through the messageId handshake (routeMail),
+      // NOT a fire-and-forget send: the mail.inbound carries a messageId, so a
+      // connected-window drop before the ack is redelivered on reconnect and
+      // the committed run cannot be left bodiless.
+      expect(frames[1]?.messageId).toBeDefined();
     });
 
     test("does not materialize grants for a non-workflow recipient", async () => {
@@ -1611,11 +1612,203 @@ describe("SidecarRouter", () => {
         [WORKFLOW_ADDR, otherWfAddr],
       );
 
-      // The shared-runId collision is refused loudly before any
-      // materialization; neither workflow recipient is delivered to.
+      // The one-workflow-recipient-per-mail restriction is refused loudly
+      // before any materialization; neither workflow recipient is delivered to.
       expect(called).toBe(false);
       expect(wfWs.sent).toHaveLength(0);
       expect(otherWs.sent).toHaveLength(0);
+    });
+
+    // Connect a keyed recipient through the challenged reconnect path so a
+    // later reconnect (which re-verifies ownership) can flush retained pending
+    // mail -- the register path leaves a keyed address unrouted until it passes
+    // a challenge, and redelivery fires only on the verified reconnect.
+    async function connectRecipientViaChallenge(
+      router: ReturnType<typeof createSidecarRouter>,
+      address: string,
+      privateKey: Uint8Array,
+      sidecarId = "sc-recipient",
+    ): Promise<ReturnType<typeof createMockWs>> {
+      const ws = createMockWs();
+      router.handleOpen(ws);
+      router.handleMessage(
+        ws,
+        JSON.stringify({
+          type: "reconnect",
+          sidecarId,
+          token: "tok",
+          agentAddresses: [address],
+        }),
+      );
+      await new Promise((res) => setTimeout(res, 50));
+      const challengeFrame = ws.sent
+        .map((s) => JSON.parse(s))
+        .find((f: { type: string }) => f.type === "challenge");
+      const responses = await Promise.all(
+        challengeFrame.challenges.map(
+          async (c: { address: string; nonce: string }) => ({
+            address: c.address,
+            signature: await signChallenge(c.nonce, c.address, privateKey),
+          }),
+        ),
+      );
+      router.handleMessage(
+        ws,
+        JSON.stringify({ type: "challenge.response", responses }),
+      );
+      await new Promise((res) => setTimeout(res, 50));
+      return ws;
+    }
+
+    test("a run-committing mail-relay is retained and redelivered on reconnect after a connected-window drop", async () => {
+      const kp = await generateKeyPair();
+      const router = createTestRouter({
+        requestTimeoutMs: 500,
+        // Large so neither the connected-window retry nor the retention TTL
+        // fires during the test; the redelivery under test is reconnect-driven.
+        mailAckRetryIntervalMs: 10_000,
+        disconnectQueueTTLMs: 60_000,
+        lookups: {
+          lookupPublicKey: async (addr) =>
+            addr === WORKFLOW_ADDR ? hexEncode(kp.publicKey) : null,
+          materializeMailTriggeredRunGrants: async () => ({
+            outcome: "materialized",
+            stepGrants: SAMPLE_GRANTS,
+          }),
+        },
+      });
+
+      const ws1 = await connectRecipientViaChallenge(
+        router,
+        WORKFLOW_ADDR,
+        kp.privateKey,
+      );
+      await sendOutbound(
+        router,
+        mailWithMessageId("<mail-relay-redeliver@tenant.example>"),
+        [WORKFLOW_ADDR],
+      );
+
+      // Delivered over the live connection via the handshake.
+      const firstInbound = ws1.sent
+        .map((s) => JSON.parse(s))
+        .find((f) => f.type === "mail.inbound");
+      expect(firstInbound).toBeDefined();
+      expect(firstInbound.messageId).toBeDefined();
+
+      // Drop BEFORE any ack: the pending relay mail must be retained.
+      router.handleClose(ws1);
+
+      // Reconnect: the retained relay mail is redelivered (identical bytes,
+      // same messageId) so the committed run's body is not left un-triggered.
+      const ws2 = await connectRecipientViaChallenge(
+        router,
+        WORKFLOW_ADDR,
+        kp.privateKey,
+        "sc-recipient-2",
+      );
+      const redelivered = ws2.sent
+        .map((s) => JSON.parse(s))
+        .find(
+          (f) =>
+            f.type === "mail.inbound" && f.messageId === firstInbound.messageId,
+        );
+      expect(redelivered).toBeDefined();
+      expect(redelivered.rawMessage).toBe(firstInbound.rawMessage);
+      // No re-materialization on redelivery; downstream dedup makes the
+      // replayed delivery effectively-once.
+    });
+
+    test("redelivery re-emits the run's grants ahead of the mail on reconnect", async () => {
+      const kp = await generateKeyPair();
+      let materializations = 0;
+      const router = createTestRouter({
+        requestTimeoutMs: 500,
+        // Large so neither the connected-window retry nor the retention TTL
+        // fires during the test; the redelivery under test is reconnect-driven.
+        mailAckRetryIntervalMs: 10_000,
+        disconnectQueueTTLMs: 60_000,
+        lookups: {
+          lookupPublicKey: async (addr) =>
+            addr === WORKFLOW_ADDR ? hexEncode(kp.publicKey) : null,
+          materializeMailTriggeredRunGrants: async () => {
+            materializations += 1;
+            return {
+              outcome: "materialized",
+              stepGrants: SAMPLE_GRANTS,
+            };
+          },
+        },
+      });
+
+      const ws1 = await connectRecipientViaChallenge(
+        router,
+        WORKFLOW_ADDR,
+        kp.privateKey,
+      );
+      await sendOutbound(
+        router,
+        mailWithMessageId("<mail-grants-redeliver@tenant.example>"),
+        [WORKFLOW_ADDR],
+      );
+      const firstInbound = ws1.sent
+        .map((s) => JSON.parse(s))
+        .find((f) => f.type === "mail.inbound");
+      expect(firstInbound).toBeDefined();
+
+      // Drop BEFORE any ack. The run.grants frame the sidecar first saw is lost
+      // with the connection; the run's grants are NOT re-fetched anywhere, so
+      // without replay the redelivered trigger would run with no grants and
+      // fail its onRunStart barrier closed on a hub-committed run.
+      router.handleClose(ws1);
+
+      const ws2 = await connectRecipientViaChallenge(
+        router,
+        WORKFLOW_ADDR,
+        kp.privateKey,
+        "sc-recipient-2",
+      );
+      const frames = ws2.sent.map((s) => JSON.parse(s));
+      const grantsIdx = frames.findIndex(
+        (f) => f.type === "run.grants" && f.runId === WORKFLOW_ADDR,
+      );
+      const mailIdx = frames.findIndex(
+        (f) =>
+          f.type === "mail.inbound" && f.messageId === firstInbound.messageId,
+      );
+      expect(grantsIdx).toBeGreaterThanOrEqual(0);
+      expect(mailIdx).toBeGreaterThanOrEqual(0);
+      // The run.grants lands AHEAD of the redelivered mail (same-connection
+      // FIFO), so the redelivered run resolves its grants instead of failing
+      // closed on the barrier.
+      expect(grantsIdx).toBeLessThan(mailIdx);
+      // The replayed snapshot is the SAME materialized bytes, not a re-fetch:
+      // materialization ran exactly once, at the original delivery.
+      expect(frames[grantsIdx]?.stepGrants).toEqual(SAMPLE_GRANTS);
+      expect(materializations).toBe(1);
+    });
+
+    test("a skip-path mail-relay is forwarded without the messageId handshake", async () => {
+      const router = createTestRouter({
+        lookups: {
+          lookupPublicKey: async () => null,
+          materializeMailTriggeredRunGrants: async () => ({ outcome: "skip" }),
+        },
+      });
+      const ws = await connectRecipient(router, WORKFLOW_ADDR);
+      await sendOutbound(
+        router,
+        mailWithMessageId("<mail-relay-skip@tenant.example>"),
+        [WORKFLOW_ADDR],
+      );
+
+      const inbound = ws.sent
+        .map((s) => JSON.parse(s))
+        .find((f) => f.type === "mail.inbound");
+      expect(inbound).toBeDefined();
+      // The skip path commits no run, so it is forwarded fire-and-forget --
+      // no messageId, no ack handshake, no redelivery tracking.
+      expect(inbound.messageId).toBeUndefined();
     });
   });
 
@@ -1672,6 +1865,66 @@ describe("SidecarRouter", () => {
 
       await promise;
       expect(router.getRoutableAddresses()).toContain("new-agent@local");
+    });
+
+    test("agent.deploy ignores an acknowledgement from another connection", async () => {
+      const primary = createMockWs();
+      const other = createMockWs();
+      for (const [ws, sidecarId] of [
+        [primary, "sc-primary"],
+        [other, "sc-other"],
+      ] as const) {
+        router.handleOpen(ws);
+        router.handleMessage(
+          ws,
+          JSON.stringify({
+            type: "register",
+            sidecarId,
+            token: "tok",
+            agentAddresses: [],
+          }),
+        );
+      }
+      await tick();
+
+      const promise = router.sendAgentDeploy("connection-bound@local", {
+        sessionId: "ses_test",
+        agentId: "a1",
+        tenantId: "t1",
+        principalId: "prin_test",
+        agentAddress: "connection-bound@local",
+        systemPrompt: "test",
+        tools: [],
+        grants: [],
+        sources: TEST_SOURCES,
+        defaultSource: TEST_DEFAULT_SOURCE,
+      });
+      expect(lastSent(primary).type).toBe("agent.deploy");
+
+      let settled = false;
+      void promise.finally(() => {
+        settled = true;
+      });
+      router.handleMessage(
+        other,
+        JSON.stringify({
+          type: "agent.deploy.ack",
+          agentAddress: "connection-bound@local",
+          publicKey: "wrong-connection-key",
+        }),
+      );
+      await tick();
+      expect(settled).toBe(false);
+
+      router.handleMessage(
+        primary,
+        JSON.stringify({
+          type: "agent.deploy.ack",
+          agentAddress: "connection-bound@local",
+          publicKey: "primary-key",
+        }),
+      );
+      await expect(promise).resolves.toEqual({ publicKey: "primary-key" });
     });
 
     test("agent.deploy.ack invokes subscribers before resolving", async () => {
@@ -1987,6 +2240,59 @@ describe("SidecarRouter", () => {
       router.handleClose(ws);
 
       await expect(promise).rejects.toThrow(/disconnected/);
+    });
+
+    test("pack acknowledgement must come from the receiving connection", async () => {
+      const owner = createMockWs();
+      router.handleOpen(owner);
+      router.handleMessage(
+        owner,
+        JSON.stringify({
+          type: "register",
+          sidecarId: "sc-pack-owner",
+          token: "tok",
+          agentAddresses: ["pack-owner@local"],
+        }),
+      );
+      await tick();
+
+      const rogue = createMockWs();
+      router.handleOpen(rogue);
+      const promise = router.sendPack(
+        "pack-owner@local",
+        new Uint8Array([1, 2, 3]),
+        "refs/heads/main",
+        "a".repeat(40),
+      );
+      const done = lastSent(owner);
+      expect(done.type).toBe("repo.pack.done");
+
+      let settled = false;
+      void promise.finally(() => {
+        settled = true;
+      });
+      router.handleMessage(
+        rogue,
+        JSON.stringify({
+          type: "repo.pack.ack",
+          agentAddress: done.agentAddress,
+          repoId: done.repoId,
+          transferId: done.transferId,
+        }),
+      );
+      await tick();
+      expect(settled).toBe(false);
+
+      router.handleMessage(
+        owner,
+        JSON.stringify({
+          type: "repo.pack.ack",
+          agentAddress: done.agentAddress,
+          repoId: done.repoId,
+          transferId: done.transferId,
+        }),
+      );
+      await expect(promise).resolves.toBeUndefined();
     });
 
     test("preserves routing when address re-registered during a request await", async () => {
@@ -4257,11 +4563,14 @@ describe("SidecarRouter", () => {
     test("workflow-run pack frames invoke receiveWorkflowRunPack and ack the sidecar", async () => {
       const { router: r, calls } = buildPackRouter();
       const ws = createMockWs();
-      const addr = "agent-wfr@local";
+      const addr = "ins_dep-wfr-1@local";
       await registerAddr(r, ws, "sc-wfr", addr);
 
       const transferId = "t-wfr-1";
-      const repoId: RepoId = { kind: "workflow-run", id: "dep-wfr-1" };
+      const repoId: RepoId = {
+        kind: "workflow-run",
+        id: deriveWorkflowRunRepoId(addr),
+      };
       const ref = "refs/heads/events";
       const commitSha = "f".repeat(40);
       const pack = new Uint8Array([1, 2, 3, 4, 5]);
@@ -4307,7 +4616,10 @@ describe("SidecarRouter", () => {
       const addr = "ins_dep_wfr@local";
       await registerAddr(r, ws, "sc-wfr", addr);
 
-      const repoId: RepoId = { kind: "workflow-run", id: "dep-wfr-2" };
+      const repoId: RepoId = {
+        kind: "workflow-run",
+        id: deriveWorkflowRunRepoId(addr),
+      };
       pushPack(r, ws, {
         agentAddress: addr,
         repoId,
@@ -4334,7 +4646,10 @@ describe("SidecarRouter", () => {
       // connection so its close leaves the new owner alone.
       const { router: r, calls } = buildPackRouter();
       const addr = "ins_dep_reclaim@local";
-      const repoId: RepoId = { kind: "workflow-run", id: "dep-reclaim" };
+      const repoId: RepoId = {
+        kind: "workflow-run",
+        id: deriveWorkflowRunRepoId(addr),
+      };
       const pack = new Uint8Array([4, 5, 6, 7]);
       const transferId = "t-reclaim";
 
@@ -4402,7 +4717,10 @@ describe("SidecarRouter", () => {
         },
       });
       const addr = "ins_dep_reclaim_rc@local";
-      const repoId: RepoId = { kind: "workflow-run", id: "dep-reclaim-rc" };
+      const repoId: RepoId = {
+        kind: "workflow-run",
+        id: deriveWorkflowRunRepoId(addr),
+      };
       const pack = new Uint8Array([4, 5, 6, 7]);
       const transferId = "t-reclaim-rc";
 
@@ -4497,7 +4815,10 @@ describe("SidecarRouter", () => {
       const stateRepoId: RepoId = { kind: "agent-state", id: addr };
 
       const wfrPack = new Uint8Array([20, 21, 22]);
-      const wfrRepoId: RepoId = { kind: "workflow-run", id: "dep-mix-1" };
+      const wfrRepoId: RepoId = {
+        kind: "workflow-run",
+        id: deriveWorkflowRunRepoId(addr),
+      };
 
       // Push the agent-state chunk first, then a workflow-run chunk
       // sharing the same transferId. If state were shared, the
@@ -4575,16 +4896,100 @@ describe("SidecarRouter", () => {
       expect(Array.from(wfrCall.pack)).toEqual(Array.from(wfrPack));
     });
 
+    test("an allocated connection can push only its authenticated workflow repository", async () => {
+      const addr = "ins_dep-exclusive-pack@tenant.example";
+      const identity = {
+        kind: "allocated" as const,
+        sidecarId: "sc-exclusive-pack",
+        allocationId: "allocation-exclusive-pack",
+        tenantId: "tenant-1",
+        anchorRunId: "dep-exclusive-pack",
+        workflowRunAddress: addr,
+        generation: 3,
+      };
+      const sources: unknown[] = [];
+      const allocatedRouter = createTestRouter({
+        authenticateSidecar: async () => identity,
+        validateSidecarIdentity: async () => true,
+        lookups: {
+          async receiveWorkflowRunPack(
+            _repoId,
+            _pack,
+            _ref,
+            _commitSha,
+            source,
+          ) {
+            sources.push(source);
+            return { accepted: true };
+          },
+        },
+      });
+      allocatedRouter.fenceAllocation(identity.allocationId, 3);
+      const ws = createMockWs();
+      allocatedRouter.handleOpen(ws);
+      allocatedRouter.handleMessage(
+        ws,
+        JSON.stringify({
+          type: "register",
+          sidecarId: identity.sidecarId,
+          token: "token",
+          agentAddresses: [addr],
+        }),
+      );
+      await tick();
+
+      pushPack(allocatedRouter, ws, {
+        agentAddress: addr,
+        repoId: { kind: "workflow-run", id: "another-deployment" },
+        transferId: "allocated-wrong-repo",
+        pack: new Uint8Array([1]),
+        ref: "refs/heads/main",
+        commitSha: "a".repeat(40),
+      });
+      await tick();
+      expect(lastSent(ws)).toMatchObject({
+        type: "repo.pack.reject",
+        reason: "path_violation",
+      });
+      expect(sources).toEqual([]);
+
+      pushPack(allocatedRouter, ws, {
+        agentAddress: addr,
+        repoId: {
+          kind: "workflow-run",
+          id: deriveWorkflowRunRepoId(addr),
+        },
+        transferId: "allocated-owned-repo",
+        pack: new Uint8Array([2]),
+        ref: "refs/heads/main",
+        commitSha: "b".repeat(40),
+      });
+      await tick();
+      expect(lastSent(ws).type).toBe("repo.pack.ack");
+      expect(sources).toEqual([
+        {
+          kind: "allocated",
+          agentAddress: addr,
+          allocationId: identity.allocationId,
+          anchorRunId: identity.anchorRunId,
+          generation: 3,
+        },
+      ]);
+    });
+
     test("workflow-run pack receive rejection is forwarded to the sidecar", async () => {
       const { router: r } = buildPackRouter({
         workflowRun: { accepted: false, reason: "path_violation" },
       });
       const ws = createMockWs();
-      const addr = "agent-wfr-rej@local";
+      const addr = "ins_dep-wfr-rej@local";
       await registerAddr(r, ws, "sc-wfr-rej", addr);
 
       const transferId = "t-wfr-rej";
-      const repoId: RepoId = { kind: "workflow-run", id: "dep-wfr-rej" };
+      const repoId: RepoId = {
+        kind: "workflow-run",
+        id: deriveWorkflowRunRepoId(addr),
+      };
       pushPack(r, ws, {
         agentAddress: addr,
         repoId,
@@ -4733,6 +5138,932 @@ describe("SidecarRouter", () => {
         .map((s) => JSON.parse(s))
         .find((f) => f.type === "signal.correlation.register.ack");
       expect(ack).toBeUndefined();
+    });
+  });
+
+  describe("connected-window mail redelivery (mail.inbound.ack)", () => {
+    // Establish an address over the challenged reconnect path so it enters the
+    // routing table under a verified connection -- the same path a real
+    // sidecar hosting a keyed address takes. Routing a keyed address via a
+    // plain register is refused by the key-existence gate.
+    async function connectViaChallenge(
+      r: ReturnType<typeof createSidecarRouter>,
+      ws: ReturnType<typeof createMockWs>,
+      addr: string,
+      privateKey: Uint8Array,
+      sidecarId = "sc-1",
+    ) {
+      r.handleOpen(ws);
+      r.handleMessage(
+        ws,
+        JSON.stringify({
+          type: "reconnect",
+          sidecarId,
+          token: "tok",
+          agentAddresses: [addr],
+        }),
+      );
+      await new Promise((res) => setTimeout(res, 50));
+      const challengeFrame = ws.sent
+        .map((s) => JSON.parse(s))
+        .find((f: { type: string }) => f.type === "challenge");
+      const responses = await Promise.all(
+        challengeFrame.challenges.map(
+          async (c: { address: string; nonce: string }) => ({
+            address: c.address,
+            signature: await signChallenge(c.nonce, c.address, privateKey),
+          }),
+        ),
+      );
+      r.handleMessage(
+        ws,
+        JSON.stringify({ type: "challenge.response", responses }),
+      );
+      await new Promise((res) => setTimeout(res, 50));
+    }
+
+    // Count `mail.inbound` frames the ws received carrying `messageId`. Each
+    // (re)delivery is a fresh send of identical bytes, so the count is the
+    // original delivery plus every redelivery attempt.
+    function inboundCount(
+      ws: ReturnType<typeof createMockWs>,
+      messageId: string,
+    ): number {
+      return ws.sent
+        .map((s) => JSON.parse(s))
+        .filter((f) => f.type === "mail.inbound" && f.messageId === messageId)
+        .length;
+    }
+
+    test("redelivers identical bytes until the sidecar acks", async () => {
+      const kp = await generateKeyPair();
+      const router = createTestRouter({
+        requestTimeoutMs: 500,
+        mailAckRetryIntervalMs: 20,
+        mailAckMaxRetries: 5,
+        lookups: {
+          async lookupPublicKey() {
+            return hexEncode(kp.publicKey);
+          },
+        },
+      });
+      const ws = createMockWs();
+      await connectViaChallenge(router, ws, "agent@local", kp.privateKey);
+
+      expect(router.routeMail("agent@local", "aGVsbG8=", "mid-1")).toBe(true);
+      // Delivered once immediately, carrying the messageId.
+      expect(inboundCount(ws, "mid-1")).toBe(1);
+      const delivered = ws.sent
+        .map((s) => JSON.parse(s))
+        .find((f) => f.type === "mail.inbound" && f.messageId === "mid-1");
+      expect(delivered.rawMessage).toBe("aGVsbG8=");
+
+      // Withhold the ack: the retry timer redelivers identical bytes.
+      await new Promise((res) => setTimeout(res, 50));
+      expect(inboundCount(ws, "mid-1")).toBeGreaterThanOrEqual(2);
+      const redelivered = ws.sent
+        .map((s) => JSON.parse(s))
+        .filter((f) => f.type === "mail.inbound" && f.messageId === "mid-1");
+      // Every redelivery replays the same bytes and messageId.
+      for (const f of redelivered) {
+        expect(f.rawMessage).toBe("aGVsbG8=");
+      }
+    });
+
+    test("an ack stops redelivery", async () => {
+      const kp = await generateKeyPair();
+      const router = createTestRouter({
+        requestTimeoutMs: 500,
+        mailAckRetryIntervalMs: 20,
+        mailAckMaxRetries: 5,
+        lookups: {
+          async lookupPublicKey() {
+            return hexEncode(kp.publicKey);
+          },
+        },
+      });
+      const ws = createMockWs();
+      await connectViaChallenge(router, ws, "agent@local", kp.privateKey);
+
+      expect(router.routeMail("agent@local", "aGk=", "mid-2")).toBe(true);
+      expect(inboundCount(ws, "mid-2")).toBe(1);
+
+      // The sidecar acks its durable inbox write.
+      router.handleMessage(
+        ws,
+        JSON.stringify({
+          type: "mail.inbound.ack",
+          agentAddress: "agent@local",
+          messageId: "mid-2",
+        }),
+      );
+      await tick();
+
+      // No redelivery fires after the ack clears the pending entry.
+      await new Promise((res) => setTimeout(res, 60));
+      expect(inboundCount(ws, "mid-2")).toBe(1);
+    });
+
+    test("redelivery is bounded by the retry budget", async () => {
+      const kp = await generateKeyPair();
+      const router = createTestRouter({
+        requestTimeoutMs: 500,
+        mailAckRetryIntervalMs: 20,
+        mailAckMaxRetries: 3,
+        lookups: {
+          async lookupPublicKey() {
+            return hexEncode(kp.publicKey);
+          },
+        },
+      });
+      const ws = createMockWs();
+      await connectViaChallenge(router, ws, "agent@local", kp.privateKey);
+
+      const warnings: string[] = [];
+      const restore = installWarningCapture(warnings);
+      try {
+        expect(router.routeMail("agent@local", "eA==", "mid-3")).toBe(true);
+        // Wait well past the full budget (interval * (maxRetries + 1)).
+        await new Promise((res) => setTimeout(res, 200));
+      } finally {
+        restore();
+      }
+
+      // One original delivery plus exactly maxRetries redeliveries, then stop.
+      expect(inboundCount(ws, "mid-3")).toBe(4);
+      expect(
+        warnings.some(
+          (w) => w.includes("mid-3") && w.includes("Gave up redelivering"),
+        ),
+      ).toBe(true);
+    });
+
+    test("give-up surfaces the un-acked mail as undelivered on a still-live connection", async () => {
+      const kp = await generateKeyPair();
+      const undelivered: { rawMessage: string; recipients: string[] }[] = [];
+      const router = createTestRouter({
+        requestTimeoutMs: 500,
+        mailAckRetryIntervalMs: 20,
+        mailAckMaxRetries: 3,
+        lookups: {
+          async lookupPublicKey() {
+            return hexEncode(kp.publicKey);
+          },
+        },
+      });
+      // The only channel through which a dropped mail is recovered externally.
+      router.events.on("mail.outbound.undelivered", (e) => {
+        undelivered.push(e);
+      });
+
+      const ws = createMockWs();
+      await connectViaChallenge(router, ws, "agent@local", kp.privateKey);
+
+      // A tracked mail carrying a hub-minted messageId. Durable delivery is
+      // what keeps the accepted bytes available through the retry window.
+      expect(router.routeMail("agent@local", "eA==", "mid-drop")).toBe(true);
+
+      const warnings: string[] = [];
+      const restore = installWarningCapture(warnings);
+      try {
+        // The sidecar never acks (its local substrate write persistently
+        // fails), but the WS stays open the whole time -- no ping timeout, no
+        // close. Wait well past the full budget.
+        await new Promise((res) => setTimeout(res, 200));
+      } finally {
+        restore();
+      }
+
+      // 1 original + 3 retries, then give up.
+      expect(inboundCount(ws, "mid-drop")).toBe(4);
+      // Give-up surfaces the mail for external relay exactly once, rather than
+      // silently dropping a committed run's trigger.
+      const forMidDrop = undelivered.filter((e) => e.rawMessage === "eA==");
+      expect(forMidDrop).toHaveLength(1);
+      expect(forMidDrop[0]?.recipients).toEqual(["agent@local"]);
+      expect(
+        warnings.some(
+          (w) => w.includes("mid-drop") && w.includes("Gave up redelivering"),
+        ),
+      ).toBe(true);
+    });
+
+    test("mail without a messageId is not tracked for redelivery", async () => {
+      const kp = await generateKeyPair();
+      const router = createTestRouter({
+        requestTimeoutMs: 500,
+        mailAckRetryIntervalMs: 20,
+        mailAckMaxRetries: 5,
+        lookups: {
+          async lookupPublicKey() {
+            return hexEncode(kp.publicKey);
+          },
+        },
+      });
+      const ws = createMockWs();
+      await connectViaChallenge(router, ws, "agent@local", kp.privateKey);
+
+      expect(router.routeMail("agent@local", "eXk=")).toBe(true);
+      const before = ws.sent.filter(
+        (s) => JSON.parse(s).type === "mail.inbound",
+      ).length;
+      expect(before).toBe(1);
+
+      await new Promise((res) => setTimeout(res, 60));
+      const after = ws.sent.filter(
+        (s) => JSON.parse(s).type === "mail.inbound",
+      ).length;
+      // No retry fired: the delivery carried no messageId, so no ack handshake.
+      expect(after).toBe(1);
+    });
+
+    test("an ack from a non-owning sidecar does not clear pending mail", async () => {
+      const kp = await generateKeyPair();
+      const other = await generateKeyPair();
+      const router = createTestRouter({
+        requestTimeoutMs: 500,
+        mailAckRetryIntervalMs: 20,
+        mailAckMaxRetries: 5,
+        lookups: {
+          lookupPublicKey: async (addr: string) =>
+            addr === "agent@local"
+              ? hexEncode(kp.publicKey)
+              : hexEncode(other.publicKey),
+        },
+      });
+      const ownerWs = createMockWs();
+      await connectViaChallenge(router, ownerWs, "agent@local", kp.privateKey);
+      const rogueWs = createMockWs();
+      await connectViaChallenge(
+        router,
+        rogueWs,
+        "other@local",
+        other.privateKey,
+        "sc-2",
+      );
+
+      expect(router.routeMail("agent@local", "aGV5", "mid-4")).toBe(true);
+      expect(inboundCount(ownerWs, "mid-4")).toBe(1);
+
+      // A sidecar that does not own agent@local acks its messageId. The gate
+      // drops it, so the pending entry survives and redelivery continues.
+      router.handleMessage(
+        rogueWs,
+        JSON.stringify({
+          type: "mail.inbound.ack",
+          agentAddress: "agent@local",
+          messageId: "mid-4",
+        }),
+      );
+      await tick();
+
+      await new Promise((res) => setTimeout(res, 50));
+      expect(inboundCount(ownerWs, "mid-4")).toBeGreaterThanOrEqual(2);
+    });
+
+    test("un-acked mail is retained across a disconnect and redelivered on reconnect", async () => {
+      const kp = await generateKeyPair();
+      const router = createTestRouter({
+        requestTimeoutMs: 500,
+        // Large intervals so neither the connected-window retry nor the
+        // retention TTL fires during the test window; the redelivery under
+        // test is driven by the reconnect, not a timer.
+        mailAckRetryIntervalMs: 10_000,
+        mailAckMaxRetries: 5,
+        disconnectQueueTTLMs: 60_000,
+        lookups: {
+          async lookupPublicKey() {
+            return hexEncode(kp.publicKey);
+          },
+        },
+      });
+      const ws1 = createMockWs();
+      await connectViaChallenge(router, ws1, "agent@local", kp.privateKey);
+      expect(router.routeMail("agent@local", "aGVsbG8=", "mid-r1")).toBe(true);
+      expect(inboundCount(ws1, "mid-r1")).toBe(1);
+
+      // Disconnect BEFORE any ack: the pending entry must be retained.
+      router.handleClose(ws1);
+
+      // Reconnect on a fresh connection; the retained mail is redelivered with
+      // identical bytes and the same messageId.
+      const ws2 = createMockWs();
+      await connectViaChallenge(router, ws2, "agent@local", kp.privateKey);
+      expect(inboundCount(ws2, "mid-r1")).toBe(1);
+      const redelivered = ws2.sent
+        .map((s) => JSON.parse(s))
+        .find((f) => f.type === "mail.inbound" && f.messageId === "mid-r1");
+      expect(redelivered.rawMessage).toBe("aGVsbG8=");
+    });
+
+    test("an ack after reconnect redelivery clears the retained mail", async () => {
+      const kp = await generateKeyPair();
+      const router = createTestRouter({
+        requestTimeoutMs: 500,
+        mailAckRetryIntervalMs: 20,
+        mailAckMaxRetries: 5,
+        disconnectQueueTTLMs: 60_000,
+        lookups: {
+          async lookupPublicKey() {
+            return hexEncode(kp.publicKey);
+          },
+        },
+      });
+      const ws1 = createMockWs();
+      await connectViaChallenge(router, ws1, "agent@local", kp.privateKey);
+      expect(router.routeMail("agent@local", "aGk=", "mid-r2")).toBe(true);
+      router.handleClose(ws1);
+
+      const ws2 = createMockWs();
+      await connectViaChallenge(router, ws2, "agent@local", kp.privateKey);
+      expect(inboundCount(ws2, "mid-r2")).toBeGreaterThanOrEqual(1);
+
+      // Ack over the reconnected connection; retries must stop afterward.
+      router.handleMessage(
+        ws2,
+        JSON.stringify({
+          type: "mail.inbound.ack",
+          agentAddress: "agent@local",
+          messageId: "mid-r2",
+        }),
+      );
+      await tick();
+      const countAtAck = inboundCount(ws2, "mid-r2");
+      await new Promise((res) => setTimeout(res, 60));
+      expect(inboundCount(ws2, "mid-r2")).toBe(countAtAck);
+    });
+
+    test("retained mail is dropped after the retention TTL and not redelivered", async () => {
+      const kp = await generateKeyPair();
+      const router = createTestRouter({
+        requestTimeoutMs: 500,
+        mailAckRetryIntervalMs: 10_000,
+        mailAckMaxRetries: 5,
+        disconnectQueueTTLMs: 30,
+        lookups: {
+          async lookupPublicKey() {
+            return hexEncode(kp.publicKey);
+          },
+        },
+      });
+      const ws1 = createMockWs();
+      await connectViaChallenge(router, ws1, "agent@local", kp.privateKey);
+      expect(router.routeMail("agent@local", "eA==", "mid-r3")).toBe(true);
+
+      const warnings: string[] = [];
+      const restore = installWarningCapture(warnings);
+      try {
+        // Disconnect arms the retention TTL; wait past it so the entry drops.
+        router.handleClose(ws1);
+        await new Promise((res) => setTimeout(res, 80));
+      } finally {
+        restore();
+      }
+      expect(
+        warnings.some(
+          (w) =>
+            w.includes("agent@local") && w.includes("retention TTL expired"),
+        ),
+      ).toBe(true);
+
+      // A later reconnect finds nothing to redeliver.
+      const ws2 = createMockWs();
+      await connectViaChallenge(router, ws2, "agent@local", kp.privateKey);
+      expect(inboundCount(ws2, "mid-r3")).toBe(0);
+    });
+  });
+
+  describe("exclusive allocation routing", () => {
+    const allocationIdentity = {
+      kind: "allocated" as const,
+      sidecarId: "sc-allocated",
+      allocationId: "alloc-1",
+      tenantId: "tenant-1",
+      anchorRunId: "run-anchor",
+      workflowRunAddress: "workflow@exclusive",
+      generation: 1,
+    };
+
+    const allocationConfig = {
+      sessionId: "ses-exclusive",
+      agentId: "workflow",
+      tenantId: "tenant-1",
+      principalId: "principal-1",
+      agentAddress: "workflow@exclusive",
+      systemPrompt: "test",
+      tools: [],
+      grants: [],
+      sources: TEST_SOURCES,
+      defaultSource: TEST_DEFAULT_SOURCE,
+    };
+
+    test("redelivers retained mail once when an allocated generation reconnects", async () => {
+      const mailCount = (
+        ws: ReturnType<typeof createMockWs>,
+        messageId: string,
+      ) =>
+        ws.sent
+          .map((sent) => JSON.parse(sent))
+          .filter(
+            (frame) =>
+              frame.type === "mail.inbound" && frame.messageId === messageId,
+          ).length;
+      const allocatedRouter = createTestRouter({
+        authenticateSidecar: async () => allocationIdentity,
+        validateSidecarIdentity: async () => true,
+        mailAckRetryIntervalMs: 10_000,
+        disconnectQueueTTLMs: 60_000,
+      });
+      allocatedRouter.fenceAllocation("alloc-1", 1);
+
+      const ws1 = createMockWs();
+      allocatedRouter.handleOpen(ws1);
+      allocatedRouter.handleMessage(
+        ws1,
+        JSON.stringify({
+          type: "register",
+          sidecarId: "sc-allocated",
+          token: "token",
+          agentAddresses: [allocationIdentity.workflowRunAddress],
+        }),
+      );
+      await tick();
+      expect(
+        allocatedRouter.routeMail(
+          allocationIdentity.workflowRunAddress,
+          "aGVsbG8=",
+          "mid-allocated-reconnect",
+        ),
+      ).toBe(true);
+
+      allocatedRouter.handleClose(ws1);
+
+      const ws2 = createMockWs();
+      allocatedRouter.handleOpen(ws2);
+      const reconnectFrame = JSON.stringify({
+        type: "reconnect",
+        sidecarId: "sc-allocated",
+        token: "token",
+        agentAddresses: [allocationIdentity.workflowRunAddress],
+      });
+      allocatedRouter.handleMessage(ws2, reconnectFrame);
+      await tick();
+
+      expect(mailCount(ws2, "mid-allocated-reconnect")).toBe(1);
+      const redelivered = ws2.sent
+        .map((sent) => JSON.parse(sent))
+        .find(
+          (frame) =>
+            frame.type === "mail.inbound" &&
+            frame.messageId === "mid-allocated-reconnect",
+        );
+      expect(redelivered.rawMessage).toBe("aGVsbG8=");
+
+      allocatedRouter.handleMessage(ws2, reconnectFrame);
+      await tick();
+      expect(mailCount(ws2, "mid-allocated-reconnect")).toBe(1);
+    });
+
+    test("reports an active workflow advertised by the allocated generation", async () => {
+      const allocatedRouter = createTestRouter({
+        authenticateSidecar: async () => allocationIdentity,
+        validateSidecarIdentity: async () => true,
+      });
+      allocatedRouter.fenceAllocation("alloc-1", 1);
+
+      const ws = createMockWs();
+      allocatedRouter.handleOpen(ws);
+      allocatedRouter.handleMessage(
+        ws,
+        JSON.stringify({
+          type: "register",
+          sidecarId: "sc-allocated",
+          token: "token",
+          agentAddresses: ["workflow@exclusive"],
+        }),
+      );
+      await tick();
+
+      expect(
+        await allocatedRouter.isAllocatedWorkflowActive({
+          allocationId: "alloc-1",
+          generation: 1,
+        }),
+      ).toBe(true);
+    });
+
+    test("routes only allocation-targeted deploys to an allocated worker", async () => {
+      const allocatedRouter = createTestRouter({
+        authenticateSidecar: async () => allocationIdentity,
+        validateSidecarIdentity: async () => true,
+        hubPublicKey: TEST_HUB_KEY,
+        requestTimeoutMs: 500,
+      });
+      allocatedRouter.fenceAllocation("alloc-1", 1);
+      let deployAck: unknown;
+      allocatedRouter.events.on("agent.deploy.ack", (event) => {
+        deployAck = event;
+      });
+
+      const ws = createMockWs();
+      allocatedRouter.handleOpen(ws);
+      allocatedRouter.handleMessage(
+        ws,
+        JSON.stringify({
+          type: "register",
+          sidecarId: "sc-allocated",
+          token: "token",
+          agentAddresses: [],
+        }),
+      );
+      await tick();
+
+      expect(
+        await allocatedRouter.isAllocatedSidecarReady({
+          allocationId: "alloc-1",
+          generation: 1,
+        }),
+      ).toBe(true);
+      await expect(
+        allocatedRouter.sendAgentDeploy("ordinary@shared", allocationConfig),
+      ).rejects.toThrow("No sidecar available");
+
+      const deployed = allocatedRouter.sendAgentDeployToAllocation(
+        { allocationId: "alloc-1", generation: 1 },
+        "workflow@exclusive",
+        allocationConfig,
+      );
+      await tick();
+      expect(lastSent(ws).type).toBe("agent.deploy");
+      allocatedRouter.handleMessage(
+        ws,
+        JSON.stringify({
+          type: "agent.deploy.ack",
+          agentAddress: "workflow@exclusive",
+          publicKey: "b".repeat(64),
+        }),
+      );
+      await expect(deployed).resolves.toEqual({ publicKey: "b".repeat(64) });
+      expect(deployAck).toMatchObject({
+        agentAddress: "workflow@exclusive",
+        allocated: {
+          allocationId: "alloc-1",
+          anchorRunId: "run-anchor",
+          generation: 1,
+        },
+      });
+    });
+
+    test("disconnect rejects an allocation-targeted deploy", async () => {
+      const allocatedRouter = createTestRouter({
+        authenticateSidecar: async () => allocationIdentity,
+        validateSidecarIdentity: async () => true,
+        hubPublicKey: TEST_HUB_KEY,
+        requestTimeoutMs: 500,
+      });
+      allocatedRouter.fenceAllocation("alloc-1", 1);
+
+      const ws = createMockWs();
+      allocatedRouter.handleOpen(ws);
+      allocatedRouter.handleMessage(
+        ws,
+        JSON.stringify({
+          type: "register",
+          sidecarId: "sc-allocated",
+          token: "token",
+          agentAddresses: [],
+        }),
+      );
+      await tick();
+
+      const deployed = allocatedRouter.sendAgentDeployToAllocation(
+        { allocationId: "alloc-1", generation: 1 },
+        "workflow@exclusive",
+        allocationConfig,
+      );
+      await tick();
+      allocatedRouter.handleClose(ws);
+
+      await expect(deployed).rejects.toThrow("disconnected");
+    });
+
+    test("restores a workflow-run pack before the deployment address is routed", async () => {
+      const allocatedRouter = createTestRouter({
+        authenticateSidecar: async () => allocationIdentity,
+        validateSidecarIdentity: async () => true,
+        hubPublicKey: TEST_HUB_KEY,
+        requestTimeoutMs: 500,
+      });
+      allocatedRouter.fenceAllocation("alloc-1", 1);
+
+      const ws = createMockWs();
+      allocatedRouter.handleOpen(ws);
+      allocatedRouter.handleMessage(
+        ws,
+        JSON.stringify({
+          type: "register",
+          sidecarId: "sc-allocated",
+          token: "token",
+          agentAddresses: [],
+        }),
+      );
+      await tick();
+
+      expect(allocatedRouter.getRoutableAddresses()).not.toContain(
+        allocationIdentity.workflowRunAddress,
+      );
+      const restored = allocatedRouter.sendWorkflowRunPackToAllocation(
+        { allocationId: "alloc-1", generation: 1 },
+        allocationIdentity.workflowRunAddress,
+        new Uint8Array([1, 2, 3]),
+        "refs/heads/events",
+        "d".repeat(40),
+      );
+      await tick();
+
+      const done = lastSent(ws);
+      expect(done).toMatchObject({
+        type: "repo.pack.done",
+        agentAddress: allocationIdentity.workflowRunAddress,
+        repoId: {
+          kind: "workflow-run",
+          id: deriveWorkflowRunRepoId(allocationIdentity.workflowRunAddress),
+        },
+        ref: "refs/heads/events",
+        commitSha: "d".repeat(40),
+      });
+      allocatedRouter.handleMessage(
+        ws,
+        JSON.stringify({
+          type: "repo.pack.ack",
+          agentAddress: allocationIdentity.workflowRunAddress,
+          repoId: done.repoId,
+          transferId: done.transferId,
+        }),
+      );
+
+      await expect(restored).resolves.toBeUndefined();
+      expect(allocatedRouter.getRoutableAddresses()).not.toContain(
+        allocationIdentity.workflowRunAddress,
+      );
+    });
+
+    test("refuses to restore Hub history over an already-active workflow", async () => {
+      const allocatedRouter = createTestRouter({
+        authenticateSidecar: async () => allocationIdentity,
+        validateSidecarIdentity: async () => true,
+        hubPublicKey: TEST_HUB_KEY,
+        requestTimeoutMs: 500,
+      });
+      allocatedRouter.fenceAllocation("alloc-1", 1);
+      const routableWhenConnected: string[][] = [];
+      allocatedRouter.events.on("sidecar.allocated.connected", () => {
+        routableWhenConnected.push(allocatedRouter.getRoutableAddresses());
+      });
+
+      const ws = createMockWs();
+      allocatedRouter.handleOpen(ws);
+      allocatedRouter.handleMessage(
+        ws,
+        JSON.stringify({
+          type: "reconnect",
+          sidecarId: "sc-allocated",
+          token: "token",
+          agentAddresses: [allocationIdentity.workflowRunAddress],
+          deployRefs: {},
+        }),
+      );
+      await tick();
+      const sentBeforeRestore = ws.sent.length;
+
+      expect(routableWhenConnected).toEqual([
+        [allocationIdentity.workflowRunAddress],
+      ]);
+
+      await expect(
+        allocatedRouter.sendWorkflowRunPackToAllocation(
+          { allocationId: "alloc-1", generation: 1 },
+          allocationIdentity.workflowRunAddress,
+          new Uint8Array([1, 2, 3]),
+          "refs/heads/main",
+          "d".repeat(40),
+        ),
+      ).rejects.toThrow("refusing to overwrite its run history");
+      expect(ws.sent).toHaveLength(sentBeforeRestore);
+    });
+
+    test("delivers grants and durable mail to the exact generation and emits its ack", async () => {
+      const allocatedRouter = createTestRouter({
+        authenticateSidecar: async () => allocationIdentity,
+        validateSidecarIdentity: async () => true,
+        hubPublicKey: TEST_HUB_KEY,
+      });
+      allocatedRouter.fenceAllocation("alloc-1", 1);
+      const acknowledgements: unknown[] = [];
+      allocatedRouter.events.on("mail.inbound.acknowledged", (event) => {
+        acknowledgements.push(event);
+      });
+      const ws = createMockWs();
+      allocatedRouter.handleOpen(ws);
+      allocatedRouter.handleMessage(
+        ws,
+        JSON.stringify({
+          type: "register",
+          sidecarId: "sc-allocated",
+          token: "token",
+          agentAddresses: [],
+        }),
+      );
+      await tick();
+
+      const deployed = allocatedRouter.sendAgentDeployToAllocation(
+        { allocationId: "alloc-1", generation: 1 },
+        "workflow@exclusive",
+        allocationConfig,
+      );
+      await tick();
+      allocatedRouter.handleMessage(
+        ws,
+        JSON.stringify({
+          type: "agent.deploy.ack",
+          agentAddress: "workflow@exclusive",
+          publicKey: "b".repeat(64),
+        }),
+      );
+      await deployed;
+
+      await allocatedRouter.sendWorkflowRunDispatchToAllocation(
+        { allocationId: "alloc-1", generation: 1 },
+        "workflow@exclusive",
+        "workflow@exclusive",
+        [],
+        "cmF3LW1haWw=",
+        "message-1",
+      );
+
+      const frames = ws.sent.map((raw) => JSON.parse(raw));
+      expect(frames.slice(-2).map((frame) => frame.type)).toEqual([
+        "run.grants",
+        "mail.inbound",
+      ]);
+      expect(frames.at(-1)).toMatchObject({
+        agentAddress: "workflow@exclusive",
+        messageId: "message-1",
+        rawMessage: "cmF3LW1haWw=",
+      });
+
+      allocatedRouter.handleMessage(
+        ws,
+        JSON.stringify({
+          type: "mail.inbound.ack",
+          agentAddress: "workflow@exclusive",
+          messageId: "message-1",
+        }),
+      );
+      await tick();
+      expect(acknowledgements).toEqual([
+        {
+          agentAddress: "workflow@exclusive",
+          messageId: "message-1",
+          allocated: {
+            allocationId: "alloc-1",
+            anchorRunId: "run-anchor",
+            generation: 1,
+          },
+        },
+      ]);
+
+      await allocatedRouter.sendSignalDeliverToAllocation(
+        { allocationId: "alloc-1", generation: 1 },
+        {
+          agentAddress: "workflow@exclusive",
+          runId: "workflow@exclusive",
+          signalName: "continue",
+          signalId: "signal-1",
+          payload: { approved: true },
+        },
+      );
+      expect(lastSent(ws)).toMatchObject({
+        type: "signal.deliver",
+        signalId: "signal-1",
+        payload: { approved: true },
+      });
+    });
+
+    test("emits exact allocation lifecycle events only for the current socket", async () => {
+      const allocatedRouter = createTestRouter({
+        authenticateSidecar: async () => allocationIdentity,
+        validateSidecarIdentity: async () => true,
+      });
+      allocatedRouter.fenceAllocation("alloc-1", 1);
+      const connected: { allocationId: string; generation: number }[] = [];
+      const disconnected: (
+        | {
+            allocationId: string;
+            generation: number;
+          }
+        | undefined
+      )[] = [];
+      allocatedRouter.events.on("sidecar.allocated.connected", (target) => {
+        connected.push(target);
+      });
+      allocatedRouter.events.on("sidecar.disconnect", ({ allocated }) => {
+        disconnected.push(allocated);
+      });
+
+      const oldWs = createMockWs();
+      allocatedRouter.handleOpen(oldWs);
+      allocatedRouter.handleMessage(
+        oldWs,
+        JSON.stringify({
+          type: "register",
+          sidecarId: "sc-allocated",
+          token: "token",
+          agentAddresses: [],
+        }),
+      );
+      await tick();
+
+      const currentWs = createMockWs();
+      allocatedRouter.handleOpen(currentWs);
+      allocatedRouter.handleMessage(
+        currentWs,
+        JSON.stringify({
+          type: "register",
+          sidecarId: "sc-allocated",
+          token: "token",
+          agentAddresses: [],
+        }),
+      );
+      await tick();
+
+      // The same-generation takeover closes the old socket but must not be
+      // interpreted as capacity loss. Closing the new current socket does.
+      expect(disconnected).toEqual([undefined]);
+      allocatedRouter.handleClose(currentWs);
+
+      expect(connected).toEqual([
+        { allocationId: "alloc-1", generation: 1 },
+        { allocationId: "alloc-1", generation: 1 },
+      ]);
+      expect(disconnected).toEqual([
+        undefined,
+        { allocationId: "alloc-1", generation: 1 },
+      ]);
+    });
+
+    test("advancing the fence closes the previous generation", async () => {
+      const allocatedRouter = createTestRouter({
+        authenticateSidecar: async () => allocationIdentity,
+        validateSidecarIdentity: async () => true,
+      });
+      allocatedRouter.fenceAllocation("alloc-1", 1);
+      const ws = createMockWs();
+      allocatedRouter.handleOpen(ws);
+      allocatedRouter.handleMessage(
+        ws,
+        JSON.stringify({
+          type: "register",
+          sidecarId: "sc-allocated",
+          token: "token",
+          agentAddresses: [],
+        }),
+      );
+      await tick();
+
+      allocatedRouter.fenceAllocation("alloc-1", 2);
+
+      expect(ws.closed).toBe(true);
+      expect(
+        await allocatedRouter.isAllocatedSidecarReady({
+          allocationId: "alloc-1",
+          generation: 1,
+        }),
+      ).toBe(false);
+    });
+
+    test("rejects an allocated credential claiming an unrelated address", async () => {
+      const allocatedRouter = createTestRouter({
+        authenticateSidecar: async () => allocationIdentity,
+        validateSidecarIdentity: async () => true,
+      });
+      allocatedRouter.fenceAllocation("alloc-1", 1);
+      const ws = createMockWs();
+      allocatedRouter.handleOpen(ws);
+      allocatedRouter.handleMessage(
+        ws,
+        JSON.stringify({
+          type: "reconnect",
+          sidecarId: "sc-allocated",
+          token: "token",
+          agentAddresses: ["other@tenant"],
+          deployRefs: {},
+        }),
+      );
+      await tick();
+
+      expect(ws.closed).toBe(true);
+      expect(allocatedRouter.getRoutableAddresses()).toEqual([]);
     });
   });
 });

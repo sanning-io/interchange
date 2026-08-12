@@ -8,8 +8,7 @@
 | ------ | ---- | ------- |
 | GET | /api/me | Get current user profile |
 | GET | /api/me/principals | List principals across all tenants |
-| GET | /api/me/agents | List agents across all tenants |
-| GET | /api/me/instances | List running agent instances across all tenants |
+| GET | /api/me/workflows/runs | List running workflow runs across all tenants |
 | GET | /api/me/sessions | List sessions across all tenants |
 | GET | /api/me/approvals | List pending approvals across all tenants |
 | GET | /api/me/git-tokens | List personal git tokens |
@@ -36,24 +35,20 @@
 | PATCH | /api/tenants/:tenantId/grants/:grantId | Update a grant |
 | DELETE | /api/tenants/:tenantId/grants/:grantId | Revoke a grant |
 | POST | /api/tenants/:tenantId/principals/:principalId/evaluate | Evaluate grants for a principal |
-| GET | /api/tenants/:tenantId/agents/definitions | List agents in the tenant |
-| POST | /api/tenants/:tenantId/agents/definitions | Create an agent |
-| GET | /api/tenants/:tenantId/agents/definitions/:agentId | Get agent details |
-| PATCH | /api/tenants/:tenantId/agents/definitions/:agentId | Update agent definition |
-| DELETE | /api/tenants/:tenantId/agents/definitions/:agentId | Retire an agent |
-| GET | /api/tenants/:tenantId/agents/definitions/:agentId/versions | List agent versions |
-| POST | /api/tenants/:tenantId/agents/definitions/:agentId/rollback | Rollback to a previous version |
-| POST | /api/tenants/:tenantId/agents/instances | Deploy an agent instance |
-| GET | /api/tenants/:tenantId/agents/instances | List agent instances |
-| GET | /api/tenants/:tenantId/agents/instances/blobs/:blobId | Fetch a blob by ID |
-| GET | /api/tenants/:tenantId/agents/instances/:instanceId | Get instance detail |
-| DELETE | /api/tenants/:tenantId/agents/instances/:instanceId | Stop an instance |
-| GET | /api/tenants/:tenantId/agents/instances/:instanceId/health | Get instance health |
-| GET | /api/tenants/:tenantId/agents/instances/:instanceId/offerings | List instance offerings |
-| GET | /api/tenants/:tenantId/agents/instances/:instanceId/events | SSE event stream |
-| POST | /api/tenants/:tenantId/agents/instances/:instanceId/mail | Send mail to the agent |
-| GET | /api/tenants/:tenantId/agents/instances/:instanceId/mail | List mail for an instance |
-| GET | /api/tenants/:tenantId/agents/instances/:instanceId/turns | List inference turns for an instance |
+| POST | /api/tenants/:tenantId/workflows/runs | Deploy an agent instance |
+| GET | /api/tenants/:tenantId/workflows/runs | List agent instances |
+| GET | /api/tenants/:tenantId/workflows/runs/blobs/:blobId | Fetch a blob by ID |
+| GET | /api/tenants/:tenantId/workflows/runs/:runId | Get instance detail |
+| DELETE | /api/tenants/:tenantId/workflows/runs/:runId | Stop an instance |
+| GET | /api/tenants/:tenantId/workflows/runs/:runId/health | Get instance health |
+| GET | /api/tenants/:tenantId/workflows/runs/:runId/offerings | List instance offerings |
+| GET | /api/tenants/:tenantId/workflows/runs/:runId/events | SSE event stream |
+| POST | /api/tenants/:tenantId/workflows/runs/:runId/mail | Send mail to the agent |
+| GET | /api/tenants/:tenantId/workflows/runs/:runId/mail | List mail for an instance |
+| GET | /api/tenants/:tenantId/workflows/runs/:runId/turns | List inference turns for an instance |
+| GET | /api/tenants/:tenantId/workflows/definitions | List workflow definitions |
+| GET | /api/tenants/:tenantId/workflows/definitions/:definitionId/versions | List definition versions |
+| POST | /api/tenants/:tenantId/workflows/definitions/:definitionId/rollback | Roll back to a previous version |
 | POST | /api/tenants/:tenantId/workflows/instances | Deploy a workflow |
 | GET | /api/tenants/:tenantId/workflows/instances | List workflow deployments |
 | POST | /api/tenants/:tenantId/workflows/:deploymentId/signals | Deliver a signal to a workflow run |
@@ -150,23 +145,14 @@ Query: cursor?, limit?
 200: unknown -- List of principals across tenants
 401: ErrorResponse -- Not authenticated
 
-### GET /api/me/agents
-List agents across all tenants
+### GET /api/me/workflows/runs
+List running workflow runs across all tenants
 
-Aggregates agents from all tenants the user belongs to. Each result is tagged with tenantId.
-
-Query: cursor?, limit?
-
-200: unknown -- Agents across tenants
-
-### GET /api/me/instances
-List running agent instances across all tenants
-
-Aggregates running agent instances from all tenants the user belongs to. Each result is tagged with tenantId.
+Aggregates running workflow runs from all tenants the user belongs to. Each result is tagged with tenantId.
 
 Query: cursor?, limit?
 
-200: unknown -- Instances across tenants
+200: unknown -- Runs across tenants
 
 ### GET /api/me/sessions
 List sessions across all tenants
@@ -212,8 +198,7 @@ Soft-revokes a personal access token by setting `revokedAt`. Only the owning use
 
 204: (no content) -- Token revoked
 401: ErrorResponse -- Not authenticated
-403: ErrorResponse -- Token not owned by the authenticated user
-404: ErrorResponse -- Token not found
+404: ErrorResponse -- Token not found or not owned by the authenticated user
 
 ### GET /api/tenants/:tenantId/git-tokens
 List tenant git tokens
@@ -454,96 +439,30 @@ Body: EvaluateRequest
 200: EvaluateResult -- Evaluation result
 404: ErrorResponse -- Principal not found
 
-## Agents
-
-### GET /api/tenants/:tenantId/agents/definitions
-List agents in the tenant
-
-Filterable by offering and status.
-
-Query: offering?, status?: deployed|stopped, cursor?, limit?
-
-200: unknown -- List of agents
-
-### POST /api/tenants/:tenantId/agents/definitions
-Create an agent
-
-Creates an agent definition. Grant requirements are stored as a manifest and resolved at instance launch time.
-
-Body: CreateAgent
-
-201: AgentResponse -- Agent created
-400: ErrorResponse -- Validation error
-
-### GET /api/tenants/:tenantId/agents/definitions/:agentId
-Get agent details
-
-Returns the agent definition, status, health, and capabilities.
-
-200: AgentResponse -- Agent details
-404: ErrorResponse -- Agent not found
-
-### PATCH /api/tenants/:tenantId/agents/definitions/:agentId
-Update agent definition
-
-Updates the agent definition and creates a new version. The new version is deployed alongside the current version until health checks pass.
-
-Body: UpdateAgent
-
-200: AgentResponse -- Agent updated
-400: ErrorResponse -- Validation error
-
-### DELETE /api/tenants/:tenantId/agents/definitions/:agentId
-Retire an agent
-
-Retires the agent definition and marks all running instances as stopped. Does not signal running sidecars; in-flight sessions continue until the sidecar disconnects.
-
-204: (no content) -- Agent retirement initiated
-404: ErrorResponse -- Agent not found
-
-### GET /api/tenants/:tenantId/agents/definitions/:agentId/versions
-List agent versions
-
-Lists all versions with their deployment status.
-
-Query: cursor?, limit?
-
-200: unknown -- List of versions
-
-### POST /api/tenants/:tenantId/agents/definitions/:agentId/rollback
-Rollback to a previous version
-
-Shifts traffic back to the specified version. The current version is stopped.
-
-Body: RollbackRequest
-
-200: AgentResponse -- Rollback initiated
-400: ErrorResponse -- Invalid version
-
 ## Instances
 
-### POST /api/tenants/:tenantId/agents/instances
+### POST /api/tenants/:tenantId/workflows/runs
 Deploy an agent instance
 
 Creates a new running instance of the specified agent definition. Resolves the definition's model requirements against the tenant catalog into an ordered inference-source list, materializes grants on a new agent principal, provisions the agent on a sidecar, and starts it. The invoker can provide invokerGrants to delegate additional capabilities, and modelPreferences to reorder or restrict the resolved providers for the session.
 
-Body: CreateAgentInstance
+Body: CreateWorkflowRun
 
-201: AgentInstanceResponse -- Instance deployed
+201: WorkflowRunResponse -- Instance deployed
 404: ErrorResponse -- Agent definition not found
 409: ErrorResponse -- Agent not launchable
 502: ErrorResponse -- Sidecar unavailable
 
-### GET /api/tenants/:tenantId/agents/instances
+### GET /api/tenants/:tenantId/workflows/runs
 List agent instances
 
-Lists agent instances in the tenant. Filterable by agentId and status.
+Lists agent instances in the tenant. Filterable by definitionId and status.
 
-Query: agentId?, status?: deployed|running|updating|error|stopped, cursor?, limit?
+Query: definitionId?, status?: deployed|running|updating|error|stopped, cursor?, limit?
 
 200: unknown -- List of instances
 
-### GET /api/tenants/:tenantId/agents/instances/blobs/:blobId
+### GET /api/tenants/:tenantId/workflows/runs/blobs/:blobId
 Fetch a blob by ID
 
 Returns raw bytes for a MIME part. Blob IDs are issued by the mail parsing layer.
@@ -553,15 +472,15 @@ Returns raw bytes for a MIME part. Blob IDs are issued by the mail parsing layer
 403: ErrorResponse -- Forbidden
 404: ErrorResponse -- Blob not found
 
-### GET /api/tenants/:tenantId/agents/instances/:instanceId
+### GET /api/tenants/:tenantId/workflows/runs/:runId
 Get instance detail
 
 Returns instance runtime state including status, public key, and sidecar assignment.
 
-200: AgentInstanceResponse -- Instance detail
+200: WorkflowRunResponse -- Instance detail
 404: ErrorResponse -- Instance not found
 
-### DELETE /api/tenants/:tenantId/agents/instances/:instanceId
+### DELETE /api/tenants/:tenantId/workflows/runs/:runId
 Stop an instance
 
 Stops the running instance and undeploys the agent from the sidecar.
@@ -571,16 +490,16 @@ Stops the running instance and undeploys the agent from the sidecar.
 409: ErrorResponse -- Instance already stopped
 502: ErrorResponse -- Sidecar unavailable
 
-### GET /api/tenants/:tenantId/agents/instances/:instanceId/health
+### GET /api/tenants/:tenantId/workflows/runs/:runId/health
 Get instance health
 
 Returns liveness and readiness for a running instance. Liveness reflects whether the instance's sidecar connection is active. Readiness reflects whether the instance has an active event collector and can process work.
 
-200: AgentHealth -- Health status
+200: WorkflowRunHealth -- Health status
 404: ErrorResponse -- Instance not found
 410: ErrorResponse -- Instance stopped
 
-### GET /api/tenants/:tenantId/agents/instances/:instanceId/offerings
+### GET /api/tenants/:tenantId/workflows/runs/:runId/offerings
 List instance offerings
 
 Returns the offerings associated with the instance's agent definition. These represent the capabilities the instance can provide.
@@ -588,7 +507,7 @@ Returns the offerings associated with the instance's agent definition. These rep
 200: OfferingDetail[] -- List of offerings
 404: ErrorResponse -- Instance not found
 
-### GET /api/tenants/:tenantId/agents/instances/:instanceId/events
+### GET /api/tenants/:tenantId/workflows/runs/:runId/events
 SSE event stream
 
 Server-Sent Events stream for agent events. Use POST .../messages for client-to-server messaging.
@@ -597,7 +516,7 @@ Server-Sent Events stream for agent events. Use POST .../messages for client-to-
 404: ErrorResponse -- Instance not found
 410: ErrorResponse -- Instance stopped
 
-### POST /api/tenants/:tenantId/agents/instances/:instanceId/mail
+### POST /api/tenants/:tenantId/workflows/runs/:runId/mail
 Send mail to the agent
 
 Persists the user message as a mail record and dispatches it to the running agent. Returns JMAP Email-shaped response.
@@ -611,7 +530,7 @@ Body: SendMessage
 413: ErrorResponse -- Request body exceeds the maximum allowed size
 502: ErrorResponse -- Sidecar unavailable
 
-### GET /api/tenants/:tenantId/agents/instances/:instanceId/mail
+### GET /api/tenants/:tenantId/workflows/runs/:runId/mail
 List mail for an instance
 
 Returns parsed JMAP Email objects in reverse chronological order. Cursor-paginated.
@@ -621,7 +540,7 @@ Query: cursor?, limit?
 200: unknown -- List of mail
 404: ErrorResponse -- Instance not found
 
-### GET /api/tenants/:tenantId/agents/instances/:instanceId/turns
+### GET /api/tenants/:tenantId/workflows/runs/:runId/turns
 List inference turns for an instance
 
 Returns inference turns with their parts in reverse chronological order. Cursor-paginated.
@@ -630,6 +549,38 @@ Query: cursor?, limit?
 
 200: unknown -- List of inference turns
 404: ErrorResponse -- Instance not found
+
+## Workflow Definitions
+
+### GET /api/tenants/:tenantId/workflows/definitions
+List workflow definitions
+
+Lists the workflow definitions for the tenant, most recent first.
+
+Query: cursor?, limit?
+
+200: unknown -- List of workflow definitions
+
+### GET /api/tenants/:tenantId/workflows/definitions/:definitionId/versions
+List definition versions
+
+Lists all versions of a workflow definition with status.
+
+Query: cursor?, limit?
+
+200: unknown -- List of versions
+404: ErrorResponse -- Definition not found
+
+### POST /api/tenants/:tenantId/workflows/definitions/:definitionId/rollback
+Roll back to a previous version
+
+Activates the specified version and stops the current one; repoints currentVersion.
+
+Body: WorkflowRollbackRequest
+
+200: WorkflowDefinitionResponse -- Rollback applied
+400: ErrorResponse -- Invalid version
+404: ErrorResponse -- Definition not found
 
 ## Workflows
 
@@ -661,21 +612,25 @@ Delivers a caller-supplied, stable signal to the named run of a workflow deploym
 Body: unknown
 
 202: (no content) -- Signal accepted for delivery
+400: ErrorResponse -- Reserved signal name or a runId that is not the deployment's addressable run
 404: ErrorResponse -- Workflow deployment not found
+409: ErrorResponse -- Workflow run has not started, is terminal, its deployment allocation is no longer active, or the signalId conflicts with a previously accepted payload
 502: ErrorResponse -- Sidecar unavailable
+503: ErrorResponse -- Durable workflow dispatch unavailable
 
 ### POST /api/tenants/:tenantId/workflows/:deploymentId/mail
 Trigger a workflow run
 
-Assembles a fresh signed conversation message and delivers it to the deployment's inbound mail address, starting a new workflow run. The run id is minted by the supervisor and is not returned synchronously; correlate the resulting RunStarted via the returned messageId.
+Delivers a fresh signed conversation message to the deployment's stable top-level run. The first accepted message fires that run; while it remains live, later messages may resume its onTrigger input. A terminal deployment run cannot be fired again. The returned messageId identifies this trigger occurrence.
 
 Body: SendMessage
 
 202: unknown -- Trigger accepted for delivery
 400: ErrorResponse -- Attachment validation error. Each variant carries a structured code (oversize_attachment, disallowed_mime_type, malformed_base64, oversize_total) with the offending index and limits. A malformed request body that fails SendMessage validation returns the generic error shape instead.
 404: ErrorResponse -- Workflow deployment not found
-409: ErrorResponse -- Deployment address is not routable
+409: ErrorResponse -- Deployment address is not routable, its allocation is no longer active, or its top-level run is terminal
 413: ErrorResponse -- Request body exceeds the maximum allowed size
+503: ErrorResponse -- Durable workflow dispatch unavailable
 
 ### GET /api/tenants/:tenantId/workflows/:deploymentId/runs
 List workflow runs
@@ -725,7 +680,8 @@ Body: ApproveAction
 400: ErrorResponse -- Unsupported scope
 403: ErrorResponse -- Approver lacks the approval resolve grant
 404: ErrorResponse -- Approval not found
-409: ErrorResponse -- Approval already resolved
+409: ErrorResponse -- Approval already resolved (takes precedence on retries), workflow run no longer running, or workflow deployment unavailable
+503: ErrorResponse -- Durable workflow dispatch unavailable
 
 ### POST /api/tenants/:tenantId/approvals/:approvalId/reject
 Reject an action
@@ -737,7 +693,8 @@ Body: RejectAction
 200: ApprovalResponse -- Action rejected
 403: ErrorResponse -- Approver lacks the approval resolve grant
 404: ErrorResponse -- Approval not found
-409: ErrorResponse -- Approval already resolved
+409: ErrorResponse -- Approval already resolved (takes precedence on retries), workflow run no longer running, or workflow deployment unavailable
+503: ErrorResponse -- Durable workflow dispatch unavailable
 
 ## Wallets
 
@@ -783,9 +740,9 @@ Deactivate a wallet
 ### GET /api/tenants/:tenantId/wallets/:walletId/transactions
 List transactions
 
-Transaction history for a wallet. Filterable by agent, date range, and status.
+Transaction history for a wallet. Filterable by run, date range, and status.
 
-Query: agentId?, startTime?, endTime?, status?: pending|completed|failed, cursor?, limit?
+Query: runId?, startTime?, endTime?, status?: pending|completed|failed, cursor?, limit?
 
 200: unknown -- List of transactions
 
@@ -951,18 +908,18 @@ Query: name?, minPrice?, maxPrice?, paymentMethod?, cursor?, limit?
 ### POST /api/tenants/:tenantId/offerings
 Register an offering
 
-Registers an offering for an agent. The agent must belong to the tenant.
+Registers an offering for a workflow definition. The definition must belong to the tenant.
 
 Body: CreateOffering
 
 201: OfferingDetail -- Offering registered
 400: ErrorResponse -- Validation error
-404: ErrorResponse -- Agent not found
+404: ErrorResponse -- Workflow definition not found
 
 ### GET /api/tenants/:tenantId/offerings/:offeringId
 Get offering details
 
-Returns pricing, agent info, and request/response type information.
+Returns pricing, definition info, and request/response type information.
 
 200: OfferingDetail -- Offering details
 404: ErrorResponse -- Offering not found
@@ -1280,25 +1237,6 @@ Returns the current set of tarballs under tarballs/ for the package-registry ass
 
 ## Type Reference
 
-### AgentHealth
-`{ liveness: "ok" | "unhealthy", readiness: "not_ready" | "ok" | "unhealthy", lastCheckedAt?: string | null }`
-Source: packages/types/src/agents.ts
-
-### AgentInstanceResponse
-`{ address: string, agentId: string, agentName: string, createdAt: string, id: string, status: "deployed" | "error" | "running" | "stopped" | "updating", tenantId: string, updatedAt: string, endedAt?: string | null, kernelId?: string | null, publicKey?: string | null, sidecarId?: string | null }`
-Source: packages/types/src/agents.ts
-
-**status**: Lifecycle state of this running instance: `deployed` (provisioned on a sidecar, not yet started), `running` (started and serving), `updating` (rolling to a new definition version), `error` (launch or runtime failure), or `stopped` (undeployed).
-
-### AgentResponse
-`{ createdAt: string, creatorPrincipalId: string, currentVersion: string, id: string, name: string, status: "deployed" | "stopped", tenantId: string, toolPackages: { name: /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/, version: string }[], updatedAt: string, capabilities?: { [string]: unknown }, contextConfig?: { [string]: unknown }, credentialRequirements?: { providerName: string, source: "creator" | "invoker" | "tenant", name?: string, scopes?: string[] }[], description?: string | null, grantRequirements?: { action: string, resource: string, source: "creator" | "invoker", conditions?: { [string]: unknown } | null, effect?: "allow" | "ask" | "deny" }[], initialState?: { [string]: unknown }, modelConfig?: { [string]: unknown }, modelRequirements?: { model: string, capabilities?: ("audio-input" | "audio-input-streaming" | "code-execution" | "code-execution-streaming" | "document-input" | "document-input-streaming" | "files-api-reference" | "files-api-reference-streaming" | "function-calling" | "function-calling-multi-turn" | "function-calling-multi-turn-streaming" | "function-calling-with-thinking" | "function-calling-with-thinking-streaming" | "grounding" | "grounding-streaming" | "image-output" | "image-output-streaming" | "long-context" | "plain-text" | "plain-text-streaming" | "prompt-caching" | "reasoning-content" | "reasoning-content-streaming" | "redacted-thinking" | "redacted-thinking-streaming" | "structured-output" | "structured-output-streaming" | "video-input" | "video-input-streaming" | "vision-input" | "vision-input-streaming")[], providers?: { mode: "pin" | "prefer", order: string[] } }[], roles?: { id: string, name: string }[], systemPrompt?: string | null }`
-Source: packages/types/src/agents.ts
-
-**creatorPrincipalId**: Identifies the definition author's principal (definitions have no principalId of their own). Used for resolving creator-sourced grant and credential requirements.
-**status**: Lifecycle state of the agent definition: `deployed` (a launchable version is active) or `stopped` (deactivated, no new instances launch).
-**toolPackages**: Tool packages this definition pins. Always present; an empty array means the definition pins no packages (the agent runs with whatever non-tool-package factories the sidecar harness ships).
-**modelRequirements**: Model needs declared by canonical name, with optional per-model capability filters and provider preferences. Resolved against the tenant catalog at launch to build the ordered inference sources; it does not introduce providers the tenant catalog lacks.
-
 ### ApprovalResponse
 `{ agentAddress: string, correlationId: string, createdAt: string, deploymentId: string, id: string, resolvedAt: string | null, runId: string, scope: "always" | "once" | null, status: "approved" | "expired" | "pending" | "rejected" | "timeout", tenantId: string, timeoutAt: string | null, toolArguments: { [string]: unknown }, toolDefinition: { [string]: unknown }, updatedAt: string }`
 Source: packages/types/src/approvals.ts
@@ -1309,10 +1247,10 @@ Source: packages/types/src/approvals.ts
 **toolDefinition**: The approver-facing tool snapshot (name, description, input schema) captured at suspend time.
 
 ### ApprovalSummary
-`{ action: string, agentId: string, agentName: string, createdAt: string, id: string, resource: string, sessionId: string, tenantId: string, tenantName: string }`
+`{ action: string, createdAt: string, definitionId: string, definitionName: string, id: string, resource: string, sessionId: string, tenantId: string, tenantName: string }`
 Source: packages/types/src/me.ts
 
-**sessionId**: Internal FK to the session channel. The instance ID can be resolved via the session relationship.
+**sessionId**: Internal FK to the session channel. The run ID can be resolved via the session relationship.
 
 ### ApproveAction
 `{ scope: "always" | "once" }`
@@ -1342,21 +1280,6 @@ Source: packages/types/src/agent-data.ts
 ### CommitDetail
 `{ author: string, changes: { path: string, status: "added" | "deleted" | "modified", additions?: number, deletions?: number }[], message: string, ref: string, timestamp: string }`
 Source: packages/types/src/agent-data.ts
-
-### CreateAgent
-`{ name: string, capabilities?: { [string]: unknown }, contextConfig?: { [string]: unknown }, credentialRequirements?: { providerName: string, source: "creator" | "invoker" | "tenant", name?: string, scopes?: string[] }[], description?: string, grantRequirements?: { action: string, resource: string, source: "creator" | "invoker", conditions?: { [string]: unknown } | null, effect?: "allow" | "ask" | "deny" }[], initialState?: { [string]: unknown }, modelConfig?: { [string]: unknown }, modelRequirements?: { model: string, capabilities?: ("audio-input" | "audio-input-streaming" | "code-execution" | "code-execution-streaming" | "document-input" | "document-input-streaming" | "files-api-reference" | "files-api-reference-streaming" | "function-calling" | "function-calling-multi-turn" | "function-calling-multi-turn-streaming" | "function-calling-with-thinking" | "function-calling-with-thinking-streaming" | "grounding" | "grounding-streaming" | "image-output" | "image-output-streaming" | "long-context" | "plain-text" | "plain-text-streaming" | "prompt-caching" | "reasoning-content" | "reasoning-content-streaming" | "redacted-thinking" | "redacted-thinking-streaming" | "structured-output" | "structured-output-streaming" | "video-input" | "video-input-streaming" | "vision-input" | "vision-input-streaming")[], providers?: { mode: "pin" | "prefer", order: string[] } }[], roleIds?: string[], systemPrompt?: string, toolPackages?: { name: /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/, version: string }[] }`
-Source: packages/types/src/agents.ts
-
-**grantRequirements**: A grant requirements manifest, not live grants. Each entry declares a resource, action, and source (creator or invoker). The control plane resolves these requirements at each agent launch against the current authority of the creator and invoker.
-**modelRequirements**: Model needs declared by canonical name, with optional per-model capability filters and provider preferences. Resolved against the tenant catalog at launch to build the ordered inference sources; it does not introduce providers the tenant catalog lacks.
-**toolPackages**: Tool packages pinned by this agent definition. Each entry must use a valid npm package name (lowercase, optionally `@scope/`-prefixed) and a parseable semver range; the array must contain no duplicate names. The hub resolves the full dependency closure at deploy-assembly time and ships the manifest to the sidecar; the sidecar materializes each pinned package and registers its tools with the harness.
-
-### CreateAgentInstance
-`{ agentId: string, invokerGrants?: { action: string, resource: string, conditions?: { [string]: unknown } | null, effect?: "allow" | "ask" | "deny" }[], modelPreferences?: { model: string, providers: { mode: "pin" | "prefer", order: string[] } }[] }`
-Source: packages/types/src/agents.ts
-
-**invokerGrants**: Capabilities the invoker is willing to delegate to the agent, resolved against the invoker's own authority at launch. These are materialized as grants on the agent principal in addition to any grants from the definition's own requirements.
-**modelPreferences**: The invoker's per-model provider preferences for this launch. Applied over the tenant-visible providers after the definition's preferences; it can only reorder or restrict, never introduce a provider the tenant catalog lacks. Persisted on the instance so re-resolution reuses it.
 
 ### CreateCredential
 `{ name: string, providerId: string, secret: string, type: "api_key" | "certificate" | "oauth_token" | "other", description?: string, expiresAt?: string, metadata?: { [string]: unknown }, oauthClientId?: string, principalId?: string, refreshSecret?: string, scopes?: string[] }`
@@ -1428,10 +1351,11 @@ Source: packages/types/src/catalog.ts
 **thinkingTokenPrice**: Cost per thinking token as a decimal string in this row's `currency`, or null if this provider does not charge for it.
 
 ### CreateProvider
-`{ name: string, plugin: string, authorizationUrl?: string, metadata?: { [string]: unknown }, scopes?: string[], tokenUrl?: string, userInfoUrl?: string }`
+`{ name: string, plugin: string, apiBaseUrl?: string, authorizationUrl?: string, metadata?: { [string]: unknown }, scopes?: string[], tokenUrl?: string, userInfoUrl?: string }`
 Source: packages/types/src/providers.ts
 
 **plugin**: Identifier of the integration this provider drives (for example the inference backend). Used to dispatch to the matching plugin and as the prefix when forming fully-qualified model ids (`plugin:model`).
+**apiBaseUrl**: The API origin a credential from this provider authenticates to (for example https://api.github.com). A provider that backs an origin-pinned credential must set it; OAuth-login-only providers may omit it.
 **metadata**: Free-form provider-specific configuration not covered by the typed fields. Not interpreted by the hub.
 **scopes**: OAuth scopes associated with this provider integration.
 
@@ -1449,6 +1373,13 @@ Source: packages/types/src/wallets.ts
 
 **backendType**: Settlement backend the wallet is denominated in: `crypto` (on-chain assets), `fiat` (national currency), or `credits` (internal accounting units). Determines how balances and transactions are settled.
 **config**: Backend-specific configuration for the wallet (for example chain or account details for a `crypto` backend). Shape depends on `backendType`; not interpreted by the hub.
+
+### CreateWorkflowRun
+`{ definitionId: string, invokerGrants?: { action: string, resource: string, conditions?: { [string]: unknown } | null, effect?: "allow" | "ask" | "deny" }[], modelPreferences?: { model: string, providers: { mode: "pin" | "prefer", order: string[] } }[] }`
+Source: packages/types/src/instances.ts
+
+**invokerGrants**: Capabilities the invoker is willing to delegate to the run, resolved against the invoker's own authority at launch. These are materialized as grants on the run principal in addition to any grants from the definition's own requirements.
+**modelPreferences**: The invoker's per-model provider preferences for this launch. Applied over the tenant-visible providers after the definition's preferences; it can only reorder or restrict, never introduce a provider the tenant catalog lacks. Persisted on the run so re-resolution reuses it.
 
 ### CredentialResponse
 `{ createdAt: string, id: string, name: string, providerId: string, status: "active" | "error" | "expired" | "revoked", tenantId: string, type: "api_key" | "certificate" | "oauth_token" | "other", updatedAt: string, description?: string | null, expiresAt?: string | null, metadata?: { [string]: unknown } | null, oauthClientId?: string | null, principalId?: string | null, scopes?: string[] | null }`
@@ -1579,10 +1510,11 @@ Source: packages/types/src/principals.ts
 **status**: Account state of the principal: `active`, `suspended`, `invited` (membership pending acceptance), or `deactivated`.
 
 ### ProviderResponse
-`{ createdAt: string, id: string, name: string, plugin: string, tenantId: string, updatedAt: string, authorizationUrl?: string | null, metadata?: { [string]: unknown } | null, scopes?: string[] | null, tokenUrl?: string | null, userInfoUrl?: string | null }`
+`{ createdAt: string, id: string, name: string, plugin: string, tenantId: string, updatedAt: string, apiBaseUrl?: string | null, authorizationUrl?: string | null, metadata?: { [string]: unknown } | null, scopes?: string[] | null, tokenUrl?: string | null, userInfoUrl?: string | null }`
 Source: packages/types/src/providers.ts
 
 **plugin**: Identifier of the integration this provider drives (for example the inference backend). Used to dispatch to the matching plugin and as the prefix when forming fully-qualified model ids (`plugin:model`).
+**apiBaseUrl**: The API origin a credential from this provider authenticates to (for example https://api.github.com). A provider that backs an origin-pinned credential must set it; OAuth-login-only providers may omit it.
 **metadata**: Free-form provider-specific configuration not covered by the typed fields. Not interpreted by the hub.
 **scopes**: OAuth scopes associated with this provider integration.
 
@@ -1594,16 +1526,12 @@ Source: packages/types/src/approvals.ts
 `{ createdAt: string, id: string, isSystem: boolean, name: string, tenantId: string, updatedAt: string, description?: string | null }`
 Source: packages/types/src/roles.ts
 
-### RollbackRequest
-`{ version: string }`
-Source: packages/types/src/agents.ts
-
 ### SendMessage
 `{ content: string, attachments?: { data: string, mimeType: string, name?: string, + (undeclared): reject }[] }`
 Source: packages/types/src/sessions.ts
 
 ### SessionSummary
-`{ agentId: string, agentName: string, createdAt: string, id: string, status: "ended" | "ending" | "idle", tenantId: string, tenantName: string, lastActivityAt?: string | null }`
+`{ createdAt: string, definitionId: string, definitionName: string, id: string, status: "ended" | "ending" | "idle", tenantId: string, tenantName: string, lastActivityAt?: string | null }`
 Source: packages/types/src/me.ts
 
 ### SpanResponse
@@ -1611,18 +1539,12 @@ Source: packages/types/src/me.ts
 Source: packages/types/src/observability.ts
 
 ### TenantResponse
-`{ createdAt: string, domain: string, id: string, name: string, slug: string, updatedAt: string, config?: { [string]: unknown }, parentId?: string | null }`
+`{ createdAt: string, domain: string, id: string, name: string, slug: string, updatedAt: string, config?: { [string]: unknown, sidecarPlacement?: { sharing: "exclusive", reuse?: "never" | "same-deployment" } }, parentId?: string | null }`
 Source: packages/types/src/tenants.ts
 
 ### TraceResponse
 `{ spans: { name: string, spanId: string, startTime: string, traceId: string, agentId?: string | null, attributes?: { [string]: unknown } | null, durationMs?: number | null, endTime?: string | null, parentSpanId?: string | null, status?: "error" | "ok" }[], traceId: string }`
 Source: packages/types/src/observability.ts
-
-### UpdateAgent
-`{ capabilities?: { [string]: unknown }, contextConfig?: { [string]: unknown }, credentialRequirements?: { providerName: string, source: "creator" | "invoker" | "tenant", name?: string, scopes?: string[] }[], description?: string, grantRequirements?: { action: string, resource: string, source: "creator" | "invoker", conditions?: { [string]: unknown } | null, effect?: "allow" | "ask" | "deny" }[], initialState?: { [string]: unknown }, modelConfig?: { [string]: unknown }, modelRequirements?: { model: string, capabilities?: ("audio-input" | "audio-input-streaming" | "code-execution" | "code-execution-streaming" | "document-input" | "document-input-streaming" | "files-api-reference" | "files-api-reference-streaming" | "function-calling" | "function-calling-multi-turn" | "function-calling-multi-turn-streaming" | "function-calling-with-thinking" | "function-calling-with-thinking-streaming" | "grounding" | "grounding-streaming" | "image-output" | "image-output-streaming" | "long-context" | "plain-text" | "plain-text-streaming" | "prompt-caching" | "reasoning-content" | "reasoning-content-streaming" | "redacted-thinking" | "redacted-thinking-streaming" | "structured-output" | "structured-output-streaming" | "video-input" | "video-input-streaming" | "vision-input" | "vision-input-streaming")[], providers?: { mode: "pin" | "prefer", order: string[] } }[], name?: string, roleIds?: string[], systemPrompt?: string, toolPackages?: { name: /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/, version: string }[] }`
-Source: packages/types/src/agents.ts
-
-**modelRequirements**: Model needs declared by canonical name, with optional per-model capability filters and provider preferences. Resolved against the tenant catalog at launch to build the ordered inference sources; it does not introduce providers the tenant catalog lacks.
 
 ### UpdateCredential
 `{ description?: string, expiresAt?: string | null, metadata?: { [string]: unknown }, name?: string, refreshSecret?: string | null, scopes?: string[] | null, secret?: string, status?: "active" | "error" | "expired" | "revoked" }`
@@ -1672,9 +1594,10 @@ Source: packages/types/src/principals.ts
 **status**: New account state for the principal. Only `active`, `suspended`, and `deactivated` are settable; `invited` is reached only through the invitation flow.
 
 ### UpdateProvider
-`{ authorizationUrl?: string | null, metadata?: { [string]: unknown } | null, name?: string, plugin?: string, scopes?: string[] | null, tokenUrl?: string | null, userInfoUrl?: string | null }`
+`{ apiBaseUrl?: string | null, authorizationUrl?: string | null, metadata?: { [string]: unknown } | null, name?: string, plugin?: string, scopes?: string[] | null, tokenUrl?: string | null, userInfoUrl?: string | null }`
 Source: packages/types/src/providers.ts
 
+**apiBaseUrl**: The API origin a credential from this provider authenticates to (for example https://api.github.com). A provider that backs an origin-pinned credential must set it; OAuth-login-only providers may omit it.
 **metadata**: Free-form provider-specific configuration not covered by the typed fields. Not interpreted by the hub.
 **plugin**: Identifier of the integration this provider drives (for example the inference backend). Used to dispatch to the matching plugin and as the prefix when forming fully-qualified model ids (`plugin:model`).
 **scopes**: OAuth scopes associated with this provider integration.
@@ -1684,7 +1607,7 @@ Source: packages/types/src/providers.ts
 Source: packages/types/src/roles.ts
 
 ### UpdateTenant
-`{ config?: { [string]: unknown }, name?: string }`
+`{ config?: { [string]: unknown, sidecarPlacement?: { sharing: "exclusive", reuse?: "never" | "same-deployment" } }, name?: string }`
 Source: packages/types/src/tenants.ts
 
 ### UpdateWallet
@@ -1704,4 +1627,24 @@ Source: packages/types/src/wallets.ts
 **backendType**: Settlement backend the wallet is denominated in: `crypto` (on-chain assets), `fiat` (national currency), or `credits` (internal accounting units). Determines how balances and transactions are settled.
 **balance**: Current balance as a decimal string in the wallet's `currency`. Stored as a string to preserve precision for both crypto and fiat amounts.
 **config**: Backend-specific configuration for the wallet (for example chain or account details for a `crypto` backend). Shape depends on `backendType`; not interpreted by the hub.
+
+### WorkflowDefinitionResponse
+`{ createdAt: string, currentVersion: string, id: string, name: string, status: "deployed" | "stopped", tenantId: string, updatedAt: string, description?: string | null }`
+Source: packages/types/src/workflows.ts
+
+**status**: Lifecycle state of the definition: `deployed` (a launchable version is active) or `stopped` (deactivated).
+
+### WorkflowRollbackRequest
+`{ version: string }`
+Source: packages/types/src/workflows.ts
+
+### WorkflowRunHealth
+`{ liveness: "ok" | "unhealthy", readiness: "not_ready" | "ok" | "unhealthy", lastCheckedAt?: string | null }`
+Source: packages/types/src/instances.ts
+
+### WorkflowRunResponse
+`{ address: string, createdAt: string, definitionId: string, definitionName: string, id: string, status: "deployed" | "error" | "running" | "stopped" | "updating", tenantId: string, updatedAt: string, endedAt?: string | null, kernelId?: string | null, publicKey?: string | null, sidecarId?: string | null }`
+Source: packages/types/src/instances.ts
+
+**status**: Lifecycle state of this run: `deployed` (provisioned on a sidecar, not yet started), `running` (started and serving), `updating` (rolling to a new definition version), `error` (launch or runtime failure), or `stopped` (undeployed).
 

@@ -18,6 +18,7 @@ import { createDefaultDirectorRegistry, defineAgent } from "@intx/agent";
 import {
   awaitSignal,
   defineWorkflow,
+  onTrigger,
   sleep,
   step,
   type WorkflowDefinition,
@@ -117,6 +118,28 @@ describe("DrainController shape", () => {
     expect(resolveDrainBehavior(def, "sleepStep")).toBe("cancel");
   });
 
+  test("an onTrigger section drains as wait by default, honoring an explicit cancel", () => {
+    const body = defineWorkflow({
+      id: "section-body",
+      trigger: { type: "manual" },
+      steps: { s: step({ agent: makeAgent("a") }) },
+    });
+    const def = defineWorkflow({
+      id: "onTrigger-drain",
+      trigger: { type: "manual" },
+      steps: {
+        live: onTrigger({ on: { type: "mail", to: "x@y.example" }, body }),
+        cancelable: onTrigger({
+          on: { type: "mail", to: "z@y.example" },
+          body,
+          drainBehavior: "cancel",
+        }),
+      },
+    });
+    expect(resolveDrainBehavior(def, "live")).toBe("wait");
+    expect(resolveDrainBehavior(def, "cancelable")).toBe("cancel");
+  });
+
   test("shouldAbortForDrain returns false when signal not aborted", () => {
     const def = defineWorkflow({
       id: "noop",
@@ -158,6 +181,63 @@ describe("DrainController shape", () => {
       },
     });
     expect(resolveDrainBehavior(def, "m[0]")).toBe("cancel");
+  });
+
+  test("long-lived step default resolves to wait", () => {
+    const a = makeAgent("a");
+    const def = defineWorkflow({
+      id: "long-lived-defaults",
+      trigger: { type: "manual" },
+      steps: {
+        multi: step({ agent: a, triggers: 5 }),
+        unbounded: step({ agent: a, triggers: "unbounded" }),
+        batch: step({ agent: a, triggers: 1 }),
+        defaultBatch: step({ agent: a }),
+      },
+    });
+    expect(resolveDrainBehavior(def, "multi")).toBe("wait");
+    expect(resolveDrainBehavior(def, "unbounded")).toBe("wait");
+    expect(resolveDrainBehavior(def, "batch")).toBe("cancel");
+    expect(resolveDrainBehavior(def, "defaultBatch")).toBe("cancel");
+  });
+
+  test("explicit drainBehavior overrides the trigger-budget default at runtime", () => {
+    const a = makeAgent("a");
+    const def = defineWorkflow({
+      id: "explicit-override",
+      trigger: { type: "manual" },
+      steps: {
+        multiCancel: step({
+          agent: a,
+          triggers: 5,
+          drainBehavior: "cancel",
+        }),
+        batchWait: step({
+          agent: a,
+          triggers: 1,
+          drainBehavior: "wait",
+        }),
+      },
+    });
+    expect(resolveDrainBehavior(def, "multiCancel")).toBe("cancel");
+    expect(resolveDrainBehavior(def, "batchWait")).toBe("wait");
+  });
+
+  test("map-inner step with long-lived budget resolves to wait", () => {
+    const a = makeAgent("a");
+    const def = defineWorkflow({
+      id: "map-long-lived",
+      trigger: { type: "manual" },
+      steps: {
+        m: {
+          kind: "map",
+          id: "",
+          over: { from: "trigger.payload" },
+          step: step({ agent: a, triggers: 3 }),
+        },
+      },
+    });
+    expect(resolveDrainBehavior(def, "m[0]")).toBe("wait");
   });
 });
 

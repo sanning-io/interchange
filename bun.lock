@@ -14,7 +14,7 @@
         "hono": "catalog:",
         "isomorphic-git": "catalog:",
         "jiti": "2.5.1",
-        "postgres": "^3.4.8",
+        "postgres": "catalog:",
         "prettier": "3.6.2",
         "ssri": "catalog:",
         "tar": "catalog:",
@@ -280,11 +280,12 @@
       "version": "0.2.2",
       "dependencies": {
         "@intx/authz": "workspace:*",
+        "@intx/crypto": "workspace:*",
         "@intx/log": "workspace:*",
         "@intx/types": "workspace:*",
         "arktype": "catalog:",
         "drizzle-orm": "catalog:",
-        "postgres": "^3.4.8",
+        "postgres": "catalog:",
       },
       "devDependencies": {
         "drizzle-kit": "^0.31.9",
@@ -295,6 +296,7 @@
       "version": "0.2.2",
       "dependencies": {
         "@intx/agent": "workspace:*",
+        "@intx/authz": "workspace:*",
         "@intx/log": "workspace:*",
         "@intx/types": "workspace:*",
       },
@@ -321,6 +323,7 @@
       "devDependencies": {
         "@intx/crypto": "workspace:*",
         "@intx/hub-sessions": "workspace:*",
+        "@intx/test-harness": "workspace:*",
         "hono": "catalog:",
       },
     },
@@ -403,6 +406,16 @@
         "@intx/mime": "workspace:*",
       },
     },
+    "packages/inference-catalog": {
+      "name": "@intx/inference-catalog",
+      "version": "0.2.2",
+      "devDependencies": {
+        "@intx/inference": "workspace:*",
+        "@intx/inference-discovery": "workspace:*",
+        "@intx/types": "workspace:*",
+        "arktype": "catalog:",
+      },
+    },
     "packages/inference-discovery": {
       "name": "@intx/inference-discovery",
       "version": "0.2.2",
@@ -417,6 +430,9 @@
       "dependencies": {
         "@intx/inference-discovery": "workspace:*",
         "arktype": "catalog:",
+      },
+      "devDependencies": {
+        "@intx/inference": "workspace:*",
       },
     },
     "packages/inference-discovery-google-genai": {
@@ -608,12 +624,23 @@
         "arktype": "catalog:",
       },
     },
+    "tests/admin-ui-e2e": {
+      "name": "@intx/admin-ui-e2e",
+      "devDependencies": {
+        "@playwright/test": "^1.50.0",
+        "arktype": "catalog:",
+        "zx": "^8.8.5",
+      },
+    },
     "tests/lib": {
       "name": "@intx/test-harness",
       "version": "0.2.2",
       "dependencies": {
+        "@intx/crypto": "workspace:*",
         "@intx/db": "workspace:*",
+        "@intx/types": "workspace:*",
         "drizzle-orm": "catalog:",
+        "postgres": "catalog:",
       },
     },
   },
@@ -624,6 +651,7 @@
     "drizzle-orm": "^0.45.1",
     "hono": "^4.11.9",
     "isomorphic-git": "^1.27.2",
+    "postgres": "^3.4.8",
     "semver": "^7.7.2",
     "ssri": "^12.0.0",
     "tar": "^7.5.1",
@@ -829,6 +857,8 @@
 
     "@intx/admin-ui": ["@intx/admin-ui@workspace:apps/admin-ui"],
 
+    "@intx/admin-ui-e2e": ["@intx/admin-ui-e2e@workspace:tests/admin-ui-e2e"],
+
     "@intx/agent": ["@intx/agent@workspace:packages/agent"],
 
     "@intx/authz": ["@intx/authz@workspace:packages/authz"],
@@ -878,6 +908,8 @@
     "@intx/hub-sessions": ["@intx/hub-sessions@workspace:packages/hub-sessions"],
 
     "@intx/inference": ["@intx/inference@workspace:packages/inference"],
+
+    "@intx/inference-catalog": ["@intx/inference-catalog@workspace:packages/inference-catalog"],
 
     "@intx/inference-discovery": ["@intx/inference-discovery@workspace:packages/inference-discovery"],
 
@@ -964,6 +996,8 @@
     "@open-draft/until": ["@open-draft/until@2.1.0", "", {}, "sha512-U69T3ItWHvLwGg5eJ0n3I62nWuE6ilHlmz7zM0npLBRvPRd7e6NYmg54vvRtP5mZG7kZqZCFVdsTWo7BPtBujg=="],
 
     "@opentelemetry/semantic-conventions": ["@opentelemetry/semantic-conventions@1.41.1", "", {}, "sha512-/UhIkaZgPutTFmQ7RnIJGgDXZmtEJ7Dvi86xNTFWcnRxVRNk/aotsqDJYeEvDP+FSMB2SdW+pQzNMcWP0rwuNA=="],
+
+    "@playwright/test": ["@playwright/test@1.62.0", "", { "dependencies": { "playwright": "1.62.0" }, "bin": { "playwright": "cli.js" } }, "sha512-9zOJ6ZQRAena31MpOH9VSzIz8Ou3YJ/wtY/eQm5T2uhfhG7/U3COrMS8xOtUrZrp9OgdmzEnIYODye3nY1VqzA=="],
 
     "@radix-ui/number": ["@radix-ui/number@1.1.1", "", {}, "sha512-MkKCwxlXTgz6CFoJx3pCwn07GKp36+aZyu/u2Ln2VrA5DcdyCZkASEDBTd8x5whTQQL5CiYf4prXKLcgQdv29g=="],
 
@@ -1871,6 +1905,10 @@
 
     "pkce-challenge": ["pkce-challenge@5.0.1", "", {}, "sha512-wQ0b/W4Fr01qtpHlqSqspcj3EhBvimsdh0KlHhH8HRZnMsEa0ea2fTULOXOS9ccQr3om+GcGRk4e+isrZWV8qQ=="],
 
+    "playwright": ["playwright@1.62.0", "", { "dependencies": { "playwright-core": "1.62.0" }, "optionalDependencies": { "fsevents": "2.3.2" }, "bin": { "playwright": "cli.js" } }, "sha512-Z14dG305dgaLu6foB1TXQagFiW8JfSUIUaUuPaKQ6NtBPKF1P/qXcqfh6c6K/icPqdy37JmjbiBXf6JNg6Sylw=="],
+
+    "playwright-core": ["playwright-core@1.62.0", "", { "bin": { "playwright-core": "cli.js" } }, "sha512-nsNRyq0r2zsG8AcRHWknc9QRA5XCueC7gWMrs+Gx2tlZn9hcl8zudfh00lhJPY1DE7NmZ6bDsT9g2yey8mXljA=="],
+
     "possible-typed-array-names": ["possible-typed-array-names@1.1.0", "", {}, "sha512-/+5VFTchJDoVj3bhoqi6UeymcD00DAwb1nJwamzPvHEszJ4FpF6SNNbUbOS8yI56qHzdV8eK0qEfOSiodkTdxg=="],
 
     "postcss": ["postcss@8.5.15", "", { "dependencies": { "nanoid": "^3.3.12", "picocolors": "^1.1.1", "source-map-js": "^1.2.1" } }, "sha512-FfR8sjd4em2T6fb3I2MwAJU7HWVMr9zba+enmQeeWFfCbm+UOC/0X4DS8XtpUTMwWMGbjKYP7xjfNekzyGmB3A=="],
@@ -2254,6 +2292,8 @@
     "ora/chalk": ["chalk@5.6.2", "", {}, "sha512-7NzBL0rN6fMUW+f7A6Io4h40qQlG+xGmtMxfbnH/K7TAtt8JQWVQK+6g0UXKMeVJoyV5EkkNsErQ8pVD3bLHbA=="],
 
     "path-scurry/lru-cache": ["lru-cache@11.5.1", "", {}, "sha512-RPimw/7aMdv2oqRrxKwvZXcPfwBrn/JZ2xYcY9Hus/6LaS3VOAKVWKWgNLCFSiOm1ESXinjsDlidVU7JlnCN2A=="],
+
+    "playwright/fsevents": ["fsevents@2.3.2", "", { "os": "darwin" }, "sha512-xiqMQR4xAeHTuB9uWm+fFRcIOgKBMiOBP+eXiyT7jsgVCq1bkVygt00oASowB7EdtpOHaaPgKt812P9ab+DDKA=="],
 
     "prompts/kleur": ["kleur@3.0.3", "", {}, "sha512-eTIzlVOSUR+JxdDFepEYcBMtZ9Qqdef+rnzWdRZuMbOywu5tO2w2N7rqjoANZ5k9vywhL6Br1VRjUIgTQx4E8w=="],
 

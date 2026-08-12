@@ -70,28 +70,25 @@ export function isResumableAwaitingSignalStep(
 }
 
 /**
- * An `awaitSignal` step left `in-flight` in a seed log is resumable ONLY
- * when the step declares no timeout. Without a timeout, an awaitSignal
- * step reaches `in-flight` exactly one way: a `SignalReceived` (or a
- * pre-await queued signal consumed by `SignalAwaited`) moved it off
- * `awaiting-signal` -- the signal is logically received and the step just
- * needs its `StepCompleted`. This is the crash-after-`SignalReceived`-
- * before-`StepCompleted` window: a run re-driving the durable log finds
- * the gate `in-flight`, and without this carve-out `nextSchedulable` skips
- * it, its dependents are blocked on the non-terminal gate, and the run
- * stalls. Re-offering the gate lets `runAwaitSignal` recover the payload
- * from the logged `SignalReceived` and short-circuit to completion without
- * parking (distinct from `isResumableAwaitingSignalStep`, which re-parks a
- * gate whose signal has NOT yet arrived).
+ * An `awaitSignal` step left `in-flight` in a seed log is resumable: some
+ * mover took it off `awaiting-signal` -- a `SignalReceived` (or a pre-await
+ * queued signal consumed by `SignalAwaited`), or, for a timed gate, a
+ * `TimerFired` -- so the step only needs its `StepCompleted` (or, on timeout,
+ * its routing/failure). This is the crash-after-move-before-`StepCompleted`
+ * window: a run re-driving the durable log finds the gate `in-flight`, and
+ * without this carve-out `nextSchedulable` skips it, its dependents are blocked
+ * on the non-terminal gate, and the run stalls. Re-offering the gate lets
+ * `runAwaitSignal` reconstruct the outcome from the log and short-circuit to
+ * completion without parking (distinct from `isResumableAwaitingSignalStep`,
+ * which re-parks a gate whose signal has NOT yet arrived).
  *
- * The `timeout === undefined` clause is load-bearing for correctness, not
- * an optimization. A timeout-bearing awaitSignal also reaches `in-flight`
- * when its `TimerFired` lands (`handleTimerFired` moves an awaiting-signal
- * step to `in-flight`), and the reduced state carries no field that
- * distinguishes "signal received" from "timeout fired" -- both leave the
- * step `in-flight` with an empty `pendingTimers`. Admitting the
- * timeout-bearing case would risk completing a timed-out run with a
- * signal payload it never received, so it stays rejected byte-for-byte.
+ * The reduced state cannot itself distinguish "signal received" from "timeout
+ * fired" -- both leave the step `in-flight` with an empty `pendingTimers`. The
+ * durable log CAN: `runAwaitSignal` replays it, folding the gate's own
+ * `TimerFired` as a competing mover, to recover which mover won (and, for a
+ * signal, its payload). That replay is what makes the timed case safe to admit
+ * here, so a fired timeout resolves to a timeout outcome rather than to a
+ * signal payload it never received.
  */
 export function isResumableReceivedAwaitSignalStep(
   def: WorkflowDefinition,
@@ -99,9 +96,27 @@ export function isResumableReceivedAwaitSignalStep(
   phase: StepPhase,
 ): boolean {
   if (phase !== "in-flight") return false;
-  const primitive = def.steps[stepId];
-  if (primitive?.kind !== "awaitSignal") return false;
-  return primitive.timeout === undefined;
+  return def.steps[stepId]?.kind === "awaitSignal";
+}
+
+/**
+ * An onTrigger section container left non-terminal in a seed log is
+ * resumable in both of its live phases: `in-flight` while a body run is
+ * mid-flight (like a loop container, `runOnTrigger` re-derives its cursor
+ * from the settled body runs and continues) and `awaiting-signal` while
+ * parked between events (like an `awaitSignal` gate, it re-parks on the
+ * input channel so the next event resolves it). The section never
+ * self-completes, so -- unlike an agent step -- neither phase is a crash
+ * mid-invocation to settle as failed. A synthetic per-event id strips to
+ * its container to resolve the kind, mirroring the loop carve-out.
+ */
+export function isResumableOnTriggerStep(
+  def: WorkflowDefinition,
+  stepId: string,
+  phase: StepPhase,
+): boolean {
+  if (phase !== "in-flight" && phase !== "awaiting-signal") return false;
+  return def.steps[baseStepId(stepId)]?.kind === "onTrigger";
 }
 
 /**
@@ -120,12 +135,12 @@ export function isResumableReceivedAwaitSignalStep(
  * non-re-invocable at this layer.
  *
  * Container/coordination primitives left `in-flight` -- a `map` outer
- * step, a timeout-bearing `awaitSignal` reduced to `in-flight`, a
- * `childWorkflow`, etc. -- are deliberately excluded: they have a
+ * step, a `childWorkflow`, etc. -- are deliberately excluded: they have a
  * re-arm surface the in-process runtime body lacks (rebuilding the map
- * iteration state, distinguishing a fired timeout from a received
- * signal), so they stay `RuntimeResumeUnsupportedError` and the host
- * owns recovery. A synthetic map/loop inner id (`<id>[i]`) is not a
+ * iteration state), so they stay `RuntimeResumeUnsupportedError` and the host
+ * owns recovery. (An `awaitSignal` gate left `in-flight`, timed or not, is
+ * instead admitted by `isResumableReceivedAwaitSignalStep`, which reconstructs
+ * its outcome from the log.) A synthetic map/loop inner id (`<id>[i]`) is not a
  * definition key, so it resolves to `undefined` and is excluded here;
  * resumable loop iterations are handled by
  * `isResumableInFlightLoopStep`, and a mid-`map` inner step stays
@@ -159,10 +174,12 @@ export function nextSchedulable(
   // The exceptions re-offered below are the resumable carve-outs: a
   // mid-loop container, an `awaitSignal` step still `awaiting-signal`
   // (`isResumableAwaitingSignalStep`, re-parked so a later signal
-  // resolves it), and an `awaitSignal` step left `in-flight` by an
+  // resolves it), an `awaitSignal` step left `in-flight` by an
   // already-logged `SignalReceived` (`isResumableReceivedAwaitSignalStep`,
-  // the crash-after-signal-before-StepCompleted window). The resume guard
-  // keys on the SAME predicates so the two views agree.
+  // the crash-after-signal-before-StepCompleted window), and an onTrigger
+  // section container in-flight or awaiting-signal
+  // (`isResumableOnTriggerStep`, re-derived by `runOnTrigger`). The resume
+  // guard keys on the SAME predicates so the two views agree.
   if (state.phase !== "running") {
     return [];
   }
@@ -181,7 +198,8 @@ export function nextSchedulable(
       existing !== undefined &&
       !isResumableInFlightLoopStep(def, stepId, existing.phase) &&
       !isResumableAwaitingSignalStep(def, stepId, existing.phase) &&
-      !isResumableReceivedAwaitSignalStep(def, stepId, existing.phase)
+      !isResumableReceivedAwaitSignalStep(def, stepId, existing.phase) &&
+      !isResumableOnTriggerStep(def, stepId, existing.phase)
     ) {
       continue;
     }
