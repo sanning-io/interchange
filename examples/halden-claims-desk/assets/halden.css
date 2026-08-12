@@ -1,0 +1,183 @@
+/* Halden Indemnity — house tokens and chrome (hl-* namespace).
+   The counterparty house to Meridian Mutual's workbench. Where Meridian is
+   filled navy chrome, gold, and Georgia warmth, Halden is a cold grey-green
+   paper surface that withholds color until something is verified: verdigris
+   means assent, slate means under examination, madder means dissent.
+   Nothing pulses. Nothing is rounded. Two themes — light is the day desk,
+   dark the night desk; [data-theme="dark"] forces it, the system preference
+   selects it otherwise. All contrast pairs AA-checked. */
+* { box-sizing: border-box; margin: 0; }
+
+:root {
+  /* field & ink */
+  --hl-field: #eff2f0;          /* ledger grey-green — the working field */
+  --hl-sheet: #ffffff;          /* the document — cards, letters, schedules */
+  --hl-ink: #1a211f;            /* spruce-black ink */
+  --hl-muted: #5c6b66;          /* annotations, secondary text */
+  --hl-line: #cbd4d0;           /* hairlines */
+  /* the house dark */
+  --hl-spruce: #1c2b28;         /* wordmark, primary buttons, the Oxford rule */
+  --hl-spruce-2: #2c423c;       /* hover / raised spruce */
+  --hl-on-spruce: #ffffff;      /* text on spruce fills */
+  --hl-chrome-ink: var(--hl-spruce); /* header lockup color */
+  /* assent — the only earned color */
+  --hl-verdigris: #2e6e63;      /* verified, accepted, paid */
+  --hl-verdigris-deep: #1f5148; /* assent text on its tint */
+  --hl-verdigris-tint: #dfece7; /* assent ground (concluded states only) */
+  /* under examination */
+  --hl-slate: #53636d;          /* pending, verifying, reserved judgment */
+  --hl-slate-tint: #e5ebee;
+  /* dissent */
+  --hl-madder: #8f3527;         /* disputed, declined — documentary, not alarmed */
+  --hl-madder-tint: #f6e7e2;
+  /* type */
+  --hl-display: Optima, Candara, sans-serif;                       /* incised caps only */
+  --hl-ui: "Helvetica Neue", Helvetica, Arial, sans-serif;         /* administrative body */
+  --hl-serif: Charter, "Bitstream Charter", Cambria, Georgia, serif; /* correspondence */
+  --hl-mono: ui-monospace, "SF Mono", "Cascadia Mono", Consolas, Menlo, monospace; /* refs & digests only */
+  /* motion — the set, not the bounce */
+  --hl-beat: 160ms;
+  --hl-ease-set: cubic-bezier(0.25, 0.1, 0.25, 1);
+}
+
+[data-theme="dark"] {
+  --hl-field: #101715;
+  --hl-sheet: #161f1c;
+  --hl-ink: #e5ebe8;
+  --hl-muted: #94a39d;
+  --hl-line: #2a3531;
+  --hl-spruce: #2c423c;         /* fills keep paper-ink text in the dark */
+  --hl-spruce-2: #3a544c;
+  --hl-on-spruce: #e5ebe8;
+  --hl-chrome-ink: var(--hl-ink);
+  --hl-verdigris: #6eb8aa;
+  --hl-verdigris-deep: #6eb8aa;
+  --hl-verdigris-tint: #142520;
+  --hl-slate: #8fa2ad;
+  --hl-slate-tint: #1a2228;
+  --hl-madder: #d5806f;
+  --hl-madder-tint: #2a1713;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --hl-field: #101715;
+    --hl-sheet: #161f1c;
+    --hl-ink: #e5ebe8;
+    --hl-muted: #94a39d;
+    --hl-line: #2a3531;
+    --hl-spruce: #2c423c;
+    --hl-spruce-2: #3a544c;
+    --hl-on-spruce: #e5ebe8;
+    --hl-chrome-ink: var(--hl-ink);
+    --hl-verdigris: #6eb8aa;
+    --hl-verdigris-deep: #6eb8aa;
+    --hl-verdigris-tint: #142520;
+    --hl-slate: #8fa2ad;
+    --hl-slate-tint: #1a2228;
+    --hl-madder: #d5806f;
+    --hl-madder-tint: #2a1713;
+  }
+}
+
+body {
+  font-family: var(--hl-ui);
+  font-size: 13.5px;
+  line-height: 1.55;
+  background: var(--hl-field);
+  color: var(--hl-ink);
+}
+::selection { background: var(--hl-verdigris-tint); }
+:focus-visible { outline: 2px solid var(--hl-verdigris); outline-offset: 1px; }
+a { color: var(--hl-verdigris-deep); }
+
+/* --- chrome: the engraved lintel (Meridian's is a filled navy awning) ------ */
+.hl-header {
+  background: var(--hl-field);
+  padding: 10px 20px;
+  display: flex; align-items: baseline; justify-content: space-between;
+}
+.hl-wordmark {
+  font-family: var(--hl-display); font-weight: 500;
+  font-size: 15px; letter-spacing: 0.2em; text-transform: uppercase;
+  color: var(--hl-chrome-ink);
+  display: inline-flex; align-items: center; gap: 10px;
+}
+.hl-wordmark .hl-seal { width: 22px; height: 22px; flex: none; }
+.hl-wordmark span {
+  font-family: var(--hl-ui); font-weight: 400; font-size: 10px;
+  letter-spacing: 0.18em; color: var(--hl-muted); margin-left: 10px;
+}
+.hl-user { font-family: var(--hl-ui); font-size: 12px; color: var(--hl-muted); }
+
+/* the Oxford rule — Halden's signature divider: a thick-thin pair.
+   Under the header, atop a letter, above a total. Never a lone hairline. */
+.hl-rule { border-top: 2px solid var(--hl-chrome-ink); }
+.hl-rule::after { content: ""; display: block; margin-top: 2px; border-top: 1px solid var(--hl-chrome-ink); }
+
+/* --- documents ------------------------------------------------------------- */
+.hl-sheet { background: var(--hl-sheet); border: 1px solid var(--hl-line); padding: 16px 20px; }
+.hl-label {
+  font-size: 10px; text-transform: uppercase; letter-spacing: 0.12em;
+  color: var(--hl-muted);
+}
+.hl-title {
+  font-family: var(--hl-display); font-weight: 500; font-size: 13px;
+  letter-spacing: 0.16em; text-transform: uppercase; color: var(--hl-ink);
+}
+.hl-facts { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+.hl-facts dt { font-size: 10px; text-transform: uppercase; letter-spacing: 0.12em; color: var(--hl-muted); }
+.hl-facts dd { font-size: 13px; margin-top: 2px; font-variant-numeric: lining-nums tabular-nums; }
+.hl-ref { font-family: var(--hl-mono); font-size: 12px; letter-spacing: 0; } /* HIC-2026-0412, digests, timestamps */
+.hl-amount { font-size: 17px; font-weight: 600; font-variant-numeric: lining-nums tabular-nums; }
+
+/* correspondence — Halden writes letters; the letter face is Charter */
+.hl-letter { font-family: var(--hl-serif); font-size: 15px; line-height: 1.65; max-width: 62ch; }
+.hl-letter p + p { margin-top: 0.9em; }
+.hl-letter .hl-signoff { margin-top: 1.4em; }
+
+/* --- state: provisional judgments are outlined, concluded ones are filled -- */
+.hl-badge {
+  font-size: 10px; padding: 2px 7px; border-radius: 0;
+  text-transform: uppercase; letter-spacing: 0.08em;
+  border: 1px solid currentColor; background: transparent;
+  transition: background var(--hl-beat) var(--hl-ease-set), color var(--hl-beat) var(--hl-ease-set);
+}
+.hl-badge.ack      { color: var(--hl-muted); }                                            /* acknowledged */
+.hl-badge.review   { color: var(--hl-slate); }                                            /* under examination */
+.hl-badge.verified { color: var(--hl-verdigris-deep); border-color: var(--hl-verdigris); }/* record verified */
+.hl-badge.paid     { color: var(--hl-verdigris-deep); background: var(--hl-verdigris-tint); border-color: transparent; }
+.hl-badge.disputed { color: var(--hl-madder); background: var(--hl-madder-tint); border-color: transparent; }
+
+/* the examination indicator — Meridian's dot pulses gold; Halden's holds
+   still: a hollow slate circle that fills verdigris once, when done */
+.hl-examining::before, .hl-attested::before {
+  content: ""; display: inline-block; width: 7px; height: 7px;
+  border-radius: 50%; margin-right: 6px; vertical-align: 1px;
+  border: 1px solid var(--hl-slate); background: transparent;
+  transition: background var(--hl-beat) var(--hl-ease-set), border-color var(--hl-beat) var(--hl-ease-set);
+}
+.hl-examining { font-size: 12px; color: var(--hl-slate); }
+.hl-attested { font-size: 12px; color: var(--hl-verdigris-deep); }
+.hl-attested::before { border-color: var(--hl-verdigris); background: var(--hl-verdigris); }
+
+/* --- controls -------------------------------------------------------------- */
+.hl-btn {
+  font-family: var(--hl-ui); font-size: 13px;
+  background: var(--hl-spruce); color: var(--hl-on-spruce);
+  border: none; border-radius: 0; padding: 8px 18px; cursor: pointer;
+  transition: background var(--hl-beat) var(--hl-ease-set);
+}
+.hl-btn:hover { background: var(--hl-spruce-2); }
+.hl-btn.ghost {
+  background: transparent; color: var(--hl-ink);
+  border: 1px solid var(--hl-ink); padding: 7px 17px;
+}
+.hl-btn.ghost:hover { background: var(--hl-sheet); }
+
+.hl-fineprint { font-size: 10px; color: var(--hl-muted); }
+.hl-fineprint a { color: var(--hl-muted); }
+
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; animation: none !important; }
+}

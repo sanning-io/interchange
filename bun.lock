@@ -230,6 +230,20 @@
         "@intx/types": "workspace:*",
       },
     },
+    "examples/halden-claims-desk": {
+      "name": "@intx/example-halden-claims-desk",
+      "version": "0.1.0",
+      "dependencies": {
+        "@ar.io/proof": "^0.3.0",
+        "@intx/agent": "workspace:*",
+        "@intx/crypto": "workspace:*",
+        "@intx/example-agent-common": "workspace:*",
+        "@intx/storage-isogit": "workspace:*",
+        "@intx/types": "workspace:*",
+        "@sanning/proof": "file:./vendor/sanning-proof-0.4.0.tgz",
+        "arktype": "catalog:",
+      },
+    },
     "examples/posix-demo": {
       "name": "@intx/example-posix-demo",
       "version": "0.2.2",
@@ -678,7 +692,7 @@
 
     "@ar.io/anchor-interchange": ["@ar.io/anchor-interchange@./vendor/ar.io-anchor-interchange-0.2.0.tgz", { "dependencies": { "@ar.io/anchor": "^0.2.0" }, "peerDependencies": { "@intx/types": "^0.2.2" } }],
 
-    "@ar.io/proof": ["@ar.io/proof@0.2.2", "", { "dependencies": { "@noble/ed25519": "^2.1.0", "canonicalize": "^2.0.0" }, "bin": { "proof": "dist/cli.js" } }, "sha512-PAwoYBpwy7Akk/W9FY2dFRuU97TR8OGXoP1tqLZPr+z+oawPS97YOZ9iX5qjX3nLJOcfY/4vHvoKG5eF4/X7eg=="],
+    "@ar.io/proof": ["@ar.io/proof@0.3.0", "", { "dependencies": { "@noble/ed25519": "^2.1.0", "canonicalize": "^2.0.0" }, "bin": { "proof": "dist/cli.js" } }, "sha512-1bZf4Csk0qTxHlIG+lpCDgPfWhyYpcHPw2taJOxK9jT3wpYlVJTwuf50dp8185ZZPvu3Xiupw0bpwqNo75v8jQ=="],
 
     "@ark/schema": ["@ark/schema@0.56.0", "", { "dependencies": { "@ark/util": "0.56.0" } }, "sha512-ECg3hox/6Z/nLajxXqNhgPtNdHWC9zNsDyskwO28WinoFEnWow4IsERNz9AnXRhTZJnYIlAJ4uGn3nlLk65vZA=="],
 
@@ -911,6 +925,8 @@
     "@intx/example-agent-structured-payload": ["@intx/example-agent-structured-payload@workspace:examples/agent-structured-payload"],
 
     "@intx/example-coding-agent": ["@intx/example-coding-agent@workspace:examples/coding-agent"],
+
+    "@intx/example-halden-claims-desk": ["@intx/example-halden-claims-desk@workspace:examples/halden-claims-desk"],
 
     "@intx/example-posix-demo": ["@intx/example-posix-demo@workspace:examples/posix-demo"],
 
@@ -2218,6 +2234,8 @@
 
     "zx": ["zx@8.8.5", "", { "bin": { "zx": "build/cli.js" } }, "sha512-SNgDF5L0gfN7FwVOdEFguY3orU5AkfFZm9B5YSHog/UDHv+lvmd82ZAsOenOkQixigwH2+yyH198AwNdKhj+RA=="],
 
+    "@ar.io/anchor/@ar.io/proof": ["@ar.io/proof@0.2.2", "", { "dependencies": { "@noble/ed25519": "^2.1.0", "canonicalize": "^2.0.0" }, "bin": { "proof": "dist/cli.js" } }, "sha512-PAwoYBpwy7Akk/W9FY2dFRuU97TR8OGXoP1tqLZPr+z+oawPS97YOZ9iX5qjX3nLJOcfY/4vHvoKG5eF4/X7eg=="],
+
     "@ar.io/anchor/@noble/hashes": ["@noble/hashes@1.8.0", "", {}, "sha512-jCs9ldd7NwzpgXDIf6P3+NrHh9/sD6CQdxHyjQI+h/6rDNo88ypBxxz45UDuZHz9r3tNz7N/VInSVoVdtXEI4A=="],
 
     "@ar.io/anchor-interchange/@ar.io/anchor": ["@ar.io/anchor@0.2.0", "", { "dependencies": { "@ar.io/proof": "^0.2.0", "@noble/ed25519": "^2.1.0", "@noble/hashes": "^1.8.0" } }, "sha512-cQwjDlAolDfqOh9Mwvj7OxNYtND8pyO1XR7HGDKd4ydZW9dPFReSWxZkcSlzl08ZOGbzEWuCBut6XsfDCPsexw=="],
@@ -2343,6 +2361,8 @@
     "wrap-ansi/strip-ansi": ["strip-ansi@6.0.1", "", { "dependencies": { "ansi-regex": "^5.0.1" } }, "sha512-Y38VPSHcqkFrCpFnQ9vuSXmquuv5oXOKpGeT6aGrr3o3Gc9AlVa6JBfUSOCnbxGGZF+/0ooI7KrPuUSztUdU5A=="],
 
     "yargs/string-width": ["string-width@4.2.3", "", { "dependencies": { "emoji-regex": "^8.0.0", "is-fullwidth-code-point": "^3.0.0", "strip-ansi": "^6.0.1" } }, "sha512-wKyQRQpjJ0sIp62ErSZdGsjMJWsap5oRNihHhu6G7JVO/9jIB6UyevL+tXuOqrng8j/cxKTWyWUwvSTriiZz/g=="],
+
+    "@ar.io/anchor-interchange/@ar.io/anchor/@ar.io/proof": ["@ar.io/proof@0.2.2", "", { "dependencies": { "@noble/ed25519": "^2.1.0", "canonicalize": "^2.0.0" }, "bin": { "proof": "dist/cli.js" } }, "sha512-PAwoYBpwy7Akk/W9FY2dFRuU97TR8OGXoP1tqLZPr+z+oawPS97YOZ9iX5qjX3nLJOcfY/4vHvoKG5eF4/X7eg=="],
 
     "@ar.io/anchor-interchange/@ar.io/anchor/@noble/hashes": ["@noble/hashes@1.8.0", "", {}, "sha512-jCs9ldd7NwzpgXDIf6P3+NrHh9/sD6CQdxHyjQI+h/6rDNo88ypBxxz45UDuZHz9r3tNz7N/VInSVoVdtXEI4A=="],
 

@@ -1,0 +1,13 @@
+{
+  "extractId": "HIC-2026-0412-X1",
+  "preparedBy": "Halden Indemnity — Inward Claims desk",
+  "subject": "Sender's own first-notice and field-inspection language, claim CLM-2026-3105 (FNOL-2026-3105), loss of 2026-07-19",
+  "source": "Quoted verbatim from the disclosed records of the sender's adjudication evidence pack. Quotations are usable only after the pack has verified; verify first.",
+  "fnolDescription": "Stovetop fire spread to the surrounding cabinetry before being extinguished by the fire department. Significant smoke damage throughout the ground floor. No injuries reported. Family has relocated to temporary accommodation; the property is not currently habitable.",
+  "fieldInspection": {
+    "inspector": "M. Delgado, Field Adjuster #87",
+    "date": "2026-07-23",
+    "findings": "Burn and char patterns identify the origin as a single cooking-fire event at the stovetop, with rapid spread to adjacent cabinetry — consistent with the fire department's incident report. No accelerant traces, no evidence of code violations, wiring intact. Smoke residue is distributed through the ground-floor rooms; water staining is limited to the suppression response. Findings are consistent with a sudden, accidental fire loss."
+  },
+  "deskNote": "The adjudication record on which the sender's payment rests describes a cooking-fire origin at the stovetop and records the wiring as intact, with no evidence of code violations. Any attribution to electrical work post-dates the payment and rests on an examination the sender commissioned itself. The seam between the record and the demand's theory is the desk's first question."
+}

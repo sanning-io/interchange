@@ -1,0 +1,27 @@
+{
+  "name": "@intx/example-halden-claims-desk",
+  "version": "0.1.0",
+  "license": "LGPL-2.1-only",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "scripts": {
+    "serve": "bun --conditions=intx-src run src/serve.ts",
+    "file-demand": "bun --conditions=intx-src run scripts/file-meridian-demand.ts"
+  },
+  "dependencies": {
+    "@ar.io/proof": "^0.3.0",
+    "@sanning/proof": "file:./vendor/sanning-proof-0.4.0.tgz",
+    "@intx/agent": "workspace:*",
+    "@intx/crypto": "workspace:*",
+    "@intx/example-agent-common": "workspace:*",
+    "@intx/storage-isogit": "workspace:*",
+    "@intx/types": "workspace:*",
+    "arktype": "catalog:"
+  }
+}
