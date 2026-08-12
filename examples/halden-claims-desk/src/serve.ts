@@ -37,6 +37,7 @@ import {
   BLOCKED_TOOL,
   buildCasePrompt,
   buildDeskTools,
+  INSURED,
   POLICY_ID,
   type DeskObservation,
 } from "./job";
@@ -84,6 +85,7 @@ export function serve(opts: ServeOptions = {}) {
 
   const pageHtml = renderPageHtml(
     readFileSync(join(ASSETS, "halden.css"), "utf8"),
+    { insured: INSURED, policyId: POLICY_ID },
   );
 
   // ---- case registry (persisted; newest last) -----------------------------
@@ -296,6 +298,19 @@ export function serve(opts: ServeOptions = {}) {
           publicKey: Buffer.from(identity.getPublicKey()).toString("hex"),
           contextDir,
         });
+      }
+
+      // The page's case switcher: every file on the desk, one line each.
+      if (req.method === "GET" && url.pathname === "/cases.json") {
+        return json(
+          200,
+          cases.map((c) => ({
+            fileRef: c.fileRef,
+            receivedAt: c.receivedAt,
+            status: c.status,
+            decision: c.decision?.decision ?? null,
+          })),
+        );
       }
 
       if (req.method === "GET" && url.pathname === "/case.json") {
