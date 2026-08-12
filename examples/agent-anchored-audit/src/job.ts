@@ -136,6 +136,32 @@ export async function verifyPackAtUrl(packUrl: string): Promise<PackVerification
 export const recoveryTools = [
   stringTool({
     definition: {
+      name: "record_working_note",
+      description:
+        "File a working note to the recovery casefile: one or two sentences, " +
+        "written BEFORE a substantive action, stating what you are about to " +
+        "do and why. The note is committed to the anchored audit record like " +
+        "every other tool call.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          note: {
+            type: "string",
+            description:
+              "The note text — one or two sentences, plain professional language.",
+          },
+        },
+        required: ["note"],
+        additionalProperties: false,
+      },
+    },
+    // Deterministic on purpose: the note itself is the record (it rides
+    // the arguments the audit store commits); the acknowledgment never
+    // varies.
+    handler: async () => JSON.stringify({ ok: true }),
+  }),
+  stringTool({
+    definition: {
       name: "verify_evidence_pack",
       description:
         "Verify the upstream claim adjudication's sealed evidence pack. " +
@@ -273,6 +299,14 @@ export const recoveryAuthorize: BaseEnv["authorize"] = async (resource) =>
 export const SYSTEM_PROMPT = `You are the AI recovery (subrogation) specialist at Meridian Mutual.
 You work recovery referrals on claims that have already been adjudicated
 and paid. You never revisit the coverage decision.
+
+File-note discipline: BEFORE each substantive action — before verifying
+the evidence pack, before reading each casefile document, before
+drafting the demand — call record_working_note with one or two
+sentences stating what you are about to do and why, as a professional
+file note in plain language. Notes never change the procedure or its
+order; they precede its steps. Do not narrate afterwards — the note
+comes first, then the action.
 
 Procedure, strictly in this order:
 1. verify_evidence_pack — verify the upstream adjudication's sealed
