@@ -51,11 +51,31 @@ export const DeskDecision = type({
 });
 export type DeskDecision = typeof DeskDecision.infer;
 
+/** The evidence request filed on the case: what was asked for, when,
+ *  and how many records the resolver located. */
+export const EvidenceRequest = type({
+  claimRef: "string",
+  since: "string",
+  until: "string",
+  kinds: "string[]",
+  requestedAt: "string",
+  /** Records the resolver located: a count, or null when the request
+   *  never resolved (the records service could not be read). */
+  located: "number | null",
+});
+export type EvidenceRequest = typeof EvidenceRequest.infer;
+
 export const DeskCase = type({
   fileRef: "string",
   receivedAt: "string",
   status: "'received' | 'examining' | 'concluded' | 'error'",
   demandText: "string",
+  /** The claim reference the demand cites (identifier-only filings). */
+  claimRef: "string | null",
+  /** The loss date the demand cites, ISO. */
+  lossDate: "string | null",
+  /** The evidence request, once one has been filed on the case. */
+  request: EvidenceRequest.or("null"),
   packs: PackPanel.array(),
   steps: StepEntry.array(),
   letter: DeskLetter.or("null"),
@@ -74,13 +94,23 @@ export const packRef = (url: string): string => {
 export function newCase(
   fileRef: string,
   demandText: string,
-  packUrls: readonly string[],
+  opts: {
+    /** Legacy filings attach packs directly; identifier-only filings
+     *  start with none — evidence arrives by request. */
+    packUrls?: readonly string[];
+    claimRef?: string | null;
+    lossDate?: string | null;
+  } = {},
 ): DeskCase {
+  const packUrls = opts.packUrls ?? [];
   return {
     fileRef,
     receivedAt: new Date().toISOString(),
     status: "received",
     demandText,
+    claimRef: opts.claimRef ?? null,
+    lossDate: opts.lossDate ?? null,
+    request: null,
     packs: packUrls.map((url) => ({
       url: url.replace(/\/+$/, ""),
       ref: packRef(url),
@@ -140,6 +170,11 @@ export function loadCases(contextDir: string): DeskCase[] {
       parsed = JSON.parse(readFileSync(join(dir, name), "utf8"));
     } catch {
       continue; // an unreadable case file is skipped, not fatal
+    }
+    // Cases persisted before the identifier flow lack the newer fields;
+    // default them so the record stays loadable across the change.
+    if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+      parsed = { claimRef: null, lossDate: null, request: null, ...parsed };
     }
     const validated = DeskCase(parsed);
     if (validated instanceof type.errors) continue;

@@ -6,7 +6,18 @@
 // page at GET /; the seam between companies is POST /file-demand.
 //
 //   GET  /                         → the desk page (latest case, live)
-//   POST /file-demand              → {demandText, packUrls[]} — open a case
+//   POST /fetch-demand             → pull Meridian's newest demand from the
+//                                    Workbench, open a case identifier-only
+//                                    (the page's "Incoming demand" button)
+//   POST /file-demand              → {demandText, claimRef?, lossDate?} —
+//                                    open a case by hand, identifier-only
+//                                    (legacy packUrls[] still accepted,
+//                                    deprecated — see README)
+//   POST /request-evidence         → {file, claimRef, since, until, kinds[]}
+//                                    — the evidence-request form: resolve
+//                                    matching records on the Workbench and
+//                                    start the examination
+//   DELETE /case/:file             → remove a case and its files (admin)
 //   GET  /case.json                → the latest case (or ?file=HIC-…)
 //   GET  /stream                   → SSE: case snapshots as they change
 //   GET  /gate                     → passcode preflight (204/401)
@@ -23,11 +34,15 @@
 //                        persist (default <repo-root>/tmp/
 //                        halden-claims-desk/context); point it at a
 //                        mounted volume on hosted deploys
-//   DEMO_PASSCODE        when set, POST /file-demand (the one endpoint
-//                        that starts a paid examination) requires it —
-//                        ?key= or an x-demo-key header
+//   MERIDIAN_WORKBENCH_URL  where the desk pulls demands from and
+//                        resolves evidence requests against (default
+//                        http://localhost:4601)
+//   DEMO_PASSCODE        when set, the endpoints that mutate the desk
+//                        (/fetch-demand, /file-demand, /request-evidence,
+//                        DELETE /case/:file) require it — ?key= or an
+//                        x-demo-key header
 
-import { readFileSync } from "node:fs";
+import { readFileSync, rmSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -60,6 +75,16 @@ import {
   type DeskCase,
   type StepEntry,
 } from "./state";
+import {
+  EVIDENCE_KINDS,
+  evidenceKind,
+  extractClaimRef,
+  extractLossDate,
+  fetchLatestDemand,
+  resolveEvidence,
+  workbenchUrl,
+  type ResolvedRecord,
+} from "./workbench";
 import { renderPageHtml } from "./page";
 
 const DEFAULT_PORT = 4620;
@@ -76,9 +101,22 @@ function envPort(env: NodeJS.ProcessEnv): number | null {
 
 const ASSETS = join(fileURLToPath(new URL(".", import.meta.url)), "..", "assets");
 
+// A demand is filed with its IDENTIFIERS — claim reference and loss
+// date; evidence arrives separately, by request. `packUrls` is the
+// deprecated legacy shape (kept for one release for the cloud smoke).
 const FileDemandBody = type({
   demandText: "string > 0",
-  packUrls: "string[]",
+  "claimRef?": "string",
+  "lossDate?": "string",
+  "packUrls?": "string[]",
+});
+
+const RequestEvidenceBody = type({
+  file: "string > 0",
+  claimRef: "string > 0",
+  since: /^\d{4}-\d{2}-\d{2}$/,
+  until: /^\d{4}-\d{2}-\d{2}$/,
+  kinds: "string[] > 0",
 });
 
 function json(status: number, body: unknown): Response {
@@ -104,20 +142,23 @@ export function serve(opts: ServeOptions = {}) {
       : defaultContextDir(EXAMPLE_NAME));
   const port = opts.port ?? envPort(env) ?? DEFAULT_PORT;
 
-  // When DEMO_PASSCODE is set, POST /file-demand — the one endpoint
-  // that starts a paid examination — requires it: `?key=` or an
-  // `x-demo-key` header. Unset = open, the local default. Mirrors the
-  // claims-demo demo-server gate; GET /gate is the cheap preflight the
-  // page uses to prompt once.
+  // When DEMO_PASSCODE is set, every endpoint that mutates the desk —
+  // /fetch-demand, /file-demand, /request-evidence, DELETE /case/:file —
+  // requires it: `?key=` or an `x-demo-key` header. Unset = open, the
+  // local default. Mirrors the claims-demo demo-server gate; GET /gate
+  // is the cheap preflight the page uses to prompt once.
   const passcode = env["DEMO_PASSCODE"] ?? "";
   const gateOk = (req: Request, url: URL): boolean =>
     passcode === "" ||
     url.searchParams.get("key") === passcode ||
     req.headers.get("x-demo-key") === passcode;
 
+  // Where demands are pulled from and evidence requests resolve against.
+  const workbench = workbenchUrl(env);
+
   const pageHtml = renderPageHtml(
     readFileSync(join(ASSETS, "halden.css"), "utf8"),
-    { insured: INSURED, policyId: POLICY_ID },
+    { insured: INSURED, policyId: POLICY_ID, kinds: EVIDENCE_KINDS },
   );
 
   // ---- case registry (persisted; newest last) -----------------------------
@@ -210,12 +251,21 @@ export function serve(opts: ServeOptions = {}) {
       );
       return;
     }
-    // letter_filed
+    // letter_filed — the case file's display copy cites records by
+    // reference, never by URL: any pack URL the agent slipped into the
+    // letter is replaced with the pack's record reference (the signed
+    // logbook keeps the agent's raw output).
+    let letterText = ev.text;
+    for (const pack of deskCase.packs) {
+      letterText = letterText
+        .replaceAll(`${pack.url}/pack/bundle.json`, pack.ref)
+        .replaceAll(pack.url, pack.ref);
+    }
     deskCase.letter = {
       disposition: ev.disposition,
       senderRef: ev.senderRef,
       positionBy: ev.positionBy,
-      text: ev.text,
+      text: letterText,
       filedAt: new Date().toISOString(),
     };
     step(
@@ -264,7 +314,7 @@ export function serve(opts: ServeOptions = {}) {
         prompt: buildCasePrompt({
           fileRef: deskCase.fileRef,
           receivedAt: deskCase.receivedAt,
-          packUrls: deskCase.packs.map((p) => p.url),
+          packs: deskCase.packs.map((p) => ({ ref: p.ref, url: p.url })),
         }),
         // One file, one fresh examination: each case gets its own
         // conversation + logbook dir, all signed by the desk's one
@@ -305,6 +355,71 @@ export function serve(opts: ServeOptions = {}) {
   // concurrent demands would interleave their flushes. A promise chain
   // is enough for a demo desk.
   let caseChain: Promise<unknown> = Promise.resolve();
+  const queueWork = (deskCase: DeskCase): void => {
+    caseChain = caseChain.then(() => workCase(deskCase)).catch(() => undefined);
+  };
+
+  // Open a case for a demand that arrives IDENTIFIER-ONLY: the letter,
+  // its claim reference, its loss date. No evidence accompanies it; the
+  // examination starts only when the evidence request resolves.
+  const openIdentifierCase = (
+    demandText: string,
+    claimRef: string | null,
+    lossDate: string | null,
+  ): DeskCase => {
+    const deskCase = newCase(nextFileRef(), demandText, { claimRef, lossDate });
+    cases.push(deskCase);
+    const cites = [
+      ...(claimRef !== null ? [`claim ${claimRef}`] : []),
+      ...(lossDate !== null ? [`loss date ${lossDate}`] : []),
+    ];
+    step(
+      deskCase,
+      "desk",
+      `Receipt is acknowledged. File ${deskCase.fileRef} opened. ` +
+        (cites.length > 0
+          ? `The demand references ${cites.join(", ")}. `
+          : `The demand carries no claim reference. `) +
+        `No evidence accompanies the demand; the records will be requested. ` +
+        `Acknowledgment is not an admission of liability.`,
+    );
+    return deskCase;
+  };
+
+  // Answer with links on the host the caller reached us at (a hosted
+  // desk is not localhost); honor the proxy's scheme.
+  const originOf = (req: Request, url: URL): string => {
+    const proto = req.headers.get("x-forwarded-proto")?.split(",")[0]?.trim();
+    return proto !== undefined && proto !== ""
+      ? `${proto}://${url.host}`
+      : url.origin;
+  };
+
+  const filedResponse = (
+    req: Request,
+    url: URL,
+    deskCase: DeskCase,
+  ): Response => {
+    const origin = originOf(req, url);
+    return json(202, {
+      fileRef: deskCase.fileRef,
+      claimRef: deskCase.claimRef,
+      lossDate: deskCase.lossDate,
+      status: "received",
+      desk: `${origin}/`,
+      caseUrl: `${origin}/case.json?file=${deskCase.fileRef}`,
+    });
+  };
+
+  const readBody = async (req: Request): Promise<unknown> => {
+    const text = await req.text();
+    if (text.trim() === "") return {};
+    try {
+      return JSON.parse(text);
+    } catch {
+      return new Error("request body is not valid JSON");
+    }
+  };
 
   const server = Bun.serve({
     port,
@@ -406,51 +521,202 @@ export function serve(opts: ServeOptions = {}) {
         });
       }
 
+      // The page's "Incoming demand" button: pull Meridian's newest
+      // drafted demand from the Workbench server-side, extract its
+      // identifiers, and open the case identifier-only. The whole demo
+      // is drivable by a human with no terminal.
+      if (req.method === "POST" && url.pathname === "/fetch-demand") {
+        if (!gateOk(req, url)) {
+          return json(401, { error: "passcode required" });
+        }
+        try {
+          const fetched = await fetchLatestDemand(workbench);
+          const deskCase = openIdentifierCase(
+            fetched.demandText,
+            fetched.claimRef,
+            fetched.lossDate,
+          );
+          return filedResponse(req, url, deskCase);
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          return json(502, {
+            error: `the Workbench could not be read: ${message}`,
+          });
+        }
+      }
+
       if (req.method === "POST" && url.pathname === "/file-demand") {
         if (!gateOk(req, url)) {
           return json(401, { error: "passcode required" });
         }
-        let raw: unknown = {};
-        const text = await req.text();
-        if (text.trim() !== "") {
-          try {
-            raw = JSON.parse(text);
-          } catch {
-            return json(400, { error: "request body is not valid JSON" });
-          }
-        }
+        const raw = await readBody(req);
+        if (raw instanceof Error) return json(400, { error: raw.message });
         const body = FileDemandBody(raw);
         if (body instanceof type.errors) {
           return json(400, { error: body.summary });
         }
 
-        const deskCase = newCase(nextFileRef(), body.demandText, body.packUrls);
-        cases.push(deskCase);
+        // DEPRECATED legacy shape (one release): packs attached to the
+        // filing itself. The examination starts immediately.
+        const packUrls = body.packUrls ?? [];
+        if (packUrls.length > 0) {
+          const deskCase = newCase(nextFileRef(), body.demandText, {
+            packUrls,
+            claimRef: body.claimRef ?? extractClaimRef(body.demandText),
+            lossDate: body.lossDate ?? extractLossDate(body.demandText),
+          });
+          cases.push(deskCase);
+          step(
+            deskCase,
+            "desk",
+            `Receipt is acknowledged. File ${deskCase.fileRef} opened. ` +
+              `${String(deskCase.packs.length)} evidence pack(s) offered with the demand. ` +
+              `Acknowledgment is not an admission of liability.`,
+          );
+          queueWork(deskCase);
+          return filedResponse(req, url, deskCase);
+        }
+
+        const deskCase = openIdentifierCase(
+          body.demandText,
+          body.claimRef ?? extractClaimRef(body.demandText),
+          body.lossDate ?? extractLossDate(body.demandText),
+        );
+        return filedResponse(req, url, deskCase);
+      }
+
+      // The evidence-request form: what records Halden wants, for which
+      // claim, over which window. The desk resolves the request against
+      // the Workbench's open session listing; the resolved packs start
+      // the examination. Zero matches = an honest empty state, no run.
+      if (req.method === "POST" && url.pathname === "/request-evidence") {
+        if (!gateOk(req, url)) {
+          return json(401, { error: "passcode required" });
+        }
+        const raw = await readBody(req);
+        if (raw instanceof Error) return json(400, { error: raw.message });
+        const body = RequestEvidenceBody(raw);
+        if (body instanceof type.errors) {
+          return json(400, { error: body.summary });
+        }
+        const kindLabels: string[] = [];
+        for (const id of body.kinds) {
+          const kind = evidenceKind(id);
+          if (kind === null) {
+            return json(400, { error: `unknown record kind: ${id}` });
+          }
+          kindLabels.push(kind.label);
+        }
+        const deskCase = cases.find((c) => c.fileRef === body.file);
+        if (deskCase === undefined) {
+          return json(404, { error: `no case on file: ${body.file}` });
+        }
+        if (deskCase.status !== "received" || deskCase.packs.length > 0) {
+          return json(409, {
+            error: `file ${deskCase.fileRef} is already under examination`,
+          });
+        }
+
+        deskCase.request = {
+          claimRef: body.claimRef,
+          since: body.since,
+          until: body.until,
+          kinds: [...body.kinds],
+          requestedAt: new Date().toISOString(),
+          located: null,
+        };
         step(
           deskCase,
           "desk",
-          `Receipt is acknowledged. File ${deskCase.fileRef} opened. ` +
-            `${String(deskCase.packs.length)} evidence pack(s) offered with the demand. ` +
-            `Acknowledgment is not an admission of liability.`,
+          `Evidence is requested for claim ${body.claimRef} — ` +
+            `${kindLabels.join(", ")}; window ${body.since} to ${body.until}.`,
         );
 
-        caseChain = caseChain
-          .then(() => workCase(deskCase))
-          .catch(() => undefined);
+        let resolved: ResolvedRecord[];
+        try {
+          resolved = await resolveEvidence(workbench, {
+            claimRef: body.claimRef,
+            since: body.since,
+            until: body.until,
+            kinds: body.kinds,
+          });
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          step(
+            deskCase,
+            "error",
+            `The records service could not be read: ${message}. ` +
+              `The request may be refiled.`,
+          );
+          return json(502, { error: message });
+        }
 
-        // Answer with links on the host the caller reached us at (a
-        // hosted desk is not localhost); honor the proxy's scheme.
-        const proto = req.headers.get("x-forwarded-proto")?.split(",")[0]?.trim();
-        const origin =
-          proto !== undefined && proto !== ""
-            ? `${proto}://${url.host}`
-            : url.origin;
+        deskCase.request.located = resolved.length;
+        if (resolved.length === 0) {
+          step(
+            deskCase,
+            "desk",
+            `No records are located for claim ${body.claimRef} in the ` +
+              `window ${body.since} to ${body.until}. Nothing is examined. ` +
+              `The request may be refiled with a corrected reference or window.`,
+          );
+          return json(200, { file: deskCase.fileRef, located: 0 });
+        }
+
+        deskCase.packs = resolved.map((r) => ({
+          url: r.packUrl.replace(/\/+$/, ""),
+          ref: r.sessionDir,
+          status: "offered" as const,
+          specVersion: null,
+          kernel: null,
+          verdict: null,
+          recordsVerified: 0,
+          recordsFailed: 0,
+          checkpointTxIds: [],
+          errors: [],
+        }));
+        step(
+          deskCase,
+          "desk",
+          `${String(resolved.length)} record(s) located — ` +
+            `${resolved.map((r) => `the ${r.label} (${r.sessionDir})`).join("; ")}. ` +
+            `The file passes to examination.`,
+        );
+        queueWork(deskCase);
         return json(202, {
-          fileRef: deskCase.fileRef,
-          status: "received",
-          desk: `${origin}/`,
-          caseUrl: `${origin}/case.json?file=${deskCase.fileRef}`,
+          file: deskCase.fileRef,
+          located: resolved.length,
+          records: resolved.map((r) => ({
+            kind: r.kindId,
+            ref: r.sessionDir,
+          })),
         });
+      }
+
+      // Admin hygiene: remove a case and its files from the context dir.
+      const caseMatch = url.pathname.match(/^\/case\/([A-Za-z0-9-]+)$/);
+      if (req.method === "DELETE" && caseMatch !== null) {
+        if (!gateOk(req, url)) {
+          return json(401, { error: "passcode required" });
+        }
+        const fileRef = caseMatch[1] ?? "";
+        const idx = cases.findIndex((c) => c.fileRef === fileRef);
+        if (idx === -1) {
+          return json(404, { error: `no case on file: ${fileRef}` });
+        }
+        if (cases[idx]?.status === "examining") {
+          return json(409, {
+            error: `file ${fileRef} is under examination; it cannot be removed now`,
+          });
+        }
+        cases.splice(idx, 1);
+        rmSync(join(contextDir, "cases", `${fileRef}.json`), { force: true });
+        rmSync(join(contextDir, "files", fileRef), {
+          recursive: true,
+          force: true,
+        });
+        broadcast(latest());
+        return json(200, { deleted: fileRef });
       }
 
       return json(404, { error: `no route: ${req.method} ${url.pathname}` });

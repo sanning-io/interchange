@@ -615,23 +615,34 @@ attempted and were prevented from doing.>
 RESPONSE: <one line: the disposition of the letter filed and the date
 it commits Halden to.>`;
 
-/** The assignment handed to the desk when a demand is filed. */
+/** The assignment handed to the desk when a demand is filed. Packs are
+ *  named by RECORD REFERENCE; the URL is the verify tool's machine
+ *  address, never a citation — letters cite references only. */
 export function buildCasePrompt(opts: {
   fileRef: string;
   receivedAt: string;
-  packUrls: readonly string[];
+  packs: readonly { ref: string; url: string }[];
 }): string {
   const packLines =
-    opts.packUrls.length > 0
-      ? opts.packUrls.map((u, i) => `  ${String(i + 1)}. ${u}`).join("\n")
-      : "  (none attached)";
+    opts.packs.length > 0
+      ? opts.packs
+          .map(
+            (p, i) =>
+              `  ${String(i + 1)}. record ${p.ref} ` +
+              `(verify_evidence_pack packUrl: ${p.url})`,
+          )
+          .join("\n")
+      : "  (none on file)";
   return (
     `Inward recovery demand received ${opts.receivedAt.slice(0, 10)}. ` +
     `Our file: ${opts.fileRef}. ` +
     `The demand is asserted against our insured, ${INSURED}, and is on ` +
-    `file (read_demand_letter). Evidence packs offered with the demand:\n` +
+    `file (read_demand_letter). Evidence records located for the file:\n` +
     `${packLines}\n` +
-    `Work the demand per your procedure and report your decision. Dates ` +
-    `Halden commits to run from the received date.`
+    `Work the demand per your procedure and report your decision. In ` +
+    `letters and notes, cite each evidence record by its record ` +
+    `reference (e.g. "${opts.packs[0]?.ref ?? "the record"}"), never by ` +
+    `URL — a URL is a machine address, not a citation. Dates Halden ` +
+    `commits to run from the received date.`
   );
 }

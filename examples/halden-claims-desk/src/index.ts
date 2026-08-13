@@ -31,6 +31,22 @@ export {
   type DeskCase,
   type DeskDecision,
   type DeskLetter,
+  type EvidenceRequest,
   type PackPanel,
   type StepEntry,
 } from "./state";
+export {
+  DEFAULT_WORKBENCH_URL,
+  EVIDENCE_KINDS,
+  evidenceKind,
+  extractClaimRef,
+  extractLossDate,
+  fetchLatestDemand,
+  issuedDemand,
+  resolveEvidence,
+  workbenchUrl,
+  type EvidenceKind,
+  type EvidenceQuery,
+  type FetchedDemand,
+  type ResolvedRecord,
+} from "./workbench";

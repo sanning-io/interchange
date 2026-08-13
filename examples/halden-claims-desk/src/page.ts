@@ -7,12 +7,17 @@
 // centered column, read top to bottom as a story —
 //
 //   letterhead + progression spine        (the only persistent status)
-//   I   · The demand      — key lines, the full letter folded away
-//   II  · The evidence    — one line per pack; grey until convinced,
-//                           the slate circle fills verdigris on verify
-//   III · The review      — the agent's steps, one line each,
+//   I   · The demand      — identifiers (claim reference, loss date),
+//                           the full letter folded away; no pack URLs
+//                           anywhere a human sees
+//   II  · The request     — the evidence-request form (what records,
+//                           which claim, what window), or the filed
+//                           request once one is on the case
+//   III · The evidence    — one line per located record; grey until
+//                           convinced, the circle fills verdigris
+//   IV  · The review      — the agent's steps, one line each,
 //                           expandable, one open at a time
-//   IV  · The position    — the decision chip and the letter itself,
+//   V   · The position    — the decision chip and the letter itself,
 //                           real correspondence, the page's payoff
 //
 // The design law is the brand's: grey until convinced; nothing pulses,
@@ -36,7 +41,7 @@ main { max-width: 720px; margin: 0 auto; padding: 34px 24px 80px; }
 
 /* chrome: switcher + theme control recede into the top corner */
 .hl-header { padding: 12px 24px; flex-wrap: wrap; gap: 8px; align-items: center; }
-.hl-header .right { display: flex; align-items: stretch; gap: 8px; }
+.hl-header .right { display: flex; align-items: stretch; gap: 8px; margin-left: auto; flex-wrap: wrap; }
 .hl-header .hl-btn.ghost { padding: 4px 10px; font-size: 11.5px; border-color: var(--hl-line); }
 .case-menu { position: relative; }
 .case-menu > summary {
@@ -114,8 +119,6 @@ main { max-width: 720px; margin: 0 auto; padding: 34px 24px 80px; }
 }
 .drow .dv { flex: 1; min-width: 0; font-size: 13.5px; }
 .drow .dv .hl-amount { font-size: 16px; }
-.encl-line { display: block; font-size: 12px; padding: 2px 0; overflow-wrap: anywhere; text-decoration: none; }
-.encl-line:hover { text-decoration: underline; }
 details.reveal { margin-top: 14px; }
 details.reveal > summary {
   list-style: none; display: inline-block; cursor: pointer;
@@ -130,7 +133,28 @@ details.reveal[open] > summary::before { content: "\25BE\00A0"; }
   white-space: pre-wrap; overflow-wrap: anywhere;
 }
 
-/* II — the evidence check: one quiet line per pack */
+/* II — the request: the evidence-request form, in the docket's grid */
+.rq .dv input, .filing .fmeta input {
+  font: inherit; font-size: 13px; color: var(--hl-ink);
+  background: var(--hl-sheet); border: 1px solid var(--hl-line);
+  border-radius: 0; padding: 6px 9px;
+}
+.rq .dv input { font-family: var(--hl-mono); font-size: 12px; }
+.rq input#rq-claim { width: 220px; max-width: 100%; }
+.rq .win { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.rq .win .to { font-size: 12px; color: var(--hl-muted); }
+.rq .kopt { display: flex; gap: 9px; align-items: center; padding: 3px 0; font-size: 13px; }
+.rq .kopt input { accent-color: var(--hl-verdigris); margin: 0; }
+.rq .frow { margin-top: 14px; display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap; }
+.rq .fnote { font-size: 12px; color: var(--hl-muted); }
+.rq .fnote.err { color: var(--hl-madder); }
+.rqnote { margin-top: 4px; padding: 8px 0 10px; font-size: 13px; color: var(--hl-madder); }
+[data-theme="dark"] .rq .dv input[type="date"] { color-scheme: dark; }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .rq .dv input[type="date"] { color-scheme: dark; }
+}
+
+/* III — the evidence check: one quiet line per pack */
 .packline { display: flex; gap: 11px; align-items: baseline; padding: 10px 0; }
 .packline + .packline { border-top: 1px solid var(--hl-line); }
 .packline .pmark { flex: none; }
@@ -155,7 +179,7 @@ details.reveal[open] > summary::before { content: "\25BE\00A0"; }
 .pverdict.idle { color: var(--hl-muted); }
 .psub { margin-top: 3px; font-size: 11px; color: var(--hl-muted); overflow-wrap: anywhere; }
 
-/* III — the review: one line per step, expandable, one open at a time */
+/* IV — the review: one line per step, expandable, one open at a time */
 .review details.step { border-top: 1px solid var(--hl-line); }
 .review details.step:first-child { border-top: none; }
 .review details.step > summary {
@@ -178,7 +202,7 @@ details.reveal[open] > summary::before { content: "\25BE\00A0"; }
 .logline { display: flex; gap: 10px; align-items: baseline; padding: 2px 0; font-size: 11.5px; color: var(--hl-muted); }
 .logline .hl-ref { font-size: 11.5px; color: var(--hl-ink); }
 
-/* IV — the position: the chip, then the letter itself */
+/* V — the position: the chip, then the letter itself */
 .chiprow { display: flex; gap: 12px; align-items: baseline; font-size: 12px; }
 .letter-sheet {
   margin-top: 16px; background: var(--hl-sheet); border: 1px solid var(--hl-line);
@@ -203,7 +227,8 @@ details.reveal[open] > summary::before { content: "\25BE\00A0"; }
   font-family: var(--hl-serif); line-height: 1.55;
   min-height: 150px; resize: vertical;
 }
-.filing input { font-family: var(--hl-mono); font-size: 11.5px; margin-top: 8px; }
+.filing .fmeta { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+.filing .fmeta input { flex: 1; min-width: 180px; font-family: var(--hl-mono); font-size: 11.5px; }
 .filing .frow { margin-top: 12px; display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap; }
 .filing .fnote { font-size: 12px; color: var(--hl-muted); }
 .filing .fnote.err { color: var(--hl-madder); }
@@ -300,17 +325,74 @@ function demandActHtml(c,p){
     var lines=c.demandText.split('\n').filter(function(l){return l.trim()!=='';}).slice(0,3);
     html+=drow('Letter',esc(lines.join(' · ')));
   }
-  if(c.packs.length){
-    var encl='';
-    for(var i=0;i<c.packs.length;i++){
-      var pk=c.packs[i];
-      encl+='<a class="hl-ref encl-line" href="'+esc(pk.url)+'/pack/bundle.json">'+esc(pk.ref)+'</a>';
-    }
-    html+=drow('Enclosed',encl);
-  }
+  if(c.claimRef)html+=drow('Claim','<span class="hl-ref">'+esc(c.claimRef)+'</span>');
+  if(c.lossDate)html+=drow('Loss date','<span class="hl-ref">'+esc(c.lossDate)+'</span>');
   html+='<details class="reveal" data-k="demand-full"><summary>Read the full letter</summary>'+
     '<div class="inletter">'+esc(c.demandText)+'</div></details>';
   return html+'</div></section>';
+}
+
+/* ---- Act II: the evidence request — the form, or the request as filed --- */
+function kindLabel(id){
+  for(var i=0;i<KINDS.length;i++)if(KINDS[i].id===id)return KINDS[i].label;
+  return id;
+}
+function addDaysIso(at,days){
+  var t=new Date(at);t.setUTCDate(t.getUTCDate()+days);
+  return t.toISOString().slice(0,10);
+}
+function requestFormHtml(claim,since,until,checked,btn){
+  var html='<div class="rq">'+
+    drow('Claim','<input id="rq-claim" value="'+esc(claim)+'" placeholder="CLM-…" aria-label="Claim reference">')+
+    drow('Window','<span class="win"><input id="rq-since" type="date" value="'+esc(since)+'" aria-label="Records since">'+
+      '<span class="to">to</span>'+
+      '<input id="rq-until" type="date" value="'+esc(until)+'" aria-label="Records until"></span>');
+  var kinds='';
+  for(var i=0;i<KINDS.length;i++){
+    var k=KINDS[i],on=checked.indexOf(k.id)!==-1;
+    kinds+='<label class="kopt"><input type="checkbox" id="rq-k-'+esc(k.id)+'" value="'+esc(k.id)+'"'+(on?' checked':'')+'> The '+esc(k.label)+'</label>';
+  }
+  html+=drow('Records',kinds);
+  html+='<div class="frow"><button class="hl-btn" id="rq-send" type="button">'+esc(btn)+'</button>'+
+    '<span class="fnote" id="rq-note"></span></div></div>';
+  return html;
+}
+function requestSummaryHtml(r){
+  var labels=[],i;
+  for(i=0;i<r.kinds.length;i++)labels.push('the '+kindLabel(r.kinds[i]));
+  return drow('Claim','<span class="hl-ref">'+esc(r.claimRef)+'</span>')+
+    drow('Window','<span class="hl-ref">'+esc(r.since)+'</span> <span class="dim">to</span> <span class="hl-ref">'+esc(r.until)+'</span>')+
+    drow('Records',esc(labels.join(', ')))+
+    drow('Requested','<span class="hl-ref">'+esc(ymd(r.requestedAt))+' '+esc(hhmm(r.requestedAt))+'</span>');
+}
+function requestActHtml(c){
+  var r=c.request;
+  if(!r&&c.packs.length){
+    var html=actOpen('II','The request','superseded');
+    html+=drow('Records','<span class="dim">Evidence accompanied the demand as filed (deprecated path); no request was needed.</span>');
+    return html+'</div></section>';
+  }
+  if(r&&c.packs.length){
+    var done=actOpen('II','The request','as filed');
+    done+=requestSummaryHtml(r);
+    done+=drow('Located',String(r.located)+' record'+(r.located===1?'':'s'));
+    return done+'</div></section>';
+  }
+  var defClaim=c.claimRef||'',defSince=c.lossDate||addDaysIso(c.receivedAt,-30),defUntil=ymd(new Date().toISOString());
+  var defKinds=[],i;
+  for(i=0;i<KINDS.length;i++)defKinds.push(KINDS[i].id);
+  if(r){
+    var back=actOpen('II','The request','as filed');
+    back+=requestSummaryHtml(r);
+    back+=(r.located===0
+      ?'<div class="rqnote">No records were located for that reference and window. Nothing is examined.</div>'
+      :'<div class="rqnote">The request did not resolve; the records service could not be read.</div>');
+    back+=requestFormHtml(r.claimRef,r.since,r.until,r.kinds,'Refile the request');
+    return back+'</div></section>';
+  }
+  var open=actOpen('II','The request','the records are requested, not attached');
+  open+=requestFormHtml(defClaim,defSince,defUntil,defKinds,'Request the evidence');
+  return open+'</div></section>';
 }
 
 function packLine(p){
@@ -338,7 +420,12 @@ function packLine(p){
     (sub?'<div class="psub">'+sub+'</div>':'')+'</div></div>';
 }
 function evidenceActHtml(c){
-  var html=actOpen('II','The evidence','checked independently of the sender'),i;
+  var html=actOpen('III','The evidence','checked independently of the sender'),i;
+  if(!c.packs.length){
+    html+='<div class="packline"><span class="pmark hl-offered"></span><div class="pbody">'+
+      '<div class="pline"><span class="pverdict idle">No records are on the file. Evidence arrives by request.</span></div></div></div>';
+    return html+'</div></section>';
+  }
   for(i=0;i<c.packs.length;i++)html+=packLine(c.packs[i]);
   return html+'</div></section>';
 }
@@ -382,7 +469,7 @@ function recordsHtml(it){
     '<div class="stepbody">'+body+'</div></details>';
 }
 function reviewActHtml(items){
-  var html=actOpen('III','The review',''),i;
+  var html=actOpen('IV','The review',''),i;
   html+='<div class="review">';
   for(i=0;i<items.length;i++)html+=items[i].kind==='records'?recordsHtml(items[i]):stepHtml(items[i]);
   return html+'</div></div></section>';
@@ -397,7 +484,7 @@ function decisionChip(d){
 }
 function positionHtml(c){
   if(!c.decision&&!c.letter)return '';
-  var html=actOpen('IV','The position','as filed');
+  var html=actOpen('V','The position','as filed');
   if(c.decision){
     html+='<div class="chiprow">'+decisionChip(c.decision.decision)+
       (c.letter?'<span class="dim">position committed by '+esc(c.letter.positionBy)+'</span>':'')+'</div>';
@@ -423,22 +510,31 @@ function positionHtml(c){
 
 /* ---- render: rebuild the column, preserve which folds are open --------- */
 var sel=null,list=[],cur=null;
+var RQ_FIELDS=['rq-claim','rq-since','rq-until'];
 function render(c){
   var sameCase=cur!==null&&c!==null&&cur.fileRef===c.fileRef;
   cur=c;
   var el=document.getElementById('desk');
-  var open={},i;
+  var open={},keep={},checks={},focusId=null,i;
   if(sameCase){
     var od=el.querySelectorAll('details[open]');
     for(i=0;i<od.length;i++){var k=od[i].getAttribute('data-k');if(k)open[k]=1;}
+    /* a live update must not clobber what the human is typing into the
+       request form: carry field values, checkboxes, and focus across */
+    for(i=0;i<RQ_FIELDS.length;i++){
+      var f=document.getElementById(RQ_FIELDS[i]);
+      if(f)keep[RQ_FIELDS[i]]=f.value;
+    }
+    var cbs=el.querySelectorAll('.rq input[type=checkbox]');
+    for(i=0;i<cbs.length;i++)checks[cbs[i].id]=cbs[i].checked;
+    if(document.activeElement&&document.activeElement.id&&el.contains(document.activeElement))focusId=document.activeElement.id;
   }
   if(!c){
-    el.innerHTML='<div class="empty">No demand is on file. A counterparty files one with <span class="hl-ref">POST /file-demand</span>.</div>';
+    el.innerHTML='<div class="empty">No demand is on file. Meridian’s demand arrives with “Incoming demand” (top right); a counterparty files its own with <span class="hl-ref">POST /file-demand</span>.</div>';
     updateMenu();return;
   }
   var p=parseDemand(c.demandText);
-  var html=letterheadHtml(c,p)+spineHtml(c)+demandActHtml(c,p);
-  if(c.packs.length)html+=evidenceActHtml(c);
+  var html=letterheadHtml(c,p)+spineHtml(c)+demandActHtml(c,p)+requestActHtml(c)+evidenceActHtml(c);
   var items=reviewItems(c);
   if(items.length)html+=reviewActHtml(items);
   html+=positionHtml(c);
@@ -447,6 +543,15 @@ function render(c){
     var d=el.querySelector('details[data-k="'+key+'"]');
     if(d)d.open=true;
   }
+  for(var kf in keep){
+    var fld=document.getElementById(kf);
+    if(fld)fld.value=keep[kf];
+  }
+  for(var kc in checks){
+    var cb=document.getElementById(kc);
+    if(cb)cb.checked=checks[kc];
+  }
+  if(focusId){var fo=document.getElementById(focusId);if(fo)fo.focus();}
   updateMenu();
 }
 
@@ -524,16 +629,18 @@ document.getElementById('file-toggle').addEventListener('click',function(){
 document.getElementById('fd-send').addEventListener('click',function(){
   var text=document.getElementById('fd-text').value.trim();
   if(text===''){note('A demand letter is required.',true);return;}
-  var packs=document.getElementById('fd-packs').value
-    .split(/[\n,]/).map(function(s){return s.trim();})
-    .filter(function(s){return s!=='';});
+  var claim=document.getElementById('fd-claim').value.trim();
+  var loss=document.getElementById('fd-loss').value.trim();
+  var payload={demandText:text};
+  if(claim!=='')payload.claimRef=claim;
+  if(loss!=='')payload.lossDate=loss;
   note('Filing…',false);
   ensureKey().then(function(key){
     if(key===null){note('Not filed.',true);return;}
     var headers={'Content-Type':'application/json'};
     if(key!=='')headers['x-demo-key']=key;
     fetch('/file-demand',{method:'POST',headers:headers,
-      body:JSON.stringify({demandText:text,packUrls:packs})})
+      body:JSON.stringify(payload)})
       .then(function(r){
         return r.json().then(function(b){return {status:r.status,body:b};})
           .catch(function(){return {status:r.status,body:null};});
@@ -547,11 +654,91 @@ document.getElementById('fd-send').addEventListener('click',function(){
         note('File '+res.body.fileRef+' opened.',false);
         sel=null; /* follow the new case as the stream reports it */
         document.getElementById('fd-text').value='';
-        document.getElementById('fd-packs').value='';
+        document.getElementById('fd-claim').value='';
+        document.getElementById('fd-loss').value='';
         filing.hidden=true;
       })
       .catch(function(){note('The desk could not be reached.',true);});
   });
+});
+
+/* ---- the incoming demand: pull Meridian's letter, server-side ---------- */
+/* The button does what the handoff script does — the desk fetches the
+   newest recovery demand from the Workbench and opens the case
+   identifier-only. No terminal required. */
+(function(){
+  var btn=document.getElementById('fetch-demand');
+  var label=btn.textContent;
+  function done(msg){btn.disabled=false;btn.textContent=label;if(msg)window.alert(msg);}
+  btn.addEventListener('click',function(){
+    btn.disabled=true;btn.textContent='Fetching the demand…';
+    ensureKey().then(function(key){
+      if(key===null){done();return;}
+      var headers={};
+      if(key!=='')headers['x-demo-key']=key;
+      fetch('/fetch-demand',{method:'POST',headers:headers})
+        .then(function(r){
+          return r.json().then(function(b){return {status:r.status,body:b};})
+            .catch(function(){return {status:r.status,body:null};});
+        })
+        .then(function(res){
+          if(res.status===401){keepKey('');done('The desk declined the passcode.');return;}
+          if(res.status!==202){
+            done('The demand could not be fetched'+(res.body&&res.body.error?' — '+res.body.error:'')+'.');
+            return;
+          }
+          sel=null; /* follow the new case as the stream reports it */
+          done();
+        })
+        .catch(function(){done('The desk could not be reached.');});
+    });
+  });
+})();
+
+/* ---- the evidence request: the form submits to /request-evidence ------- */
+function rqNote(t,err){
+  var n=document.getElementById('rq-note');
+  if(n){n.textContent=t;n.className='fnote'+(err?' err':'');}
+}
+function submitRequest(){
+  if(!cur)return;
+  var file=cur.fileRef;
+  var claim=(document.getElementById('rq-claim').value||'').trim();
+  var since=document.getElementById('rq-since').value;
+  var until=document.getElementById('rq-until').value;
+  var kinds=[],cbs=document.querySelectorAll('.rq input[type=checkbox]'),i;
+  for(i=0;i<cbs.length;i++)if(cbs[i].checked)kinds.push(cbs[i].value);
+  if(claim===''){rqNote('A claim reference is required.',true);return;}
+  if(!since||!until){rqNote('The window needs both dates.',true);return;}
+  if(!kinds.length){rqNote('Select at least one record.',true);return;}
+  rqNote('Requesting…',false);
+  ensureKey().then(function(key){
+    if(key===null){rqNote('Not requested.',true);return;}
+    var headers={'Content-Type':'application/json'};
+    if(key!=='')headers['x-demo-key']=key;
+    fetch('/request-evidence',{method:'POST',headers:headers,
+      body:JSON.stringify({file:file,claimRef:claim,since:since,until:until,kinds:kinds})})
+      .then(function(r){
+        return r.json().then(function(b){return {status:r.status,body:b};})
+          .catch(function(){return {status:r.status,body:null};});
+      })
+      .then(function(res){
+        if(res.status===401){keepKey('');rqNote('The desk declined the passcode.',true);return;}
+        if(res.status===200&&res.body&&res.body.located===0){
+          rqNote('No records located.',true);return;
+        }
+        if(res.status!==202){
+          rqNote('HTTP '+res.status+(res.body&&res.body.error?' — '+res.body.error:''),true);
+          return;
+        }
+        rqNote(res.body.located+' record'+(res.body.located===1?'':'s')+' located.',false);
+      })
+      .catch(function(){rqNote('The desk could not be reached.',true);});
+  });
+}
+document.getElementById('desk').addEventListener('click',function(ev){
+  var b=ev.target&&ev.target.closest?ev.target.closest('#rq-send'):null;
+  if(b)submitRequest();
 });
 
 /* the review's reveal idiom: one record open at a time */
@@ -607,16 +794,24 @@ es.onmessage=function(ev){
  * The one page the desk serves. `cssText` is the verbatim contents of
  * assets/halden.css (the approved house sheet); everything else on the
  * page composes its tokens. `insured`/`policyId` are the desk's own
- * schedule facts, shown on the letterhead.
+ * schedule facts, shown on the letterhead; `kinds` are the record kinds
+ * the evidence-request form offers.
  */
 export function renderPageHtml(
   cssText: string,
-  opts: { insured: string; policyId: string },
+  opts: {
+    insured: string;
+    policyId: string;
+    kinds: readonly { id: string; label: string }[];
+  },
 ): string {
   const clientJs =
     `var SEAL=${JSON.stringify(SEAL_SVG)};\n` +
     `var INSURED=${JSON.stringify(opts.insured)};\n` +
     `var POLICY=${JSON.stringify(opts.policyId)};\n` +
+    `var KINDS=${JSON.stringify(
+      opts.kinds.map((k) => ({ id: k.id, label: k.label })),
+    )};\n` +
     CLIENT_MAIN;
   return `<!doctype html>
 <html lang="en">
@@ -637,6 +832,7 @@ ${PAGE_CSS}
       <summary><span id="cm-cur" class="hl-ref">…</span></summary>
       <div class="menu" id="cm-list"></div>
     </details>
+    <button class="hl-btn ghost" id="fetch-demand" type="button">Incoming demand — Meridian</button>
     <button class="hl-btn ghost" id="file-toggle" type="button">File a demand</button>
     <button class="hl-btn ghost" id="theme-toggle" type="button">Night desk</button>
   </span>
@@ -647,7 +843,10 @@ ${PAGE_CSS}
     <div class="act-label"><span class="hl-label">File a demand</span><span class="hl-label">POST /file-demand</span></div>
     <div class="act-body">
       <textarea id="fd-text" placeholder="The demand letter, as issued." aria-label="Demand letter"></textarea>
-      <input id="fd-packs" placeholder="Evidence pack URLs, comma-separated (optional)" aria-label="Evidence pack URLs">
+      <div class="fmeta">
+        <input id="fd-claim" placeholder="Claim reference (e.g. CLM-2026-3105)" aria-label="Claim reference">
+        <input id="fd-loss" placeholder="Loss date (YYYY-MM-DD)" aria-label="Loss date">
+      </div>
       <div class="frow">
         <button class="hl-btn" id="fd-send" type="button">File at the desk</button>
         <span class="fnote" id="fd-note"></span>
