@@ -333,6 +333,8 @@ export function serve(opts: ServeOptions = {}) {
 
   const server = Bun.serve({
     port,
+    // "::" = dual-stack: Railway private networking is IPv6-only, local stays IPv4-reachable
+    hostname: "::",
     idleTimeout: 240, // a model turn can take a while
     async fetch(req) {
       const url = new URL(req.url);

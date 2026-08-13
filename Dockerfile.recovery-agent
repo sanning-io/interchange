@@ -29,4 +29,8 @@ ENV NODE_ENV=production
 ENV SANNING_CONTEXT_DIR=/data
 
 EXPOSE 4610
-CMD ["bun", "--conditions=intx-src", "run", "examples/agent-anchored-audit/src/serve.ts"]
+# The entrypoint seeds an empty volume from SANNING_IDENTITY_B64 /
+# SANNING_WALLET_B64 before starting — the identity is unrecoverable if
+# lost, so it must never depend on the volume alone.
+RUN chmod +x docker-entrypoint-recovery.sh
+ENTRYPOINT ["./docker-entrypoint-recovery.sh"]
