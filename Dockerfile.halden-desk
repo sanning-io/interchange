@@ -1,0 +1,32 @@
+# The Halden Indemnity inward-claims desk (examples/halden-claims-desk).
+# Built from the REPO ROOT so the @intx/* workspace packages resolve —
+# the example runs from source via the intx-src condition, exactly like
+# local `bun run serve`.
+#
+#   docker build -f Dockerfile.halden-desk -t sanning/halden-desk .
+#   docker run -p 4620:4620 -v halden-data:/data \
+#     -e OPENROUTER_API_KEY=... -e DEMO_PASSCODE=... sanning/halden-desk
+#
+# Runtime env (see examples/halden-claims-desk/README.md):
+#   PORT (Railway injects it) · SANNING_CONTEXT_DIR (defaults to /data
+#   here — mount the volume there) · DEMO_PASSCODE · OPENROUTER_API_KEY.
+#   The desk holds NO Sanning account — that asymmetry is the story.
+
+FROM oven/bun:1.2.23
+WORKDIR /app
+
+# The whole workspace: workspace deps + vendored tarballs live in-tree.
+# .dockerignore keeps .git, tmp/, node_modules, and .env files out.
+COPY . .
+
+RUN bun install --frozen-lockfile
+
+ENV NODE_ENV=production
+# Persistent state (identity.json, cases/, files/<ref> logbooks) lives
+# here — mount a volume at /data. Unset SANNING_CONTEXT_DIR falls back
+# to <repo>/tmp/halden-claims-desk/context, which is ephemeral inside a
+# container.
+ENV SANNING_CONTEXT_DIR=/data
+
+EXPOSE 4620
+CMD ["bun", "--conditions=intx-src", "run", "examples/halden-claims-desk/src/serve.ts"]

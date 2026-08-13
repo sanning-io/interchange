@@ -21,17 +21,26 @@
 //   GET  /timeline/:sessionId                       → the run's step timeline
 //   GET  /pack/:sessionId                           → the run's evidence pack
 //   POST /assemble {since?, until?, sessionIds?}    → sign an evidence pack
+//   GET  /gate                                      → passcode preflight (204/401)
 //   GET  /health                                    → liveness + identity
 //
 // Start (from this example's directory — Bun auto-loads ./.env):
 //
 //   bun --conditions=intx-src run src/serve.ts     # listens on :4610
 //
-// Port override: SANNING_AGENT_SERVICE_PORT.
+// Deploy knobs (all optional; unset = local behavior unchanged):
+//   PORT                 the deploy platform's injected port (wins)
+//   SANNING_AGENT_SERVICE_PORT   the example's own port override
+//   SANNING_CONTEXT_DIR  where identity/anchor state persists (default
+//                        <repo-root>/tmp/agent-anchored-audit/context);
+//                        point it at a mounted volume on hosted deploys
+//   DEMO_PASSCODE        when set, POST /run and POST /assemble (the
+//                        endpoints that spend money / sign with the key)
+//                        require it — ?key= or an x-demo-key header
 
 import { createHash } from "node:crypto";
 import { writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 import { type } from "arktype";
 
@@ -54,6 +63,16 @@ import {
 } from "./composition";
 
 const DEFAULT_PORT = 4610;
+
+// Railway (and most deploy platforms) inject PORT; the example's own
+// SANNING_AGENT_SERVICE_PORT keeps working locally.
+function envPort(env: NodeJS.ProcessEnv): number | null {
+  for (const name of ["PORT", "SANNING_AGENT_SERVICE_PORT"]) {
+    const raw = env[name];
+    if (raw !== undefined && raw !== "") return Number.parseInt(raw, 10);
+  }
+  return null;
+}
 
 const RunBody = type({
   "prompt?": "string",
@@ -287,13 +306,25 @@ export interface ServeOptions {
 
 export function serve(opts: ServeOptions = {}) {
   const env = opts.env ?? process.env;
-  const contextDir = opts.contextDir ?? defaultContextDir(EXAMPLE_NAME);
-  const port =
-    opts.port ??
-    (env["SANNING_AGENT_SERVICE_PORT"] !== undefined &&
-    env["SANNING_AGENT_SERVICE_PORT"] !== ""
-      ? Number.parseInt(env["SANNING_AGENT_SERVICE_PORT"], 10)
-      : DEFAULT_PORT);
+  const contextDir =
+    opts.contextDir ??
+    (env["SANNING_CONTEXT_DIR"] !== undefined &&
+    env["SANNING_CONTEXT_DIR"] !== ""
+      ? resolve(env["SANNING_CONTEXT_DIR"])
+      : defaultContextDir(EXAMPLE_NAME));
+  const port = opts.port ?? envPort(env) ?? DEFAULT_PORT;
+
+  // When DEMO_PASSCODE is set, the endpoints that spend money (POST
+  // /run buys a model turn and anchors) or exercise the persisted key
+  // (POST /assemble signs a pack) require it — `?key=` or an
+  // `x-demo-key` header (EventSource can't send headers, hence the
+  // query param). Unset = open, the local default. Mirrors the
+  // claims-demo demo-server gate.
+  const passcode = env["DEMO_PASSCODE"] ?? "";
+  const gateOk = (req: Request, url: URL): boolean =>
+    passcode === "" ||
+    url.searchParams.get("key") === passcode ||
+    req.headers.get("x-demo-key") === passcode;
 
   // Sessions serialize: the composition appends to one retention trail
   // and one git store, so two concurrent /run bodies would interleave
@@ -305,6 +336,13 @@ export function serve(opts: ServeOptions = {}) {
     idleTimeout: 240, // a model turn can take a while
     async fetch(req) {
       const url = new URL(req.url);
+
+      // Preflight for a UI: is a passcode needed, and is this one right?
+      if (req.method === "GET" && url.pathname === "/gate") {
+        return gateOk(req, url)
+          ? new Response(null, { status: 204 })
+          : json(401, { error: "passcode required" });
+      }
 
       if (req.method === "GET" && url.pathname === "/health") {
         const identity = await createExampleIdentity(contextDir);
@@ -324,6 +362,9 @@ export function serve(opts: ServeOptions = {}) {
       }
 
       if (req.method === "POST" && url.pathname === "/run") {
+        if (!gateOk(req, url)) {
+          return json(401, { error: "passcode required" });
+        }
         const body = await parseBody(req, RunBody);
         if (body instanceof Response) return body;
 
@@ -445,6 +486,9 @@ export function serve(opts: ServeOptions = {}) {
       }
 
       if (req.method === "POST" && url.pathname === "/assemble") {
+        if (!gateOk(req, url)) {
+          return json(401, { error: "passcode required" });
+        }
         const body = await parseBody(req, AssembleBody);
         if (body instanceof Response) return body;
 

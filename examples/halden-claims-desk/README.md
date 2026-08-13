@@ -84,6 +84,32 @@ bun run serve                          # the desk, on http://localhost:4620
 Override the model with `OPENROUTER_MODEL` (default
 `anthropic/claude-haiku-4.5`), the port with `HALDEN_DESK_PORT`.
 
+### Environment
+
+| Variable | Required | What it does |
+| --- | --- | --- |
+| `OPENROUTER_API_KEY` | to work cases | the desk agent's inference source (a filed demand errors politely without it) |
+| `OPENROUTER_MODEL` | no | model override (default `anthropic/claude-haiku-4.5`) |
+| `PORT` | no | deploy platforms (Railway) inject it; wins over the next row |
+| `HALDEN_DESK_PORT` | no | the example's own port override (default `4620`) |
+| `SANNING_CONTEXT_DIR` | no | where persistent state lives — `identity.json`, `cases/`, `files/<ref>/` logbooks (default `<repo-root>/tmp/halden-claims-desk/context`); on hosted deploys point it at a mounted volume |
+| `DEMO_PASSCODE` | no | when set, `POST /file-demand` (the one endpoint that starts a paid examination) requires it — `?key=` or an `x-demo-key` header; the page prompts once and keeps it for the tab session. Unset = open, the local default |
+
+### Docker
+
+[`Dockerfile.halden-desk`](../../Dockerfile.halden-desk) at the **repo
+root** builds the desk (root context so the `@intx/*` workspace
+packages resolve):
+
+```bash
+docker build -f Dockerfile.halden-desk -t halden-desk .   # from the repo root
+docker run -p 4620:4620 -v halden-data:/data \
+  -e OPENROUTER_API_KEY=... -e DEMO_PASSCODE=... halden-desk
+```
+
+The image sets `SANNING_CONTEXT_DIR=/data` — mount the volume there so
+the desk's identity and case files outlive deploys.
+
 The desk:
 
 - `GET /` — the Halden-branded page: the demand as received, the
@@ -94,6 +120,11 @@ The desk:
 - `POST /file-demand` `{demandText, packUrls[]}` — a counterparty files
   a demand; the desk opens a file (`HIC-2026-…`), acknowledges,
   verifies, decides, and answers. Cases serialize on one logbook.
+  Gated by `DEMO_PASSCODE` when set; the page's **File a demand**
+  button (top right) drives the same endpoint and asks for the
+  passcode once.
+- `GET /gate` — passcode preflight: `204` when no passcode is set or
+  the supplied one is right, `401` otherwise.
 - `GET /case.json` — the latest case (or `?file=HIC-2026-0412`).
 - `GET /stream` — SSE: case snapshots as they change (what the page
   listens to).
@@ -115,7 +146,8 @@ demo's fiction), takes the adjudication pack the payment rests on plus
 the recovery session's own pack, and POSTs the lot to the desk. The
 file travels over dumb HTTP; the trust arrives separately, when
 Halden's own kernels finish with the packs. Overrides:
-`MERIDIAN_WORKBENCH_URL`, `HALDEN_DESK_URL`.
+`MERIDIAN_WORKBENCH_URL`, `HALDEN_DESK_URL`, and `HALDEN_DESK_KEY`
+(or `DEMO_PASSCODE`) when the hosted desk gates filing.
 
 **Where the files land:** like every example, output goes to
 `<repo-root>/tmp/halden-claims-desk/context/` — `identity.json` (the

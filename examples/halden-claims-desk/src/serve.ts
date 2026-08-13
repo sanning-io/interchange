@@ -9,16 +9,26 @@
 //   POST /file-demand              → {demandText, packUrls[]} — open a case
 //   GET  /case.json                → the latest case (or ?file=HIC-…)
 //   GET  /stream                   → SSE: case snapshots as they change
+//   GET  /gate                     → passcode preflight (204/401)
 //   GET  /health                   → liveness + the desk's public key
 //
 // Start (from this example's directory — Bun auto-loads ./.env):
 //
 //   bun --conditions=intx-src run src/serve.ts     # listens on :4620
 //
-// Port override: HALDEN_DESK_PORT.
+// Deploy knobs (all optional; unset = local behavior unchanged):
+//   PORT                 the deploy platform's injected port (wins)
+//   HALDEN_DESK_PORT     the example's own port override
+//   SANNING_CONTEXT_DIR  where the desk's identity/cases/logbooks
+//                        persist (default <repo-root>/tmp/
+//                        halden-claims-desk/context); point it at a
+//                        mounted volume on hosted deploys
+//   DEMO_PASSCODE        when set, POST /file-demand (the one endpoint
+//                        that starts a paid examination) requires it —
+//                        ?key= or an x-demo-key header
 
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { type } from "arktype";
@@ -54,6 +64,16 @@ import { renderPageHtml } from "./page";
 
 const DEFAULT_PORT = 4620;
 
+// Railway (and most deploy platforms) inject PORT; the example's own
+// HALDEN_DESK_PORT keeps working locally.
+function envPort(env: NodeJS.ProcessEnv): number | null {
+  for (const name of ["PORT", "HALDEN_DESK_PORT"]) {
+    const raw = env[name];
+    if (raw !== undefined && raw !== "") return Number.parseInt(raw, 10);
+  }
+  return null;
+}
+
 const ASSETS = join(fileURLToPath(new URL(".", import.meta.url)), "..", "assets");
 
 const FileDemandBody = type({
@@ -76,12 +96,24 @@ export interface ServeOptions {
 
 export function serve(opts: ServeOptions = {}) {
   const env = opts.env ?? process.env;
-  const contextDir = opts.contextDir ?? defaultContextDir(EXAMPLE_NAME);
-  const port =
-    opts.port ??
-    (env["HALDEN_DESK_PORT"] !== undefined && env["HALDEN_DESK_PORT"] !== ""
-      ? Number.parseInt(env["HALDEN_DESK_PORT"], 10)
-      : DEFAULT_PORT);
+  const contextDir =
+    opts.contextDir ??
+    (env["SANNING_CONTEXT_DIR"] !== undefined &&
+    env["SANNING_CONTEXT_DIR"] !== ""
+      ? resolve(env["SANNING_CONTEXT_DIR"])
+      : defaultContextDir(EXAMPLE_NAME));
+  const port = opts.port ?? envPort(env) ?? DEFAULT_PORT;
+
+  // When DEMO_PASSCODE is set, POST /file-demand — the one endpoint
+  // that starts a paid examination — requires it: `?key=` or an
+  // `x-demo-key` header. Unset = open, the local default. Mirrors the
+  // claims-demo demo-server gate; GET /gate is the cheap preflight the
+  // page uses to prompt once.
+  const passcode = env["DEMO_PASSCODE"] ?? "";
+  const gateOk = (req: Request, url: URL): boolean =>
+    passcode === "" ||
+    url.searchParams.get("key") === passcode ||
+    req.headers.get("x-demo-key") === passcode;
 
   const pageHtml = renderPageHtml(
     readFileSync(join(ASSETS, "halden.css"), "utf8"),
@@ -286,6 +318,13 @@ export function serve(opts: ServeOptions = {}) {
         });
       }
 
+      // Preflight for the page: is a passcode needed, and is this one right?
+      if (req.method === "GET" && url.pathname === "/gate") {
+        return gateOk(req, url)
+          ? new Response(null, { status: 204 })
+          : json(401, { error: "passcode required" });
+      }
+
       if (req.method === "GET" && url.pathname === "/health") {
         const identity = await createDeskIdentity(contextDir);
         return json(200, {
@@ -366,6 +405,9 @@ export function serve(opts: ServeOptions = {}) {
       }
 
       if (req.method === "POST" && url.pathname === "/file-demand") {
+        if (!gateOk(req, url)) {
+          return json(401, { error: "passcode required" });
+        }
         let raw: unknown = {};
         const text = await req.text();
         if (text.trim() !== "") {
@@ -394,11 +436,18 @@ export function serve(opts: ServeOptions = {}) {
           .then(() => workCase(deskCase))
           .catch(() => undefined);
 
+        // Answer with links on the host the caller reached us at (a
+        // hosted desk is not localhost); honor the proxy's scheme.
+        const proto = req.headers.get("x-forwarded-proto")?.split(",")[0]?.trim();
+        const origin =
+          proto !== undefined && proto !== ""
+            ? `${proto}://${url.host}`
+            : url.origin;
         return json(202, {
           fileRef: deskCase.fileRef,
           status: "received",
-          desk: `http://localhost:${String(port)}/`,
-          caseUrl: `http://localhost:${String(port)}/case.json?file=${deskCase.fileRef}`,
+          desk: `${origin}/`,
+          caseUrl: `${origin}/case.json?file=${deskCase.fileRef}`,
         });
       }
 

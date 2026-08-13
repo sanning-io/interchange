@@ -1,0 +1,32 @@
+# The Meridian Recovery agent service (examples/agent-anchored-audit,
+# service mode). Built from the REPO ROOT so the @intx/* workspace
+# packages resolve — the example runs from source via the intx-src
+# condition, exactly like local `bun run serve`.
+#
+#   docker build -f Dockerfile.recovery-agent -t sanning/recovery-agent .
+#   docker run -p 4610:4610 -v recovery-data:/data \
+#     -e OPENROUTER_API_KEY=... -e DEMO_PASSCODE=... sanning/recovery-agent
+#
+# Runtime env (see examples/agent-anchored-audit/README.md):
+#   PORT (Railway injects it) · SANNING_CONTEXT_DIR (defaults to /data
+#   here — mount the volume there) · DEMO_PASSCODE · OPENROUTER_API_KEY
+#   · SANNING_API_KEY and friends for production anchoring.
+
+FROM oven/bun:1.2.23
+WORKDIR /app
+
+# The whole workspace: workspace deps + vendored tarballs live in-tree.
+# .dockerignore keeps .git, tmp/, node_modules, and .env files out.
+COPY . .
+
+RUN bun install --frozen-lockfile
+
+ENV NODE_ENV=production
+# Persistent state (identity.json, wallet.json, anchor/ retention trail)
+# lives here — mount a volume at /data. Unset SANNING_CONTEXT_DIR falls
+# back to <repo>/tmp/agent-anchored-audit/context, which is ephemeral
+# inside a container.
+ENV SANNING_CONTEXT_DIR=/data
+
+EXPOSE 4610
+CMD ["bun", "--conditions=intx-src", "run", "examples/agent-anchored-audit/src/serve.ts"]

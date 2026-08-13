@@ -10,13 +10,18 @@
 //   bun --conditions=intx-src run scripts/file-meridian-demand.ts
 //
 // Env: MERIDIAN_WORKBENCH_URL (default http://localhost:4601),
-//      HALDEN_DESK_URL        (default http://localhost:4620).
+//      HALDEN_DESK_URL        (default http://localhost:4620),
+//      HALDEN_DESK_KEY        (or DEMO_PASSCODE) — the desk's demo
+//                             passcode, when the hosted desk gates
+//                             POST /file-demand.
 
 import { type } from "arktype";
 
 const WORKBENCH =
   process.env["MERIDIAN_WORKBENCH_URL"] ?? "http://localhost:4601";
 const DESK = process.env["HALDEN_DESK_URL"] ?? "http://localhost:4620";
+const DESK_KEY =
+  process.env["HALDEN_DESK_KEY"] ?? process.env["DEMO_PASSCODE"] ?? "";
 
 const SessionsListing = type({
   sessions: type({
@@ -153,7 +158,10 @@ async function main(): Promise<number> {
   //    shared credential — the desk verifies for itself.
   const res = await fetch(`${DESK}/file-demand`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      ...(DESK_KEY !== "" ? { "x-demo-key": DESK_KEY } : {}),
+    },
     body: JSON.stringify({ demandText: issuedDemand(demandText), packUrls }),
   });
   const body: unknown = await res.json();

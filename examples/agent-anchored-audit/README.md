@@ -104,7 +104,38 @@ The same composition also runs as a small resident HTTP service
   disclosed in-body), and returns its path, sha256 and counts. This is
   the key-holder fulfilling an evidence request **after the fact** —
   the sessions that produced the evidence are long gone.
+- `GET /gate` — passcode preflight: `204` when no passcode is set or
+  the supplied one is right, `401` otherwise.
 - `GET /health` — liveness, mode, producer, public key.
+
+#### Service-mode environment
+
+| Variable | Required | What it does |
+| --- | --- | --- |
+| `OPENROUTER_API_KEY` | for `POST /run` | service mode's inference source (the CLI also accepts `ANTHROPIC_API_KEY`; the service is OpenRouter-only) |
+| `OPENROUTER_MODEL` | no | model override (default `anthropic/claude-haiku-4.5`) |
+| `PORT` | no | deploy platforms (Railway) inject it; wins over the next row |
+| `SANNING_AGENT_SERVICE_PORT` | no | the example's own port override (default `4610`) |
+| `SANNING_CONTEXT_DIR` | no | where persistent state lives — `identity.json`, `wallet.json`, the `anchor/` retention trail (default `<repo-root>/tmp/agent-anchored-audit/context`); on hosted deploys point it at a mounted volume |
+| `DEMO_PASSCODE` | no | when set, `POST /run` and `POST /assemble` require it (`?key=` or an `x-demo-key` header); unset = open, the local default |
+| `SANNING_API_KEY` | no | production anchoring via the control plane (unset = dev mode; see below) |
+| `SANNING_DEV_UPLOAD_URL` | no | dev-mode mock upload front for a fully local loop |
+| `SANNING_PRODUCER_ID` · `SANNING_AGENT_NAME` · `SANNING_DISPLAY_NAME` · `SANNING_CONTROL_PLANE_URL` | no | keyed-mode extras (see “Anchoring modes”) |
+
+#### Docker
+
+[`Dockerfile.recovery-agent`](../../Dockerfile.recovery-agent) at the
+**repo root** builds this service (root context so the `@intx/*`
+workspace packages resolve):
+
+```bash
+docker build -f Dockerfile.recovery-agent -t recovery-agent .   # from the repo root
+docker run -p 4610:4610 -v recovery-data:/data \
+  -e OPENROUTER_API_KEY=... -e DEMO_PASSCODE=... recovery-agent
+```
+
+The image sets `SANNING_CONTEXT_DIR=/data` — mount the volume there so
+the identity and the retention trail outlive deploys.
 
 [`fulfilment/`](fulfilment/README.md) closes the loop: an Interchange
 workflow (customer code — a tool package + workflow definition) that

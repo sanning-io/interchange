@@ -1,0 +1,31 @@
+# Build context for Dockerfile.recovery-agent / Dockerfile.halden-desk.
+# The images run the two Sanning demo examples from source with
+# --conditions=intx-src, so the whole workspace ships — minus anything
+# heavy, generated, or machine-local. bun install runs inside the image;
+# runtime config (keys, ports, passcodes) comes from the deploy
+# environment, never from baked-in .env files.
+.git
+.githooks
+.claude
+node_modules
+**/node_modules
+tmp
+**/tmp
+dist
+**/dist
+*.tsbuildinfo
+**/*.tsbuildinfo
+.tap
+.eslintcache
+.DS_Store
+keypairs
+dispatch
+Dockerfile.*
+.dockerignore
+
+# env files are machine-local secrets; the *.example files stay as docs
+.env
+.env.*
+**/.env
+!.env.example
+!.env.*.example

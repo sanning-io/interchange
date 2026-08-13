@@ -191,6 +191,23 @@ details.reveal[open] > summary::before { content: "\25BE\00A0"; }
 .letter-sign .hl-seal { width: 56px; height: 56px; flex: none; color: var(--hl-chrome-ink); }
 .letter-date { margin-top: 12px; font-family: var(--hl-mono); font-size: 11px; color: var(--hl-muted); }
 
+/* the filing form — the counterparty seam (POST /file-demand), driven
+   from the page on hosted desks; hidden until asked for */
+.filing { margin-top: 28px; }
+.filing textarea, .filing input {
+  width: 100%; box-sizing: border-box; font: inherit; font-size: 13px;
+  color: var(--hl-ink); background: var(--hl-sheet);
+  border: 1px solid var(--hl-line); border-radius: 0; padding: 8px 10px;
+}
+.filing textarea {
+  font-family: var(--hl-serif); line-height: 1.55;
+  min-height: 150px; resize: vertical;
+}
+.filing input { font-family: var(--hl-mono); font-size: 11.5px; margin-top: 8px; }
+.filing .frow { margin-top: 12px; display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap; }
+.filing .fnote { font-size: 12px; color: var(--hl-muted); }
+.filing .fnote.err { color: var(--hl-madder); }
+
 .empty { padding: 90px 0; color: var(--hl-muted); font-size: 13px; text-align: center; }
 footer { max-width: 720px; margin: 0 auto; padding: 0 24px 30px; }
 footer span + span::before { content: " \00B7 "; }
@@ -470,6 +487,73 @@ document.addEventListener('click',function(ev){
   if(cm.open&&!cm.contains(ev.target))cm.open=false;
 });
 
+/* ---- filing: the counterparty seam, driven from the page --------------- */
+/* Hosted desks gate POST /file-demand (the one endpoint that starts a
+   paid examination) behind a passcode; GET /gate is the cheap
+   preflight. The key is asked for once and kept for the tab session
+   (sessionStorage), the same prompt-once flow as the Workbench. */
+function deskKey(){try{return sessionStorage.getItem('halden-demo-key')||'';}catch(e){return '';}}
+function keepKey(k){try{sessionStorage.setItem('halden-demo-key',k);}catch(e){}}
+function gateCheck(k){
+  return fetch('/gate'+(k?'?key='+encodeURIComponent(k):''))
+    .then(function(r){return r.status===204;})
+    .catch(function(){return false;});
+}
+function ensureKey(){
+  var key=deskKey();
+  return gateCheck(key).then(function(ok){
+    if(ok)return key;
+    var entered=window.prompt('Demo passcode');
+    if(entered===null)return null;
+    return gateCheck(entered).then(function(ok2){
+      if(!ok2){window.alert("That passcode wasn't accepted.");return null;}
+      keepKey(entered);
+      return entered;
+    });
+  });
+}
+var filing=document.getElementById('filing');
+function note(t,err){
+  var n=document.getElementById('fd-note');
+  n.textContent=t;n.className='fnote'+(err?' err':'');
+}
+document.getElementById('file-toggle').addEventListener('click',function(){
+  filing.hidden=!filing.hidden;
+  if(!filing.hidden)document.getElementById('fd-text').focus();
+});
+document.getElementById('fd-send').addEventListener('click',function(){
+  var text=document.getElementById('fd-text').value.trim();
+  if(text===''){note('A demand letter is required.',true);return;}
+  var packs=document.getElementById('fd-packs').value
+    .split(/[\n,]/).map(function(s){return s.trim();})
+    .filter(function(s){return s!=='';});
+  note('Filing…',false);
+  ensureKey().then(function(key){
+    if(key===null){note('Not filed.',true);return;}
+    var headers={'Content-Type':'application/json'};
+    if(key!=='')headers['x-demo-key']=key;
+    fetch('/file-demand',{method:'POST',headers:headers,
+      body:JSON.stringify({demandText:text,packUrls:packs})})
+      .then(function(r){
+        return r.json().then(function(b){return {status:r.status,body:b};})
+          .catch(function(){return {status:r.status,body:null};});
+      })
+      .then(function(res){
+        if(res.status===401){keepKey('');note('The desk declined the passcode.',true);return;}
+        if(res.status!==202){
+          note('HTTP '+res.status+(res.body&&res.body.error?' — '+res.body.error:''),true);
+          return;
+        }
+        note('File '+res.body.fileRef+' opened.',false);
+        sel=null; /* follow the new case as the stream reports it */
+        document.getElementById('fd-text').value='';
+        document.getElementById('fd-packs').value='';
+        filing.hidden=true;
+      })
+      .catch(function(){note('The desk could not be reached.',true);});
+  });
+});
+
 /* the review's reveal idiom: one record open at a time */
 document.addEventListener('toggle',function(ev){
   var d=ev.target;
@@ -553,11 +637,25 @@ ${PAGE_CSS}
       <summary><span id="cm-cur" class="hl-ref">…</span></summary>
       <div class="menu" id="cm-list"></div>
     </details>
+    <button class="hl-btn ghost" id="file-toggle" type="button">File a demand</button>
     <button class="hl-btn ghost" id="theme-toggle" type="button">Night desk</button>
   </span>
 </header>
 <div class="hl-rule"></div>
-<main id="desk"></main>
+<main>
+  <section class="act filing" id="filing" hidden>
+    <div class="act-label"><span class="hl-label">File a demand</span><span class="hl-label">POST /file-demand</span></div>
+    <div class="act-body">
+      <textarea id="fd-text" placeholder="The demand letter, as issued." aria-label="Demand letter"></textarea>
+      <input id="fd-packs" placeholder="Evidence pack URLs, comma-separated (optional)" aria-label="Evidence pack URLs">
+      <div class="frow">
+        <button class="hl-btn" id="fd-send" type="button">File at the desk</button>
+        <span class="fnote" id="fd-note"></span>
+      </div>
+    </div>
+  </section>
+  <div id="desk"></div>
+</main>
 <footer class="hl-fineprint">
   <span>Verified against the public record — independently of the sender.</span>
   <span>Raw record: <a href="/case.json">case</a> · <a href="/cases.json">cases</a> · <a href="/health">desk</a></span>
