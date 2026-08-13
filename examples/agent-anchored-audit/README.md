@@ -266,3 +266,24 @@ signer — see the adapter README.
 > **Note:** `@ar.io/anchor` and `@ar.io/anchor-interchange` are
 > consumed from vendored tarballs (`vendor/`) ahead of their npm
 > release. Both become normal version ranges once published.
+
+## Temporary scaffolding
+
+Three pieces of this example are interim stand-ins for product
+features in flight; each shrinks to nothing when its feature lands:
+
+- **The fulfilment bridge stub**
+  ([`fulfilment/bridge-stub.ts`](fulfilment/bridge-stub.ts)) fakes the
+  console-approval leg of an evidence request. Replaced by the console
+  pushing a signed notice plus machine access to requests —
+  [control-plane#68](https://github.com/sanning-io/control-plane/issues/68).
+- **The `/assemble` endpoint** ([`src/serve.ts`](src/serve.ts)) is a
+  hand-rolled stand-in for the SDK's official assemble verb —
+  [control-plane#69](https://github.com/sanning-io/control-plane/issues/69),
+  decision at
+  [control-plane#61](https://github.com/sanning-io/control-plane/issues/61).
+- **Two SDK workarounds** in
+  [`src/composition.ts`](src/composition.ts): the wrap that catches
+  the session-close crash when the upload is rejected at `close()`,
+  and the subject name-format lift. Both go away with the SDK fixes
+  in [anchor#15](https://github.com/sanning-io/anchor/issues/15).

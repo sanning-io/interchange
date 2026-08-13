@@ -157,3 +157,23 @@ git logbook: one file, one fresh examination — a shared dir would
 resume the previous case's conversation, which is the runtime's resume
 feature and exactly what a claims desk must not do between demands).
 `rm -rf ../../tmp/halden-claims-desk` starts the desk over.
+
+## Temporary scaffolding
+
+Two pieces of this example are interim stand-ins; each shrinks to
+nothing when the product feature behind it lands:
+
+- **The "issued by counsel" lift** in
+  [`scripts/file-meridian-demand.ts`](scripts/file-meridian-demand.ts):
+  the script promotes Meridian's drafted-but-denied demand to "issued
+  by authority of supervising counsel" in the demo's fiction. Replaced
+  by a real delivery step in the evidence-request flow — the
+  fulfilment decision,
+  [control-plane#68](https://github.com/sanning-io/control-plane/issues/68).
+- **Raw hex pack links with no readable layer**: the demand carries
+  bare pack URLs. Replaced by the four-layer evidence delivery once
+  that shape is validated —
+  [evidence-delivery-shape.md](https://github.com/sanning-io/knowledge-base/blob/claude/interchange-sprint-thread/research/evidence-delivery-shape.md)
+  (knowledge-base; on its PR branch until
+  [knowledge-base#50](https://github.com/sanning-io/knowledge-base/pull/50)
+  merges).
