@@ -36,12 +36,12 @@ import {
   type InclusionReceipt,
   type RetainedCheckpoint,
   type RetainedEvent,
-} from "@ar.io/anchor";
+} from "@sanning/anchor";
 import {
   anchoredAuditStore,
   signerFromCryptoProvider,
   type InterchangeAnchorEvent,
-} from "@ar.io/anchor-interchange";
+} from "@sanning/anchor-interchange";
 import {
   createAgent,
   createDefaultDirectorRegistry,

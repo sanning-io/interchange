@@ -11,7 +11,7 @@
 //
 // The verify step is the handoff moment between two evidence planes:
 // the upstream pack was produced by Meridian's claims-demo estate on the
-// sanning.* wire IDs, so THIS agent verifies it with the same vendored
+// sanning.* wire IDs, so THIS agent verifies it with the same published
 // @sanning/proof kernel (programmatic API, offline) before acting on it.
 // No verified pack — no recovery work: the refusal is the required
 // behavior, and the refusal itself becomes anchored evidence.
@@ -74,7 +74,7 @@ function upstreamDecisionFrom(logs: Record<string, string>): string | null {
 
 /**
  * Fetch a claims-demo evidence pack (`<packUrl>/pack/bundle.json` +
- * `<packUrl>/logs-mapping.json`) and verify it OFFLINE with the vendored
+ * `<packUrl>/logs-mapping.json`) and verify it OFFLINE with the published
  * @sanning/proof kernel — signature, payload binding, Merkle inclusion,
  * and disclosed-content hashes. Network is used only to FETCH the pack;
  * the verification itself is local math.

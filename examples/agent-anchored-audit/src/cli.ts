@@ -5,7 +5,7 @@
 // an AuditRecord in a real git repository — open format, standard
 // tools. This example adds the missing external leg: each committed
 // record is ALSO Merkle-batched and anchored via
-// @ar.io/anchor-interchange, so every record — including the calls
+// @sanning/anchor-interchange, so every record — including the calls
 // authorization BLOCKED — gets a standalone inclusion proof that lives
 // outside the repo it attests to. A git history can be rewritten by
 // whoever holds the keys; the anchored checkpoint cannot.
@@ -39,7 +39,7 @@
 // a single portable trace-bundle.json, and prints the command an auditor
 // runs to verify the whole thing offline with the read-only verifier:
 //
-//   npx @ar.io/proof verify <contextDir>/trace-bundle.json
+//   npx @sanning/proof verify <contextDir>/trace-bundle.json
 //
 // The full composition (identity, retention, anchorer, agent, tools,
 // policy) lives in ./composition — shared with the service mode
@@ -160,7 +160,7 @@ export async function main(
     `  (${String(disclosed)}/${String(receipts.length)} records disclosed in-body, each bound to its committed hash)\n`,
   );
   stdout("verify it anywhere — no repo access, no agent, no write SDK:\n");
-  stdout(`  npx @ar.io/proof verify ${bundlePath}\n`);
+  stdout(`  npx @sanning/proof verify ${bundlePath}\n`);
   return 0;
 }
 

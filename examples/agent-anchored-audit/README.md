@@ -4,7 +4,7 @@
 trail is a real git repository — open format, standard tools. This
 example adds the missing external leg: every audit record is **also
 anchored to Arweave** via
-[`@ar.io/anchor-interchange`](https://github.com/sanning-io/anchor/tree/main/packages/interchange),
+[`@sanning/anchor-interchange`](https://github.com/sanning-io/anchor/tree/main/packages/interchange),
 so the trail is verifiable by someone who trusts **neither this
 machine nor its operator**. A git history can be rewritten by whoever
 holds the keys; an anchored checkpoint cannot.
@@ -20,8 +20,8 @@ Everything about the job lives in [`src/job.ts`](src/job.ts) and
 1. **`verify_evidence_pack` — the handoff moment.** Before doing any
    work, the specialist fetches the upstream adjudication's sealed
    evidence pack (produced by the claims-demo estate on the `sanning.*`
-   wire IDs) and verifies it **programmatically** with the vendored
-   `@sanning/proof` 0.4.0 kernel — signatures, Merkle inclusion,
+   wire IDs) and verifies it **programmatically** with the published
+   `@sanning/proof` kernel — signatures, Merkle inclusion,
    disclosed-content hashes, all offline. No pack, or any verdict other
    than `verified` → the specialist **refuses to proceed** and says why.
    The refusal is anchored evidence too.
@@ -167,12 +167,13 @@ default `Meridian Mutual — Recovery` — a rename shows up in the console
 immediately and never rewrites what past envelopes were signed saying),
 `SANNING_CONTROL_PLANE_URL`.
 
-> **Two kernels, deliberately.** This agent's OWN anchors are `ario.*`
-> wire IDs (the vendored `@ar.io/anchor` 0.2.0) — its packs verify with
-> the published `npx @ar.io/proof`. The claims-demo packs it VERIFIES
-> are `sanning.*` — those go through the vendored `@sanning/proof`
-> 0.4.0 kernel, imported programmatically in the verify tool (never
-> `npx`: both kernels claim the bin name `proof`).
+> **One wire format now.** This agent's OWN anchors are `sanning.*`
+> wire IDs (the published `@sanning/anchor` 0.4.0) — its packs verify
+> with `npx @sanning/proof`. The claims-demo packs it VERIFIES are
+> `sanning.*` too, checked programmatically with the same published
+> `@sanning/proof` kernel. Legacy `ario.*` packs still verify with the
+> published `@ar.io/proof` — the Halden desk dispatches by
+> `spec_version`.
 
 ### Persisted identity
 
@@ -201,7 +202,7 @@ checkpoint: <txId>
 portable evidence bundle: <contextDir>/trace-bundle.json
   (6/6 records disclosed in-body, each bound to its committed hash)
 verify it anywhere — no repo access, no agent, no write SDK:
-  npx @ar.io/proof verify <contextDir>/trace-bundle.json
+  npx @sanning/proof verify <contextDir>/trace-bundle.json
 ```
 
 **Where the files land:** not in this folder — like every agent-\*
@@ -223,16 +224,15 @@ Copy `trace-bundle.json` to any machine — no Interchange, no agent, no
 access to the git repo — and run the read-only verifier:
 
 ```bash
-npx @ar.io/proof verify trace-bundle.json
+npx @sanning/proof verify trace-bundle.json
 # optionally re-fetch the checkpoint on-chain to confirm it's anchored:
-npx @ar.io/proof verify trace-bundle.json https://arweave.net,https://permagate.io
+npx @sanning/proof verify trace-bundle.json https://arweave.net,https://permagate.io
 ```
 
 It recomputes every record's signature, payload binding, and Merkle
 inclusion — and, because the bundle **discloses the raw records
 in-body**, it also recomputes each disclosed record's `SHA-256` against
-the committed `content_hash` (the `logs ✓` marks, `@ar.io/proof` ≥
-0.3.0). The auditor doesn't just verify _that_ two tool calls happened;
+the committed `content_hash` (the `logs ✓` marks). The auditor doesn't just verify _that_ two tool calls happened;
 they read _what_ the calls were — the blocked deletion included — and
 every byte of it is bound to the on-chain checkpoint. Drag-and-drop
 bundle viewers built on `verifyEvidenceBundle` show the same thing with
@@ -257,15 +257,16 @@ holds one proof row per event and checkpoint, and `logs/` holds the
 exact committed bytes, content-addressed. Everything the bundle
 disclosed came from that store — no second copy of the truth.
 
-Without `SANNING_API_KEY` this run uses `@ar.io/anchor`'s dev mode; the
+Without `SANNING_API_KEY` this run uses `@sanning/anchor`'s dev mode; the
 envelopes are permanently marked `environment: "dev"` inside the signed
 bytes. With the key set, envelopes are `environment: "production"`,
 signed by the persisted identity and uploaded with the persisted wallet
 signer — see the adapter README.
 
-> **Note:** `@ar.io/anchor` and `@ar.io/anchor-interchange` are
-> consumed from vendored tarballs (`vendor/`) ahead of their npm
-> release. Both become normal version ranges once published.
+> **Note:** `@sanning/anchor` and `@sanning/proof` are consumed from
+> npm. `@sanning/anchor-interchange` is still a vendored tarball
+> (`vendor/`) ahead of its npm release — it becomes a normal version
+> range once published.
 
 ## Temporary scaffolding
 

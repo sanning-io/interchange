@@ -12,7 +12,7 @@
 // liability") is the whole voice of the house.
 //
 // Two kernels, dispatched by the pack's own spec_version: `sanning.*`
-// packs verify with the vendored @sanning/proof kernel, `ario.*` packs
+// packs verify with the published @sanning/proof kernel, `ario.*` packs
 // with the published @ar.io/proof kernel. Both verifications are local
 // math over fetched bytes; no credential is sent anywhere.
 
@@ -207,7 +207,7 @@ function decisionLinesFrom(texts: (string | null)[]): string | null {
 /**
  * Fetch an evidence pack (`<packUrl>/pack/bundle.json` +
  * `<packUrl>/logs-mapping.json`) and verify it OFFLINE with the kernel
- * its own spec_version names: `sanning.*` → the vendored @sanning/proof,
+ * its own spec_version names: `sanning.*` → the published @sanning/proof,
  * `ario.*` → the published @ar.io/proof. Network is used only to FETCH
  * the pack; the verification is local math, and no Sanning credential
  * exists anywhere in this example.
@@ -250,7 +250,7 @@ export async function verifyPackAtUrl(
   let kernel: string | null;
   let rawResult: unknown;
   if (specVersion?.startsWith("sanning.") === true) {
-    kernel = "@sanning/proof 0.4.0 (vendored)";
+    kernel = "@sanning/proof 0.4.1 (npm)";
     rawResult = await verifySanningBundle(bundle, { content });
   } else if (specVersion?.startsWith("ario.") === true) {
     kernel = "@ar.io/proof 0.3.0 (npm)";

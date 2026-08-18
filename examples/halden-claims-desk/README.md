@@ -25,10 +25,13 @@ no platform, no login, and no trust — only math.
 
 Two kernels, dispatched by each pack's own `spec_version`:
 
-- `sanning.*` packs (the claims-demo estate) → the vendored
-  [`@sanning/proof`](vendor/) 0.4.0 kernel
-- `ario.*` packs (the Interchange-hosted recovery agent) → the
-  published [`@ar.io/proof`](https://www.npmjs.com/package/@ar.io/proof)
+- `sanning.*` packs (the claims-demo estate and the Interchange-hosted
+  recovery agent) → the published
+  [`@sanning/proof`](https://www.npmjs.com/package/@sanning/proof)
+  kernel from npm
+- `ario.*` packs (legacy anchors from before the `sanning.*` rename) →
+  the published
+  [`@ar.io/proof`](https://www.npmjs.com/package/@ar.io/proof)
   0.3.0 kernel from npm
 
 Both imported programmatically (never `npx`: the two kernels claim the

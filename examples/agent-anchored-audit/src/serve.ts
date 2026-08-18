@@ -44,8 +44,8 @@ import { join, resolve } from "node:path";
 
 import { type } from "arktype";
 
-import type { EvidenceBundle } from "@ar.io/anchor";
-import type { InterchangeAnchorEvent } from "@ar.io/anchor-interchange";
+import type { EvidenceBundle } from "@sanning/anchor";
+import type { InterchangeAnchorEvent } from "@sanning/anchor-interchange";
 import { defaultContextDir } from "@intx/example-agent-common";
 
 import {
