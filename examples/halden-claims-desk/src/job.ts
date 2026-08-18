@@ -12,7 +12,7 @@
 // liability") is the whole voice of the house.
 //
 // Two kernels, dispatched by the pack's own spec_version: `sanning.*`
-// packs verify with the vendored @sanning/proof kernel, `ario.*` packs
+// packs verify with the published @sanning/proof kernel, `ario.*` packs
 // with the published @ar.io/proof kernel. Both verifications are local
 // math over fetched bytes; no credential is sent anywhere.
 
@@ -27,7 +27,11 @@ import { verifyEvidenceBundle as verifySanningBundle } from "@sanning/proof";
 
 import { stringTool, type AgentTool, type BaseEnv } from "@intx/agent";
 
-const FIXTURES = join(fileURLToPath(new URL(".", import.meta.url)), "..", "fixtures");
+const FIXTURES = join(
+  fileURLToPath(new URL(".", import.meta.url)),
+  "..",
+  "fixtures",
+);
 const loadFixture = (name: string): string =>
   readFileSync(join(FIXTURES, name), "utf8");
 
@@ -203,12 +207,14 @@ function decisionLinesFrom(texts: (string | null)[]): string | null {
 /**
  * Fetch an evidence pack (`<packUrl>/pack/bundle.json` +
  * `<packUrl>/logs-mapping.json`) and verify it OFFLINE with the kernel
- * its own spec_version names: `sanning.*` → the vendored @sanning/proof,
+ * its own spec_version names: `sanning.*` → the published @sanning/proof,
  * `ario.*` → the published @ar.io/proof. Network is used only to FETCH
  * the pack; the verification is local math, and no Sanning credential
  * exists anywhere in this example.
  */
-export async function verifyPackAtUrl(packUrl: string): Promise<PackVerification> {
+export async function verifyPackAtUrl(
+  packUrl: string,
+): Promise<PackVerification> {
   const base = packUrl.replace(/\/+$/, "");
   const get = async (path: string): Promise<unknown> => {
     const res = await fetch(`${base}${path}`);
@@ -244,7 +250,7 @@ export async function verifyPackAtUrl(packUrl: string): Promise<PackVerification
   let kernel: string | null;
   let rawResult: unknown;
   if (specVersion?.startsWith("sanning.") === true) {
-    kernel = "@sanning/proof 0.4.0 (vendored)";
+    kernel = "@sanning/proof 0.4.1 (npm)";
     rawResult = await verifySanningBundle(bundle, { content });
   } else if (specVersion?.startsWith("ario.") === true) {
     kernel = "@ar.io/proof 0.3.0 (npm)";
@@ -279,7 +285,11 @@ export async function verifyPackAtUrl(packUrl: string): Promise<PackVerification
   // verified pack: the desk does not read what did not verify.
   const records: PackRecordSummary[] = [];
   const texts: (string | null)[] = [];
-  if (verified && !(shaped instanceof type.errors) && shaped.body !== undefined) {
+  if (
+    verified &&
+    !(shaped instanceof type.errors) &&
+    shaped.body !== undefined
+  ) {
     for (const [i, ev] of shaped.body.events.entries()) {
       const text = disclosedText(ev.content, logs[ev.envelope.event_id]);
       texts.push(text);
@@ -359,7 +369,8 @@ export function buildDeskTools(ctx: DeskCaseContext): AgentTool[] {
           properties: {
             packUrl: {
               type: "string",
-              description: "The pack's base URL, exactly as given in the assignment.",
+              description:
+                "The pack's base URL, exactly as given in the assignment.",
             },
           },
           required: ["packUrl"],
@@ -367,7 +378,8 @@ export function buildDeskTools(ctx: DeskCaseContext): AgentTool[] {
         },
       },
       handler: async (args) => {
-        const packUrl = typeof args["packUrl"] === "string" ? args["packUrl"] : "";
+        const packUrl =
+          typeof args["packUrl"] === "string" ? args["packUrl"] : "";
         observe({ kind: "tool_start", tool: "verify_evidence_pack" });
         if (packUrl === "") {
           return JSON.stringify({
@@ -403,7 +415,11 @@ export function buildDeskTools(ctx: DeskCaseContext): AgentTool[] {
             checkpointTxIds: [],
             errors: [message],
           });
-          return JSON.stringify({ verdict: "unavailable", packUrl, error: message });
+          return JSON.stringify({
+            verdict: "unavailable",
+            packUrl,
+            error: message,
+          });
         }
       },
     }),
@@ -413,7 +429,11 @@ export function buildDeskTools(ctx: DeskCaseContext): AgentTool[] {
         description:
           "Read the recovery demand exactly as received at the desk, " +
           "including the sender's theory of liability and the amount demanded.",
-        inputSchema: { type: "object", properties: {}, additionalProperties: false },
+        inputSchema: {
+          type: "object",
+          properties: {},
+          additionalProperties: false,
+        },
       },
       handler: async () => {
         observe({ kind: "tool_start", tool: "read_demand_letter" });
@@ -427,7 +447,11 @@ export function buildDeskTools(ctx: DeskCaseContext): AgentTool[] {
           "Read our insured's commercial general liability policy with " +
           "Halden (limits, period, conditions — including the desk's " +
           "authority and the no-voluntary-admission condition).",
-        inputSchema: { type: "object", properties: {}, additionalProperties: false },
+        inputSchema: {
+          type: "object",
+          properties: {},
+          additionalProperties: false,
+        },
       },
       handler: async () => {
         observe({ kind: "tool_start", tool: "read_policy_certificate" });
@@ -442,7 +466,11 @@ export function buildDeskTools(ctx: DeskCaseContext): AgentTool[] {
           "and field-inspection language, quoted verbatim from the disclosed " +
           "records of the sender's adjudication pack. Usable only after that " +
           "pack has verified.",
-        inputSchema: { type: "object", properties: {}, additionalProperties: false },
+        inputSchema: {
+          type: "object",
+          properties: {},
+          additionalProperties: false,
+        },
       },
       handler: async () => {
         observe({ kind: "tool_start", tool: "read_fnol_extract" });
@@ -517,7 +545,11 @@ export function buildDeskTools(ctx: DeskCaseContext): AgentTool[] {
           "Admit liability for the demand on behalf of our insured. " +
           "Reserved to supervising counsel under the policy's " +
           "no-voluntary-admission condition; authorization denies this desk.",
-        inputSchema: { type: "object", properties: {}, additionalProperties: false },
+        inputSchema: {
+          type: "object",
+          properties: {},
+          additionalProperties: false,
+        },
       },
       handler: async () => {
         throw new Error("unreachable — authorization denies this tool");

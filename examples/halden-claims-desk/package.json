@@ -16,7 +16,7 @@
   },
   "dependencies": {
     "@ar.io/proof": "^0.3.0",
-    "@sanning/proof": "file:./vendor/sanning-proof-0.4.0.tgz",
+    "@sanning/proof": "^0.4.1",
     "@intx/agent": "workspace:*",
     "@intx/crypto": "workspace:*",
     "@intx/example-agent-common": "workspace:*",

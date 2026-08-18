@@ -102,14 +102,14 @@
       "name": "@intx/example-agent-anchored-audit",
       "version": "0.2.2",
       "dependencies": {
-        "@ar.io/anchor": "file:./vendor/ar.io-anchor-0.2.0.tgz",
-        "@ar.io/anchor-interchange": "file:./vendor/ar.io-anchor-interchange-0.2.0.tgz",
         "@intx/agent": "workspace:*",
         "@intx/crypto": "workspace:*",
         "@intx/example-agent-common": "workspace:*",
         "@intx/storage-isogit": "workspace:*",
         "@intx/types": "workspace:*",
-        "@sanning/proof": "file:./vendor/sanning-proof-0.4.0.tgz",
+        "@sanning/anchor": "^0.4.0",
+        "@sanning/anchor-interchange": "file:./vendor/sanning-anchor-interchange-0.4.0.tgz",
+        "@sanning/proof": "^0.4.1",
         "arktype": "catalog:",
       },
     },
@@ -240,7 +240,7 @@
         "@intx/example-agent-common": "workspace:*",
         "@intx/storage-isogit": "workspace:*",
         "@intx/types": "workspace:*",
-        "@sanning/proof": "file:./vendor/sanning-proof-0.4.0.tgz",
+        "@sanning/proof": "^0.4.1",
         "arktype": "catalog:",
       },
     },
@@ -687,10 +687,6 @@
   },
   "packages": {
     "@antfu/ni": ["@antfu/ni@25.0.0", "", { "dependencies": { "ansis": "^4.0.0", "fzf": "^0.5.2", "package-manager-detector": "^1.3.0", "tinyexec": "^1.0.1" }, "bin": { "na": "bin/na.mjs", "ni": "bin/ni.mjs", "nr": "bin/nr.mjs", "nci": "bin/nci.mjs", "nlx": "bin/nlx.mjs", "nun": "bin/nun.mjs", "nup": "bin/nup.mjs" } }, "sha512-9q/yCljni37pkMr4sPrI3G4jqdIk074+iukc5aFJl7kmDCCsiJrbZ6zKxnES1Gwg+i9RcDZwvktl23puGslmvA=="],
-
-    "@ar.io/anchor": ["@ar.io/anchor@./vendor/ar.io-anchor-0.2.0.tgz", { "dependencies": { "@ar.io/proof": "^0.2.0", "@noble/ed25519": "^2.1.0", "@noble/hashes": "^1.8.0" } }],
-
-    "@ar.io/anchor-interchange": ["@ar.io/anchor-interchange@./vendor/ar.io-anchor-interchange-0.2.0.tgz", { "dependencies": { "@ar.io/anchor": "^0.2.0" }, "peerDependencies": { "@intx/types": "^0.2.2" } }],
 
     "@ar.io/proof": ["@ar.io/proof@0.3.0", "", { "dependencies": { "@noble/ed25519": "^2.1.0", "canonicalize": "^2.0.0" }, "bin": { "proof": "dist/cli.js" } }, "sha512-1bZf4Csk0qTxHlIG+lpCDgPfWhyYpcHPw2taJOxK9jT3wpYlVJTwuf50dp8185ZZPvu3Xiupw0bpwqNo75v8jQ=="],
 
@@ -1212,7 +1208,11 @@
 
     "@rollup/rollup-win32-x64-msvc": ["@rollup/rollup-win32-x64-msvc@4.60.4", "", { "os": "win32", "cpu": "x64" }, "sha512-QVTUovf40zgTqlFVrKA1uXMVvU2QWEFWfAH8Wdc48IxLvrJMQVMBRjuQyUpzZCDkakImib9eVazbWlC6ksWtJw=="],
 
-    "@sanning/proof": ["@sanning/proof@./vendor/sanning-proof-0.4.0.tgz", { "dependencies": { "@noble/ed25519": "^2.1.0", "canonicalize": "^2.0.0" }, "bin": { "proof": "./dist/cli.js" } }],
+    "@sanning/anchor": ["@sanning/anchor@0.4.0", "", { "dependencies": { "@noble/ed25519": "^2.1.0", "@noble/hashes": "^1.8.0", "@sanning/proof": "^0.4.0" } }, "sha512-++P6p1Jg3+/6Cdqid8AzyetA5O0AQZSg4KVdt1nfYAYhZIuyUdMBSWpYALDFvTyd13BwI1GEjVafrAAiJz8h2Q=="],
+
+    "@sanning/anchor-interchange": ["@sanning/anchor-interchange@./vendor/sanning-anchor-interchange-0.4.0.tgz", { "dependencies": { "@sanning/anchor": "^0.4.0" }, "peerDependencies": { "@intx/types": "^0.2.2" } }],
+
+    "@sanning/proof": ["@sanning/proof@0.4.1", "", { "dependencies": { "@noble/ed25519": "^2.1.0", "canonicalize": "^2.0.0" }, "bin": { "proof": "dist/cli.js" } }, "sha512-8FbLUrr6HjzPfKxj/QJccf96li6DNgjGfNaXmaZycsXHwnbUsZroa6NatD2slEb6vpP7wBiTqWgSvU3Ls9nzmQ=="],
 
     "@sec-ant/readable-stream": ["@sec-ant/readable-stream@0.4.1", "", {}, "sha512-831qok9r2t8AlxLko40y2ebgSDhenenCatLVeW/uBtnHPyhHOvG0C7TvfgecV+wHzIm5KUICgzmVpWS+IMEAeg=="],
 
@@ -2234,12 +2234,6 @@
 
     "zx": ["zx@8.8.5", "", { "bin": { "zx": "build/cli.js" } }, "sha512-SNgDF5L0gfN7FwVOdEFguY3orU5AkfFZm9B5YSHog/UDHv+lvmd82ZAsOenOkQixigwH2+yyH198AwNdKhj+RA=="],
 
-    "@ar.io/anchor/@ar.io/proof": ["@ar.io/proof@0.2.2", "", { "dependencies": { "@noble/ed25519": "^2.1.0", "canonicalize": "^2.0.0" }, "bin": { "proof": "dist/cli.js" } }, "sha512-PAwoYBpwy7Akk/W9FY2dFRuU97TR8OGXoP1tqLZPr+z+oawPS97YOZ9iX5qjX3nLJOcfY/4vHvoKG5eF4/X7eg=="],
-
-    "@ar.io/anchor/@noble/hashes": ["@noble/hashes@1.8.0", "", {}, "sha512-jCs9ldd7NwzpgXDIf6P3+NrHh9/sD6CQdxHyjQI+h/6rDNo88ypBxxz45UDuZHz9r3tNz7N/VInSVoVdtXEI4A=="],
-
-    "@ar.io/anchor-interchange/@ar.io/anchor": ["@ar.io/anchor@0.2.0", "", { "dependencies": { "@ar.io/proof": "^0.2.0", "@noble/ed25519": "^2.1.0", "@noble/hashes": "^1.8.0" } }, "sha512-cQwjDlAolDfqOh9Mwvj7OxNYtND8pyO1XR7HGDKd4ydZW9dPFReSWxZkcSlzl08ZOGbzEWuCBut6XsfDCPsexw=="],
-
     "@babel/core/semver": ["semver@6.3.1", "", { "bin": { "semver": "bin/semver.js" } }, "sha512-BR7VvDCVHO+q2xBEWskxS6DJE1qRnb7DxzUrogb71CWoSficBxYsiAGd+Kl0mmq/MprG9yArRkyrQxTO6XjMzA=="],
 
     "@babel/helper-compilation-targets/lru-cache": ["lru-cache@5.1.1", "", { "dependencies": { "yallist": "^3.0.2" } }, "sha512-KpNARQA3Iwv+jTA0utUVVbrh+Jlrr1Fv0e56GGzAFOXN7dk/FviaDW8LHmK52DlcH4WP2n6gI8vN1aesBFgo9w=="],
@@ -2269,6 +2263,8 @@
     "@noble/curves/@noble/hashes": ["@noble/hashes@1.8.0", "", {}, "sha512-jCs9ldd7NwzpgXDIf6P3+NrHh9/sD6CQdxHyjQI+h/6rDNo88ypBxxz45UDuZHz9r3tNz7N/VInSVoVdtXEI4A=="],
 
     "@npmcli/agent/lru-cache": ["lru-cache@11.5.1", "", {}, "sha512-RPimw/7aMdv2oqRrxKwvZXcPfwBrn/JZ2xYcY9Hus/6LaS3VOAKVWKWgNLCFSiOm1ESXinjsDlidVU7JlnCN2A=="],
+
+    "@sanning/anchor/@noble/hashes": ["@noble/hashes@1.8.0", "", {}, "sha512-jCs9ldd7NwzpgXDIf6P3+NrHh9/sD6CQdxHyjQI+h/6rDNo88ypBxxz45UDuZHz9r3tNz7N/VInSVoVdtXEI4A=="],
 
     "@tailwindcss/node/jiti": ["jiti@2.7.0", "", { "bin": { "jiti": "lib/jiti-cli.mjs" } }, "sha512-AC/7JofJvZGrrneWNaEnJeOLUx+JlGt7tNa0wZiRPT4MY1wmfKjt2+6O2p2uz2+skll8OZZmJMNqeke7kKbNgQ=="],
 
@@ -2361,10 +2357,6 @@
     "wrap-ansi/strip-ansi": ["strip-ansi@6.0.1", "", { "dependencies": { "ansi-regex": "^5.0.1" } }, "sha512-Y38VPSHcqkFrCpFnQ9vuSXmquuv5oXOKpGeT6aGrr3o3Gc9AlVa6JBfUSOCnbxGGZF+/0ooI7KrPuUSztUdU5A=="],
 
     "yargs/string-width": ["string-width@4.2.3", "", { "dependencies": { "emoji-regex": "^8.0.0", "is-fullwidth-code-point": "^3.0.0", "strip-ansi": "^6.0.1" } }, "sha512-wKyQRQpjJ0sIp62ErSZdGsjMJWsap5oRNihHhu6G7JVO/9jIB6UyevL+tXuOqrng8j/cxKTWyWUwvSTriiZz/g=="],
-
-    "@ar.io/anchor-interchange/@ar.io/anchor/@ar.io/proof": ["@ar.io/proof@0.2.2", "", { "dependencies": { "@noble/ed25519": "^2.1.0", "canonicalize": "^2.0.0" }, "bin": { "proof": "dist/cli.js" } }, "sha512-PAwoYBpwy7Akk/W9FY2dFRuU97TR8OGXoP1tqLZPr+z+oawPS97YOZ9iX5qjX3nLJOcfY/4vHvoKG5eF4/X7eg=="],
-
-    "@ar.io/anchor-interchange/@ar.io/anchor/@noble/hashes": ["@noble/hashes@1.8.0", "", {}, "sha512-jCs9ldd7NwzpgXDIf6P3+NrHh9/sD6CQdxHyjQI+h/6rDNo88ypBxxz45UDuZHz9r3tNz7N/VInSVoVdtXEI4A=="],
 
     "@babel/helper-compilation-targets/lru-cache/yallist": ["yallist@3.1.1", "", {}, "sha512-a4UGQaWPH59mOXUYnAG2ewncQS4i4F43Tv3JoAM+s2VDAmS9NsK8GpDMLrCHPksFT7h3K6TOoUNn2pb7RoXx4g=="],
 

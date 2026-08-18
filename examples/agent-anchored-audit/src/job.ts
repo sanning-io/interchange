@@ -11,7 +11,7 @@
 //
 // The verify step is the handoff moment between two evidence planes:
 // the upstream pack was produced by Meridian's claims-demo estate on the
-// sanning.* wire IDs, so THIS agent verifies it with the same vendored
+// sanning.* wire IDs, so THIS agent verifies it with the same published
 // @sanning/proof kernel (programmatic API, offline) before acting on it.
 // No verified pack — no recovery work: the refusal is the required
 // behavior, and the refusal itself becomes anchored evidence.
@@ -24,7 +24,11 @@ import { verifyEvidenceBundle } from "@sanning/proof";
 
 import { stringTool, type BaseEnv } from "@intx/agent";
 
-const FIXTURES = join(fileURLToPath(new URL(".", import.meta.url)), "..", "fixtures");
+const FIXTURES = join(
+  fileURLToPath(new URL(".", import.meta.url)),
+  "..",
+  "fixtures",
+);
 const loadFixture = (name: string): string =>
   readFileSync(join(FIXTURES, name), "utf8");
 
@@ -70,12 +74,14 @@ function upstreamDecisionFrom(logs: Record<string, string>): string | null {
 
 /**
  * Fetch a claims-demo evidence pack (`<packUrl>/pack/bundle.json` +
- * `<packUrl>/logs-mapping.json`) and verify it OFFLINE with the vendored
+ * `<packUrl>/logs-mapping.json`) and verify it OFFLINE with the published
  * @sanning/proof kernel — signature, payload binding, Merkle inclusion,
  * and disclosed-content hashes. Network is used only to FETCH the pack;
  * the verification itself is local math.
  */
-export async function verifyPackAtUrl(packUrl: string): Promise<PackVerification> {
+export async function verifyPackAtUrl(
+  packUrl: string,
+): Promise<PackVerification> {
   const base = packUrl.replace(/\/+$/, "");
   const get = async (path: string): Promise<unknown> => {
     const res = await fetch(`${base}${path}`);
@@ -185,7 +191,8 @@ export const recoveryTools = [
       },
     },
     handler: async (args) => {
-      const packUrl = typeof args["packUrl"] === "string" ? args["packUrl"] : "";
+      const packUrl =
+        typeof args["packUrl"] === "string" ? args["packUrl"] : "";
       if (packUrl === "") {
         return JSON.stringify({
           verdict: "unavailable",
@@ -210,7 +217,11 @@ export const recoveryTools = [
       description:
         "Read the post-payment cause-and-origin investigation report for the " +
         "fire claim: origin, refined cause, and the identified liable party.",
-      inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      inputSchema: {
+        type: "object",
+        properties: {},
+        additionalProperties: false,
+      },
     },
     handler: async () => loadFixture("investigation-CLM-2026-3105.json"),
   }),
@@ -220,7 +231,11 @@ export const recoveryTools = [
       description:
         "Read the policy's subrogation and recovery clause: demand basis, " +
         "pursue/decline thresholds, and the authority rules for issuance.",
-      inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      inputSchema: {
+        type: "object",
+        properties: {},
+        additionalProperties: false,
+      },
     },
     handler: async () => loadFixture("recovery-clause-HO-77341-2024.json"),
   }),
@@ -230,7 +245,11 @@ export const recoveryTools = [
       description:
         "Read the payout record for the claim: adjudicated decision, amount " +
         "paid, deductible, payment details, and the recovery referral.",
-      inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      inputSchema: {
+        type: "object",
+        properties: {},
+        additionalProperties: false,
+      },
     },
     handler: async () => loadFixture("payout-CLM-2026-3105.json"),
   }),
@@ -244,9 +263,15 @@ export const recoveryTools = [
       inputSchema: {
         type: "object",
         properties: {
-          target: { type: "string", description: "The liable party the demand addresses." },
+          target: {
+            type: "string",
+            description: "The liable party the demand addresses.",
+          },
           amount: { type: "number", description: "The demand amount in USD." },
-          basis: { type: "string", description: "One-paragraph liability basis for the demand." },
+          basis: {
+            type: "string",
+            description: "One-paragraph liability basis for the demand.",
+          },
         },
         required: ["target", "amount", "basis"],
         additionalProperties: false,
@@ -280,7 +305,11 @@ export const recoveryTools = [
       name: BLOCKED_TOOL,
       description:
         "Issue (send) the drafted recovery demand letter to the liable party.",
-      inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      inputSchema: {
+        type: "object",
+        properties: {},
+        additionalProperties: false,
+      },
     },
     handler: async () => {
       throw new Error("unreachable — authorization denies this tool");
@@ -346,7 +375,9 @@ Plain language; supervising counsel reads this first.>`;
 
 /** The run prompt: the assignment handed to the specialist. `packUrl`
  *  absent is a legitimate input — the required outcome is a refusal. */
-export function buildRunPrompt(opts: { caseRef?: string; packUrl?: string } = {}): string {
+export function buildRunPrompt(
+  opts: { caseRef?: string; packUrl?: string } = {},
+): string {
   const caseRef = opts.caseRef ?? DEFAULT_CASE_REF;
   const packLine =
     opts.packUrl !== undefined && opts.packUrl !== ""

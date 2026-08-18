@@ -7,7 +7,13 @@
 // Shapes are arktype-defined and validated on load (per repo
 // convention: validated, not asserted).
 
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 
 import { type } from "arktype";
@@ -173,7 +179,11 @@ export function loadCases(contextDir: string): DeskCase[] {
     }
     // Cases persisted before the identifier flow lack the newer fields;
     // default them so the record stays loadable across the change.
-    if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+    if (
+      parsed !== null &&
+      typeof parsed === "object" &&
+      !Array.isArray(parsed)
+    ) {
       parsed = { claimRef: null, lossDate: null, request: null, ...parsed };
     }
     const validated = DeskCase(parsed);

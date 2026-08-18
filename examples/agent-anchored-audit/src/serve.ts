@@ -9,7 +9,7 @@
 // records; ASSEMBLING evidence needs neither. Assembly reads the
 // durable retention trail (`anchor/proofs.jsonl` + `anchor/logs/`),
 // reconstructs the inclusion receipts for the requested window, and
-// has the persisted identity sign one `ario.evidence/v1` bundle — no
+// has the persisted identity sign one `sanning.evidence/v1` bundle — no
 // model call, no network write, no new anchors. That is what lets an
 // approved evidence request be fulfilled long after the sessions that
 // produced the evidence are gone.
@@ -44,8 +44,8 @@ import { join, resolve } from "node:path";
 
 import { type } from "arktype";
 
-import type { EvidenceBundle } from "@ar.io/anchor";
-import type { InterchangeAnchorEvent } from "@ar.io/anchor-interchange";
+import type { EvidenceBundle } from "@sanning/anchor";
+import type { InterchangeAnchorEvent } from "@sanning/anchor-interchange";
 import { defaultContextDir } from "@intx/example-agent-common";
 
 import {
@@ -475,7 +475,9 @@ export function serve(opts: ServeOptions = {}) {
             sessionIds: [sessionId],
           });
           if (receipts.length === 0) {
-            return json(404, { error: `no anchored receipts for session ${sessionId}` });
+            return json(404, {
+              error: `no anchored receipts for session ${sessionId}`,
+            });
           }
           const identity = await createExampleIdentity(contextDir);
           const anchorer = createExampleAnchorer(contextDir, env, identity);
@@ -504,8 +506,7 @@ export function serve(opts: ServeOptions = {}) {
           });
           if (receipts.length === 0) {
             return json(404, {
-              error:
-                "no anchored receipts match the requested window/sessions",
+              error: "no anchored receipts match the requested window/sessions",
             });
           }
 

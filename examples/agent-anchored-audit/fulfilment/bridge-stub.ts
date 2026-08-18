@@ -27,8 +27,16 @@ const EMAIL = process.env["HUB_ADMIN_EMAIL"] ?? "alice@example.com";
 const PASSWORD = process.env["HUB_ADMIN_PASSWORD"] ?? "password123";
 
 const coords = JSON.parse(
-  readFileSync(join(REPO_ROOT, "tmp", "sanning-fulfilment-deploy.json"), "utf8"),
-) as { base: string; tenantId: string; deploymentId: string; mailAddress: string };
+  readFileSync(
+    join(REPO_ROOT, "tmp", "sanning-fulfilment-deploy.json"),
+    "utf8",
+  ),
+) as {
+  base: string;
+  tenantId: string;
+  deploymentId: string;
+  mailAddress: string;
+};
 
 const BASE = coords.base;
 const TENANT = coords.tenantId;

@@ -15,14 +15,14 @@
     "serve": "bun --conditions=intx-src run src/serve.ts"
   },
   "dependencies": {
-    "@ar.io/anchor": "file:./vendor/ar.io-anchor-0.2.0.tgz",
-    "@ar.io/anchor-interchange": "file:./vendor/ar.io-anchor-interchange-0.2.0.tgz",
-    "@sanning/proof": "file:./vendor/sanning-proof-0.4.0.tgz",
     "@intx/agent": "workspace:*",
     "@intx/crypto": "workspace:*",
     "@intx/example-agent-common": "workspace:*",
     "@intx/storage-isogit": "workspace:*",
     "@intx/types": "workspace:*",
+    "@sanning/anchor": "^0.4.0",
+    "@sanning/anchor-interchange": "file:./vendor/sanning-anchor-interchange-0.4.0.tgz",
+    "@sanning/proof": "^0.4.1",
     "arktype": "catalog:"
   }
 }
