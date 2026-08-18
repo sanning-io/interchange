@@ -27,7 +27,7 @@ Everything about the job lives in [`src/job.ts`](src/job.ts) and
    The refusal is anchored evidence too.
 2. **The casefile** (deterministic reads over fixtures): the
    cause-and-origin investigation report (faulty rewiring by the
-   fictional contractor *Hollis & Verne Electrical* caused the fire),
+   fictional contractor _Hollis & Verne Electrical_ caused the fire),
    the policy's subrogation clause, and the payout record.
 3. **Decide, draft, and be denied.** The specialist decides
    PURSUE/DECLINE per the clause, drafts the demand letter
@@ -110,17 +110,17 @@ The same composition also runs as a small resident HTTP service
 
 #### Service-mode environment
 
-| Variable | Required | What it does |
-| --- | --- | --- |
-| `OPENROUTER_API_KEY` | for `POST /run` | service mode's inference source (the CLI also accepts `ANTHROPIC_API_KEY`; the service is OpenRouter-only) |
-| `OPENROUTER_MODEL` | no | model override (default `anthropic/claude-haiku-4.5`) |
-| `PORT` | no | deploy platforms (Railway) inject it; wins over the next row |
-| `SANNING_AGENT_SERVICE_PORT` | no | the example's own port override (default `4610`) |
-| `SANNING_CONTEXT_DIR` | no | where persistent state lives — `identity.json`, `wallet.json`, the `anchor/` retention trail (default `<repo-root>/tmp/agent-anchored-audit/context`); on hosted deploys point it at a mounted volume |
-| `DEMO_PASSCODE` | no | when set, `POST /run` and `POST /assemble` require it (`?key=` or an `x-demo-key` header); unset = open, the local default |
-| `SANNING_API_KEY` | no | production anchoring via the control plane (unset = dev mode; see below) |
-| `SANNING_DEV_UPLOAD_URL` | no | dev-mode mock upload front for a fully local loop |
-| `SANNING_PRODUCER_ID` · `SANNING_AGENT_NAME` · `SANNING_DISPLAY_NAME` · `SANNING_CONTROL_PLANE_URL` | no | keyed-mode extras (see “Anchoring modes”) |
+| Variable                                                                                            | Required        | What it does                                                                                                                                                                                          |
+| --------------------------------------------------------------------------------------------------- | --------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `OPENROUTER_API_KEY`                                                                                | for `POST /run` | service mode's inference source (the CLI also accepts `ANTHROPIC_API_KEY`; the service is OpenRouter-only)                                                                                            |
+| `OPENROUTER_MODEL`                                                                                  | no              | model override (default `anthropic/claude-haiku-4.5`)                                                                                                                                                 |
+| `PORT`                                                                                              | no              | deploy platforms (Railway) inject it; wins over the next row                                                                                                                                          |
+| `SANNING_AGENT_SERVICE_PORT`                                                                        | no              | the example's own port override (default `4610`)                                                                                                                                                      |
+| `SANNING_CONTEXT_DIR`                                                                               | no              | where persistent state lives — `identity.json`, `wallet.json`, the `anchor/` retention trail (default `<repo-root>/tmp/agent-anchored-audit/context`); on hosted deploys point it at a mounted volume |
+| `DEMO_PASSCODE`                                                                                     | no              | when set, `POST /run` and `POST /assemble` require it (`?key=` or an `x-demo-key` header); unset = open, the local default                                                                            |
+| `SANNING_API_KEY`                                                                                   | no              | production anchoring via the control plane (unset = dev mode; see below)                                                                                                                              |
+| `SANNING_DEV_UPLOAD_URL`                                                                            | no              | dev-mode mock upload front for a fully local loop                                                                                                                                                     |
+| `SANNING_PRODUCER_ID` · `SANNING_AGENT_NAME` · `SANNING_DISPLAY_NAME` · `SANNING_CONTROL_PLANE_URL` | no              | keyed-mode extras (see “Anchoring modes”)                                                                                                                                                             |
 
 #### Docker
 
@@ -204,7 +204,7 @@ verify it anywhere — no repo access, no agent, no write SDK:
   npx @ar.io/proof verify <contextDir>/trace-bundle.json
 ```
 
-**Where the files land:** not in this folder — like every agent-*
+**Where the files land:** not in this folder — like every agent-\*
 example, output goes to `<repo-root>/tmp/agent-anchored-audit/context/`
 (the run prints the full path). In there: `state/audit/` (the git
 logbook), `anchor/` (durable proofs + retained bytes),
@@ -232,8 +232,8 @@ It recomputes every record's signature, payload binding, and Merkle
 inclusion — and, because the bundle **discloses the raw records
 in-body**, it also recomputes each disclosed record's `SHA-256` against
 the committed `content_hash` (the `logs ✓` marks, `@ar.io/proof` ≥
-0.3.0). The auditor doesn't just verify *that* two tool calls happened;
-they read *what* the calls were — the blocked deletion included — and
+0.3.0). The auditor doesn't just verify _that_ two tool calls happened;
+they read _what_ the calls were — the blocked deletion included — and
 every byte of it is bound to the on-chain checkpoint. Drag-and-drop
 bundle viewers built on `verifyEvidenceBundle` show the same thing with
 full content coverage.

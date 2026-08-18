@@ -99,7 +99,11 @@ function envPort(env: NodeJS.ProcessEnv): number | null {
   return null;
 }
 
-const ASSETS = join(fileURLToPath(new URL(".", import.meta.url)), "..", "assets");
+const ASSETS = join(
+  fileURLToPath(new URL(".", import.meta.url)),
+  "..",
+  "assets",
+);
 
 // A demand is filed with its IDENTIFIERS — claim reference and loss
 // date; evidence arrives separately, by request. `packUrls` is the
@@ -170,7 +174,8 @@ export function serve(opts: ServeOptions = {}) {
   let fileSeq = 411;
   for (const c of cases) {
     const m = c.fileRef.match(/^HIC-2026-(\d+)$/);
-    if (m !== null) fileSeq = Math.max(fileSeq, Number.parseInt(m[1] ?? "0", 10));
+    if (m !== null)
+      fileSeq = Math.max(fileSeq, Number.parseInt(m[1] ?? "0", 10));
   }
   const nextFileRef = (): string => {
     fileSeq += 1;
@@ -429,7 +434,10 @@ export function serve(opts: ServeOptions = {}) {
     async fetch(req) {
       const url = new URL(req.url);
 
-      if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html")) {
+      if (
+        req.method === "GET" &&
+        (url.pathname === "/" || url.pathname === "/index.html")
+      ) {
         return new Response(pageHtml, {
           headers: { "Content-Type": "text/html; charset=utf-8" },
         });
@@ -448,7 +456,8 @@ export function serve(opts: ServeOptions = {}) {
           ok: true,
           service: EXAMPLE_NAME,
           desk: DESK_WORKER,
-          verifies: "sanning.* and ario.* evidence packs, public kernels, no account",
+          verifies:
+            "sanning.* and ario.* evidence packs, public kernels, no account",
           anchors: false,
           blockedTool: BLOCKED_TOOL,
           publicKey: Buffer.from(identity.getPublicKey()).toString("hex"),

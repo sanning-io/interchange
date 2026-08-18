@@ -71,7 +71,9 @@ const DEFAULT_DISPLAY_NAME = "Meridian Mutual — Recovery";
 
 export function rosterDisplayName(env: NodeJS.ProcessEnv): string {
   const fromEnv = env["SANNING_DISPLAY_NAME"];
-  return fromEnv !== undefined && fromEnv !== "" ? fromEnv : DEFAULT_DISPLAY_NAME;
+  return fromEnv !== undefined && fromEnv !== ""
+    ? fromEnv
+    : DEFAULT_DISPLAY_NAME;
 }
 
 // OpenRouter rides Interchange's OpenAI-compatible adapter: same wire
@@ -482,7 +484,8 @@ export function loadReceiptsFromSink(
   const checkpoints = new Map<string, RetainedCheckpoint>();
   const events = new Map<string, RetainedEvent>();
   for (const row of rows) {
-    if (row.type === "checkpoint") checkpoints.set(row.checkpoint.txId, row.checkpoint);
+    if (row.type === "checkpoint")
+      checkpoints.set(row.checkpoint.txId, row.checkpoint);
     else if (row.type === "event") events.set(row.event.eventId, row.event);
   }
 

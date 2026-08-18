@@ -475,7 +475,9 @@ export function serve(opts: ServeOptions = {}) {
             sessionIds: [sessionId],
           });
           if (receipts.length === 0) {
-            return json(404, { error: `no anchored receipts for session ${sessionId}` });
+            return json(404, {
+              error: `no anchored receipts for session ${sessionId}`,
+            });
           }
           const identity = await createExampleIdentity(contextDir);
           const anchorer = createExampleAnchorer(contextDir, env, identity);
@@ -504,8 +506,7 @@ export function serve(opts: ServeOptions = {}) {
           });
           if (receipts.length === 0) {
             return json(404, {
-              error:
-                "no anchored receipts match the requested window/sessions",
+              error: "no anchored receipts match the requested window/sessions",
             });
           }
 

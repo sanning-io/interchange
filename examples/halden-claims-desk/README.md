@@ -5,7 +5,7 @@ Chapter two of the claims-demo story — **the counterparty**.
 [`agent-anchored-audit`](../agent-anchored-audit/README.md) hosts
 Meridian Mutual's recovery specialist: it verifies the upstream
 adjudication, decides to pursue, drafts a $46,500 demand against the
-electrical contractor *Hollis & Verne Electrical* — and is denied the
+electrical contractor _Hollis & Verne Electrical_ — and is denied the
 send, which goes to supervising counsel. This example is the desk that
 demand LANDS ON: the **Halden Indemnity Company** (Hartford, est.
 1908), Hollis & Verne's commercial-liability insurer, receiving another
@@ -61,7 +61,7 @@ desk earns color until it verifies).
    A pack that does not verify is not evidence.
 4. **Compare.** The demand's theory (negligent electrical work) is read
    against the sender's own verified record: Meridian's first notice of
-   loss describes a *stovetop fire*, its field inspection recorded the
+   loss describes a _stovetop fire_, its field inspection recorded the
    wiring intact, and the junction-box refinement arrives only in a
    post-payment examination Meridian commissioned itself
    ([`fixtures/fnol-extract-FNOL-2026-3105.json`](fixtures/fnol-extract-FNOL-2026-3105.json)
@@ -98,15 +98,15 @@ Override the model with `OPENROUTER_MODEL` (default
 
 ### Environment
 
-| Variable | Required | What it does |
-| --- | --- | --- |
-| `OPENROUTER_API_KEY` | to work cases | the desk agent's inference source (a filed demand errors politely without it) |
-| `OPENROUTER_MODEL` | no | model override (default `anthropic/claude-haiku-4.5`) |
-| `PORT` | no | deploy platforms (Railway) inject it; wins over the next row |
-| `HALDEN_DESK_PORT` | no | the example's own port override (default `4620`) |
-| `SANNING_CONTEXT_DIR` | no | where persistent state lives — `identity.json`, `cases/`, `files/<ref>/` logbooks (default `<repo-root>/tmp/halden-claims-desk/context`); on hosted deploys point it at a mounted volume |
-| `MERIDIAN_WORKBENCH_URL` | no | where the desk pulls incoming demands from and resolves evidence requests against (default `http://localhost:4601`, the local claims-demo Workbench); on hosted deploys point it at the hosted Workbench |
-| `DEMO_PASSCODE` | no | when set, the endpoints that mutate the desk (`/fetch-demand`, `/file-demand`, `/request-evidence`, `DELETE /case/:file`) require it — `?key=` or an `x-demo-key` header; the page prompts once and keeps it for the tab session. Unset = open, the local default |
+| Variable                 | Required      | What it does                                                                                                                                                                                                                                                      |
+| ------------------------ | ------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `OPENROUTER_API_KEY`     | to work cases | the desk agent's inference source (a filed demand errors politely without it)                                                                                                                                                                                     |
+| `OPENROUTER_MODEL`       | no            | model override (default `anthropic/claude-haiku-4.5`)                                                                                                                                                                                                             |
+| `PORT`                   | no            | deploy platforms (Railway) inject it; wins over the next row                                                                                                                                                                                                      |
+| `HALDEN_DESK_PORT`       | no            | the example's own port override (default `4620`)                                                                                                                                                                                                                  |
+| `SANNING_CONTEXT_DIR`    | no            | where persistent state lives — `identity.json`, `cases/`, `files/<ref>/` logbooks (default `<repo-root>/tmp/halden-claims-desk/context`); on hosted deploys point it at a mounted volume                                                                          |
+| `MERIDIAN_WORKBENCH_URL` | no            | where the desk pulls incoming demands from and resolves evidence requests against (default `http://localhost:4601`, the local claims-demo Workbench); on hosted deploys point it at the hosted Workbench                                                          |
+| `DEMO_PASSCODE`          | no            | when set, the endpoints that mutate the desk (`/fetch-demand`, `/file-demand`, `/request-evidence`, `DELETE /case/:file`) require it — `?key=` or an `x-demo-key` header; the page prompts once and keeps it for the tab session. Unset = open, the local default |
 
 ### Docker
 

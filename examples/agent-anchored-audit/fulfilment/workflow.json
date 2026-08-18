@@ -30,7 +30,5 @@
       }
     }
   },
-  "stepOrder": [
-    "fulfil"
-  ]
+  "stepOrder": ["fulfil"]
 }
