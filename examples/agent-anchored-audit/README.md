@@ -57,7 +57,7 @@ badges from.
   is a single Arweave transaction, but every record keeps its own
   standalone inclusion proof.
 - **Nothing semantic leaves the process.** Records are hashed locally;
-  the on-chain envelope carries only hashes (`ario.events/v1`, Minimal
+  the on-chain envelope carries only hashes (`sanning.events/v1`, Minimal
   disclosure).
 
 ## Running
@@ -100,7 +100,7 @@ The same composition also runs as a small resident HTTP service
   anchors: reconstructs the inclusion receipts for the requested window
   from the durable retention trail (`anchor/proofs.jsonl` +
   `anchor/logs/`), has the persisted identity sign ONE
-  `ario.evidence/v1` pack (`evidence-pack-<stamp>.json`, raw records
+  `sanning.evidence/v1` pack (`evidence-pack-<stamp>.json`, raw records
   disclosed in-body), and returns its path, sha256 and counts. This is
   the key-holder fulfilling an evidence request **after the fact** —
   the sessions that produced the evidence are long gone.

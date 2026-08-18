@@ -47,7 +47,7 @@ retention trail, and assembly is a purely local act — no model call, no
 network write, no new anchors. Anyone holding the resulting pack runs
 
 ```bash
-npx @ar.io/proof verify evidence-pack-<stamp>.json \
+npx @sanning/proof verify evidence-pack-<stamp>.json \
   https://arweave.net,https://permagate.io,https://console.sanning.io/read
 ```
 

@@ -9,7 +9,7 @@
 // records; ASSEMBLING evidence needs neither. Assembly reads the
 // durable retention trail (`anchor/proofs.jsonl` + `anchor/logs/`),
 // reconstructs the inclusion receipts for the requested window, and
-// has the persisted identity sign one `ario.evidence/v1` bundle — no
+// has the persisted identity sign one `sanning.evidence/v1` bundle — no
 // model call, no network write, no new anchors. That is what lets an
 // approved evidence request be fulfilled long after the sessions that
 // produced the evidence are gone.
