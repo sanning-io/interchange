@@ -151,6 +151,39 @@ function checkOrSkip(
   process.exit(1);
 }
 
+// Fetches every page of a paginated GET endpoint, following nextCursor until
+// it is exhausted. The hub clamps `limit` to 100, so any one-shot list call
+// silently truncates once a collection outgrows a page — the model catalog
+// already does. All list-then-find lookups must go through this.
+async function listAll<T>(
+  path: string,
+  itemSchema: Type<T>,
+  label: string,
+  cookies: CookieJar = [],
+): Promise<T[]> {
+  const schema = paginatedSchema(itemSchema);
+  const items: T[] = [];
+  let cursor: string | null = null;
+  do {
+    const sep = path.includes("?") ? "&" : "?";
+    const page = cursor
+      ? `${path}${sep}limit=100&cursor=${encodeURIComponent(cursor)}`
+      : `${path}${sep}limit=100`;
+    const { status, data } = await api("GET", page, undefined, cookies);
+    if (status !== 200) {
+      process.stderr.write(
+        `[seed] FAIL list ${label}: expected 200, got ${status}\n`,
+      );
+      process.stderr.write(`[seed]   ${JSON.stringify(data)}\n`);
+      process.exit(1);
+    }
+    const parsed = parse(schema, data, label);
+    items.push(...parsed.data);
+    cursor = parsed.nextCursor;
+  } while (cursor !== null);
+  return items;
+}
+
 // A row that a create returned 201 or 409 for must appear in the subsequent
 // list. When it does not, the seed is in an inconsistent state (a create that
 // did not persist, a list that truncated), so fail loudly rather than skip
@@ -255,17 +288,12 @@ async function ensureTenant(
   }
 
   // Already exists -- look up via /me/principals
-  const { data: principals } = await api(
-    "GET",
+  const principalList = await listAll(
     "/api/me/principals",
-    undefined,
+    PrincipalSummary,
+    "me/principals response",
     cookies,
   );
-  const principalList = parse(
-    paginatedSchema(PrincipalSummary),
-    principals,
-    "me/principals response",
-  ).data;
   const match = principalList.find((p) => p.tenantSlug === slug);
 
   if (match) {
@@ -323,17 +351,12 @@ if (regStatus === 201 || regStatus === 409) {
 
 log("Inviting Bob to Acme...");
 
-const { data: rolesData } = await api(
-  "GET",
+const rolesList = await listAll(
   `/api/tenants/${acmeTenantId}/roles`,
-  undefined,
+  RoleResponse,
+  "roles response",
   aliceCookies,
 );
-const rolesList = parse(
-  paginatedSchema(RoleResponse),
-  rolesData,
-  "roles response",
-).data;
 const memberRole = rolesList.find((r) => r.name === "member");
 
 const { status: inviteStatus, data: inviteData } = await api(
@@ -358,17 +381,12 @@ if (checkOrSkip("invite bob", inviteStatus, 201, inviteData)) {
   );
 } else {
   // Already invited -- find Bob's principal
-  const { data: acmePrincipals } = await api(
-    "GET",
+  const acmePrincipalList = await listAll(
     `/api/tenants/${acmeTenantId}/principals`,
-    undefined,
+    PrincipalResponse,
+    "acme principals response",
     aliceCookies,
   );
-  const acmePrincipalList = parse(
-    paginatedSchema(PrincipalResponse),
-    acmePrincipals,
-    "acme principals response",
-  ).data;
   const bobP = acmePrincipalList.find((p) => p.refId === bob.userId);
   bobPrincipalId = bobP?.id ?? "";
 }
@@ -378,17 +396,12 @@ log(`  Bob principal ID: ${bobPrincipalId}`);
 
 log("Inviting Carol to Widgets...");
 
-const { data: widgetRoles } = await api(
-  "GET",
+const widgetRolesList = await listAll(
   `/api/tenants/${widgetsTenantId}/roles`,
-  undefined,
+  RoleResponse,
+  "widget roles response",
   aliceCookies,
 );
-const widgetRolesList = parse(
-  paginatedSchema(RoleResponse),
-  widgetRoles,
-  "widget roles response",
-).data;
 const widgetAdminRole = widgetRolesList.find((r) => r.name === "admin");
 
 const { status: carolInviteStatus, data: carolInviteData } = await api(
@@ -444,17 +457,13 @@ async function ensureRole(
     log(`  Created role ${name}`);
   } else if (status === 409) {
     log(`  SKIP role ${name} (already exists)`);
-    const { data: allRoles } = await api(
-      "GET",
-      `/api/tenants/${tenantId}/roles?limit=200`,
-      undefined,
+    const allRoles = await listAll(
+      `/api/tenants/${tenantId}/roles`,
+      RoleResponse,
+      `roles list response`,
       cookies,
     );
-    const found = parse(
-      paginatedSchema(RoleResponse),
-      allRoles,
-      `roles list response`,
-    ).data.find((r) => r.name === name);
+    const found = allRoles.find((r) => r.name === name);
     if (!found) {
       process.stderr.write(`[seed] FATAL: could not find role ${name}\n`);
       process.exit(1);
@@ -672,35 +681,23 @@ const { status: prv4Status, data: prv4Data } = await api(
 checkOrSkip("create opencode-go provider", prv4Status, 201, prv4Data);
 
 // Look up provider IDs (handles re-runs where providers already exist)
-const { data: acmeProviders } = await api(
-  "GET",
+const providerList = await listAll(
   `/api/tenants/${acmeTenantId}/providers`,
-  undefined,
-  aliceCookies,
-);
-const providerList = parse(
-  paginatedSchema(ProviderResponse),
-  acmeProviders,
+  ProviderResponse,
   "acme providers response",
-);
-const anthropicProvider = providerList.data.find((p) => p.name === "Anthropic");
-const githubProvider = providerList.data.find((p) => p.name === "GitHub");
-const opencodeGoProvider = providerList.data.find(
-  (p) => p.name === "OpenCode Go",
-);
-
-const { data: widgetProviders } = await api(
-  "GET",
-  `/api/tenants/${widgetsTenantId}/providers`,
-  undefined,
   aliceCookies,
 );
-const widgetProviderList = parse(
-  paginatedSchema(ProviderResponse),
-  widgetProviders,
+const anthropicProvider = providerList.find((p) => p.name === "Anthropic");
+const githubProvider = providerList.find((p) => p.name === "GitHub");
+const opencodeGoProvider = providerList.find((p) => p.name === "OpenCode Go");
+
+const widgetProviderList = await listAll(
+  `/api/tenants/${widgetsTenantId}/providers`,
+  ProviderResponse,
   "widget providers response",
+  aliceCookies,
 );
-const stripeProvider = widgetProviderList.data.find((p) => p.name === "Stripe");
+const stripeProvider = widgetProviderList.find((p) => p.name === "Stripe");
 
 // -- Create OAuth clients --
 
@@ -878,18 +875,14 @@ for (const m of catalogModels) {
   checkOrSkip(`create model ${m.canonicalName}`, status, 201, data);
 }
 
-const { data: catalogModelListData } = await api(
-  "GET",
+const catalogModelList = await listAll(
   `/api/tenants/${acmeTenantId}/catalog/models`,
-  undefined,
+  ModelResponse,
+  "catalog models response",
   aliceCookies,
 );
 const modelIdByName = new Map(
-  parse(
-    paginatedSchema(ModelResponse),
-    catalogModelListData,
-    "catalog models response",
-  ).data.map((m) => [m.canonicalName, m.id]),
+  catalogModelList.map((m) => [m.canonicalName, m.id]),
 );
 
 for (const p of catalogProviders) {
@@ -913,17 +906,13 @@ for (const p of catalogProviders) {
     intgData,
   );
 
-  const { data: intgListData } = await api(
-    "GET",
+  const intgList = await listAll(
     `/api/tenants/${acmeTenantId}/providers`,
-    undefined,
+    ProviderResponse,
+    "integration providers response",
     aliceCookies,
   );
-  const integrationProvider = parse(
-    paginatedSchema(ProviderResponse),
-    intgListData,
-    "integration providers response",
-  ).data.find((x) => x.name === p.name);
+  const integrationProvider = intgList.find((x) => x.name === p.name);
   if (!integrationProvider) fatalMissing(`integration provider ${p.name}`);
 
   // Every dev deployment authenticates with an API key.
@@ -946,17 +935,13 @@ for (const p of catalogProviders) {
     credData,
   );
 
-  const { data: credListData } = await api(
-    "GET",
+  const credList = await listAll(
     `/api/tenants/${acmeTenantId}/credentials`,
-    undefined,
+    CredentialIdName,
+    "credentials response",
     aliceCookies,
   );
-  const credential = parse(
-    paginatedSchema(CredentialIdName),
-    credListData,
-    "credentials response",
-  ).data.find((c) => c.name === cred.credentialName);
+  const credential = credList.find((c) => c.name === cred.credentialName);
   if (!credential) fatalMissing(`credential ${cred.credentialName}`);
 
   const { status: provStatus, data: provData } = await api(
@@ -972,17 +957,13 @@ for (const p of catalogProviders) {
   );
   checkOrSkip(`create catalog provider ${p.name}`, provStatus, 201, provData);
 
-  const { data: provListData } = await api(
-    "GET",
+  const catalogProviderList = await listAll(
     `/api/tenants/${acmeTenantId}/catalog/providers`,
-    undefined,
+    ModelProviderResponse,
+    "catalog providers response",
     aliceCookies,
   );
-  const catalogProviderRow = parse(
-    paginatedSchema(ModelProviderResponse),
-    provListData,
-    "catalog providers response",
-  ).data.find((x) => x.name === p.name);
+  const catalogProviderRow = catalogProviderList.find((x) => x.name === p.name);
   if (!catalogProviderRow) fatalMissing(`catalog provider ${p.name}`);
 
   for (const o of p.offerings) {
@@ -1009,17 +990,12 @@ for (const p of catalogProviders) {
     checkOrSkip(`create offering ${p.name}/${o.model}`, status, 201, data);
   }
 
-  const { data: offeringListData } = await api(
-    "GET",
+  const catalogOfferings = await listAll(
     `/api/tenants/${acmeTenantId}/catalog/offerings`,
-    undefined,
+    ModelOfferingResponse,
+    "catalog offerings response",
     aliceCookies,
   );
-  const catalogOfferings = parse(
-    paginatedSchema(ModelOfferingResponse),
-    offeringListData,
-    "catalog offerings response",
-  ).data;
   for (const o of p.offerings) {
     const modelId = modelIdByName.get(o.model);
     // The create loop already logged and skipped an offering whose model was
@@ -1072,17 +1048,12 @@ async function resolveTenantPrincipalId(
   userId: string,
   cookies: CookieJar,
 ): Promise<string> {
-  const { data } = await api(
-    "GET",
-    `/api/tenants/${tenantId}/principals?limit=200`,
-    undefined,
+  const principals = await listAll(
+    `/api/tenants/${tenantId}/principals`,
+    PrincipalResponse,
+    "tenant principals response",
     cookies,
   );
-  const principals = parse(
-    paginatedSchema(PrincipalResponse),
-    data,
-    "tenant principals response",
-  ).data;
   const match = principals.find((p) => p.refId === userId);
   if (!match) {
     process.stderr.write(
@@ -1105,18 +1076,13 @@ async function plantPrincipalGrant(
   // rows. Check for an equivalent existing grant first and skip the
   // insert when one is present, matching how the role-grant block only
   // plants grants for a freshly created role.
-  const { status: listStatus, data: listData } = await api(
-    "GET",
-    `/api/tenants/${tenantId}/grants?principalId=${encodeURIComponent(principalId)}&resource=${encodeURIComponent(resource)}&limit=200`,
-    undefined,
+  const grants = await listAll(
+    `/api/tenants/${tenantId}/grants?principalId=${encodeURIComponent(principalId)}&resource=${encodeURIComponent(resource)}`,
+    GrantResponse,
+    `grants list for principal ${principalId}`,
     cookies,
   );
-  check(`list grants for principal ${principalId}`, listStatus, 200, listData);
-  const existing = parse(
-    paginatedSchema(GrantResponse),
-    listData,
-    `grants list for principal ${principalId}`,
-  ).data.find(
+  const existing = grants.find(
     (g) =>
       g.resource === resource &&
       g.action === action &&
