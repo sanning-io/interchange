@@ -21,10 +21,13 @@
 
 import { type } from "arktype";
 
-export const DEFAULT_WORKBENCH_URL = "http://localhost:4601";
+export const DEFAULT_WORKBENCH_URL = "http://localhost:4630";
 
 /** The Workbench base URL: `MERIDIAN_WORKBENCH_URL`, or the local
- *  claims-demo default. */
+ *  default — the meridian-workbench example IN THIS estate, so the
+ *  two-company story runs with no dependency on the claims-demo repo.
+ *  The env override still accepts any workbench speaking the same open
+ *  estate contract (a hosted claims-demo included). */
 export function workbenchUrl(env: NodeJS.ProcessEnv): string {
   const raw = env["MERIDIAN_WORKBENCH_URL"];
   return raw !== undefined && raw !== ""

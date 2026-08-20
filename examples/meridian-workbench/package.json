@@ -1,0 +1,28 @@
+{
+  "name": "@intx/example-meridian-workbench",
+  "version": "0.2.2",
+  "license": "LGPL-2.1-only",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "scripts": {
+    "serve": "bun --conditions=intx-src run src/serve.ts",
+    "day": "bun --conditions=intx-src run scripts/run-day.ts",
+    "mock": "bun --conditions=intx-src run scripts/mock-services.ts",
+    "smoke": "bun --conditions=intx-src run scripts/smoke.ts"
+  },
+  "dependencies": {
+    "@intx/agent": "workspace:*",
+    "@intx/example-agent-anchored-audit": "workspace:*",
+    "@intx/example-agent-common": "workspace:*",
+    "@intx/example-halden-claims-desk": "workspace:*",
+    "@sanning/anchor": "^0.4.0",
+    "@sanning/proof": "^0.4.1",
+    "arktype": "catalog:"
+  }
+}

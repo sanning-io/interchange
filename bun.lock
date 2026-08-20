@@ -244,6 +244,19 @@
         "arktype": "catalog:",
       },
     },
+    "examples/meridian-workbench": {
+      "name": "@intx/example-meridian-workbench",
+      "version": "0.2.2",
+      "dependencies": {
+        "@intx/agent": "workspace:*",
+        "@intx/example-agent-anchored-audit": "workspace:*",
+        "@intx/example-agent-common": "workspace:*",
+        "@intx/example-halden-claims-desk": "workspace:*",
+        "@sanning/anchor": "^0.4.0",
+        "@sanning/proof": "^0.4.1",
+        "arktype": "catalog:",
+      },
+    },
     "examples/posix-demo": {
       "name": "@intx/example-posix-demo",
       "version": "0.2.2",
@@ -923,6 +936,8 @@
     "@intx/example-coding-agent": ["@intx/example-coding-agent@workspace:examples/coding-agent"],
 
     "@intx/example-halden-claims-desk": ["@intx/example-halden-claims-desk@workspace:examples/halden-claims-desk"],
+
+    "@intx/example-meridian-workbench": ["@intx/example-meridian-workbench@workspace:examples/meridian-workbench"],
 
     "@intx/example-posix-demo": ["@intx/example-posix-demo@workspace:examples/posix-demo"],
 

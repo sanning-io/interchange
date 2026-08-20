@@ -1,0 +1,23 @@
+{
+  "rules": [
+    {
+      "line": "fire and smoke",
+      "severity": "major when the property is uninhabitable or the initial estimate exceeds $25,000; standard otherwise",
+      "queue": "property-claims-adjudication",
+      "sla": "adjudication within 10 business days of a complete claim file"
+    },
+    {
+      "line": "water damage",
+      "severity": "standard unless habitability is affected",
+      "queue": "property-claims-adjudication",
+      "sla": "adjudication within 15 business days"
+    },
+    {
+      "line": "liability",
+      "severity": "always referred",
+      "queue": "liability-referral",
+      "sla": "referral within 2 business days"
+    }
+  ],
+  "notes": "Major-severity claims require a field inspection before adjudication. All fire losses receive a cause-and-origin review eligibility flag for post-payment recovery screening."
+}

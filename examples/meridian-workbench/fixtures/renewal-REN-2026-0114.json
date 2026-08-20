@@ -1,0 +1,11 @@
+{
+  "reviewId": "REN-2026-0114",
+  "policyId": "HO-77341-2024",
+  "policyholder": { "id": "PH-201District", "name": "Dana Okafor" },
+  "renewalDate": "2026-11-01",
+  "reviewWindowOpened": "2026-07-20",
+  "currentAnnualPremium": 1840,
+  "tenureYears": 2,
+  "requestedChanges": "none",
+  "notes": "Standard 90-day advance renewal review."
+}
