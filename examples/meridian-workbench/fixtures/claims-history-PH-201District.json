@@ -1,0 +1,22 @@
+{
+  "policyholderId": "PH-201District",
+  "policyId": "HO-77341-2024",
+  "claims": [
+    {
+      "claimId": "CLM-2024-0847",
+      "lossDate": "2024-12-03",
+      "type": "water damage",
+      "decision": "DENIED",
+      "basis": "gradual seepage from a known, unrepaired supply-line leak — excluded as gradual damage and failure to mitigate",
+      "note": "The leak documented in the denial remains unrepaired per the inspection accompanying CLM-2026-3105."
+    },
+    {
+      "claimId": "CLM-2026-3105",
+      "lossDate": "2026-07-19",
+      "type": "fire and smoke",
+      "decision": "APPROVED",
+      "approvedAmount": 45500,
+      "note": "Sudden and accidental cooking fire; paid in full less deductible."
+    }
+  ]
+}

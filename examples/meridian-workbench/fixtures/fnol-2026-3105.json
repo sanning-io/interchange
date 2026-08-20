@@ -1,0 +1,14 @@
+{
+  "notificationId": "FNOL-2026-3105",
+  "receivedAt": "2026-07-21T14:32:00Z",
+  "channel": "phone",
+  "policyId": "HO-77341-2024",
+  "policyholder": { "id": "PH-201District", "name": "Dana Okafor" },
+  "lossDate": "2026-07-19",
+  "lossType": "fire and smoke",
+  "description": "Stovetop fire spread to the surrounding cabinetry before being extinguished by the fire department. Significant smoke damage throughout the ground floor. No injuries reported. Family has relocated to temporary accommodation; the property is not currently habitable.",
+  "initialEstimate": 46500,
+  "injuries": false,
+  "habitability": "uninhabitable pending remediation",
+  "reportedBy": "policyholder"
+}

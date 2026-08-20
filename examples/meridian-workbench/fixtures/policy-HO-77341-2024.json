@@ -1,0 +1,29 @@
+{
+  "policyId": "HO-77341-2024",
+  "product": "Meridian HomeShield Plus",
+  "policyholder": { "id": "PH-201District", "name": "Dana Okafor" },
+  "property": "1442 Alder Row, Harrisview",
+  "effective": { "from": "2024-11-01", "to": "2026-11-01" },
+  "status": "active",
+  "premiumsCurrent": true,
+  "coverage": {
+    "waterDamage": {
+      "covered": "sudden and accidental discharge of water (e.g. burst pipe, appliance failure)",
+      "limit": 50000,
+      "exclusions": [
+        "gradual seepage or leakage occurring over 14 days or more",
+        "wear and tear, deterioration, or corrosion",
+        "damage the insured knew of and failed to mitigate"
+      ]
+    },
+    "fire": {
+      "covered": "direct loss from fire and smoke, including damage caused by fire-department response and reasonable emergency mitigation",
+      "limit": 250000,
+      "exclusions": [
+        "arson by or at the direction of the insured",
+        "fire arising from illegal activity at the premises"
+      ]
+    }
+  },
+  "deductible": 1000
+}

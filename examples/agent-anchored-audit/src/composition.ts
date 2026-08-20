@@ -90,10 +90,17 @@ export function openrouterSource(
   const apiKey = env["OPENROUTER_API_KEY"];
   if (apiKey === undefined || apiKey === "") return null;
   const model = env["OPENROUTER_MODEL"] ?? DEFAULT_OPENROUTER_MODEL;
+  // OPENROUTER_BASE_URL override: dev-only knob so the whole flow is
+  // drivable against a local mock without model spend.
+  const baseURL =
+    env["OPENROUTER_BASE_URL"] !== undefined &&
+    env["OPENROUTER_BASE_URL"] !== ""
+      ? env["OPENROUTER_BASE_URL"]
+      : OPENROUTER_BASE_URL;
   return {
     id: `openrouter:${model}`,
     provider: "openai",
-    baseURL: OPENROUTER_BASE_URL,
+    baseURL,
     apiKey,
     model,
   };
@@ -282,22 +289,43 @@ export function createExampleAnchorer(
   });
 }
 
-// The Recovery job's tools (see ./job): four deterministic reads over
-// the recovery casefile, the kernel-backed pack verification, the
-// allowed draft, and the DENIED send. The authorize policy denies
-// issuance, so a full run produces both audit shapes — allowed calls
+// A runnable job: WHAT an agent session does — prompt, tools, policy —
+// while runAnchoredSession stays the plumbing (identity, storage,
+// anchoring). The default is this example's Recovery job; the Meridian
+// Workbench example passes its own stages through the same seam.
+export interface JobSpec {
+  /** Agent id — names the session's tool package too. */
+  id: string;
+  systemPrompt: string;
+  tools: typeof recoveryTools;
+  authorize: BaseEnv["authorize"];
+}
+
+function toolsFactoryFor(job: JobSpec) {
+  return defineTool({
+    id: `@intx/example-${job.id}/tools`,
+    definitions: job.tools.map((t) => ({ name: t.definition.name })),
+    factory: () => {
+      const runner = createToolRunner(job.tools);
+      return {
+        definitions: runner.definitions,
+        run: (call, signal) => runner.run(call, signal),
+      };
+    },
+  });
+}
+
+// The Recovery job (see ./job): four deterministic reads over the
+// recovery casefile, the kernel-backed pack verification, the allowed
+// draft, and the DENIED send. The authorize policy denies issuance, so
+// a full run produces both audit shapes — allowed calls
 // (interchange.tool_call) and the blocked one (interchange.tool_blocked).
-const toolsFactory = defineTool({
-  id: `@intx/example-${EXAMPLE_NAME}/tools`,
-  definitions: recoveryTools.map((t) => ({ name: t.definition.name })),
-  factory: () => {
-    const runner = createToolRunner(recoveryTools);
-    return {
-      definitions: runner.definitions,
-      run: (call, signal) => runner.run(call, signal),
-    };
-  },
-});
+export const RECOVERY_JOB: JobSpec = {
+  id: EXAMPLE_NAME,
+  systemPrompt: SYSTEM_PROMPT,
+  tools: recoveryTools,
+  authorize: recoveryAuthorize,
+};
 
 /** Thrown when the session succeeded but the anchoring flush did not.
  *  The signed git audit trail in `contextDir` is intact either way. */
@@ -317,6 +345,9 @@ export interface RunSessionParams {
   source: InferenceSource;
   env: NodeJS.ProcessEnv;
   contextDir: string;
+  /** The job to run (prompt/tools/policy). Default: this example's
+   *  Recovery job — existing callers are unchanged. */
+  job?: JobSpec;
   /** Called with the assistant's reply as soon as the turn completes,
    *  BEFORE the anchoring flush — so callers can surface the reply even
    *  when anchoring subsequently fails. */
@@ -393,10 +424,11 @@ export async function runAnchoredSession(
       : {},
   );
 
+  const job = params.job ?? RECOVERY_JOB;
   const def = defineAgent({
-    id: EXAMPLE_NAME,
-    systemPrompt: SYSTEM_PROMPT,
-    tools: [toolsFactory],
+    id: job.id,
+    systemPrompt: job.systemPrompt,
+    tools: [toolsFactoryFor(job)],
     capabilities: [],
     inference: {
       sources: [{ provider: source.provider, model: source.model }],
@@ -409,7 +441,7 @@ export async function runAnchoredSession(
     storage,
     workdir: contextDir,
     audit: provenance,
-    authorize: recoveryAuthorize,
+    authorize: job.authorize,
     directors: createDefaultDirectorRegistry(),
     ...optional("deps", params.deps),
   };

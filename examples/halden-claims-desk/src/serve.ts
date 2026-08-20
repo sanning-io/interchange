@@ -36,7 +36,7 @@
 //                        mounted volume on hosted deploys
 //   MERIDIAN_WORKBENCH_URL  where the desk pulls demands from and
 //                        resolves evidence requests against (default
-//                        http://localhost:4601)
+//                        http://localhost:4630, the in-estate Meridian Workbench)
 //   DEMO_PASSCODE        when set, the endpoints that mutate the desk
 //                        (/fetch-demand, /file-demand, /request-evidence,
 //                        DELETE /case/:file) require it — ?key= or an

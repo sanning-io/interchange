@@ -108,7 +108,7 @@ Override the model with `OPENROUTER_MODEL` (default
 | `PORT`                   | no            | deploy platforms (Railway) inject it; wins over the next row                                                                                                                                                                                                      |
 | `HALDEN_DESK_PORT`       | no            | the example's own port override (default `4620`)                                                                                                                                                                                                                  |
 | `SANNING_CONTEXT_DIR`    | no            | where persistent state lives — `identity.json`, `cases/`, `files/<ref>/` logbooks (default `<repo-root>/tmp/halden-claims-desk/context`); on hosted deploys point it at a mounted volume                                                                          |
-| `MERIDIAN_WORKBENCH_URL` | no            | where the desk pulls incoming demands from and resolves evidence requests against (default `http://localhost:4601`, the local claims-demo Workbench); on hosted deploys point it at the hosted Workbench                                                          |
+| `MERIDIAN_WORKBENCH_URL` | no            | where the desk pulls incoming demands from and resolves evidence requests against (default `http://localhost:4630`, the in-estate `meridian-workbench` example — the two-company story needs nothing outside this repo); point it at any workbench speaking the same open estate contract, a hosted claims-demo included                                                          |
 | `DEMO_PASSCODE`          | no            | when set, the endpoints that mutate the desk (`/fetch-demand`, `/file-demand`, `/request-evidence`, `DELETE /case/:file`) require it — `?key=` or an `x-demo-key` header; the page prompts once and keeps it for the tab session. Unset = open, the local default |
 
 ### Docker
@@ -162,7 +162,7 @@ The desk (mutating endpoints gated by `DEMO_PASSCODE` when set):
 
 ### The handoff from Meridian
 
-With the claims-demo Workbench on `:4601` (serving sessions) and the
+With the in-estate Meridian Workbench on `:4630` (serving sessions — `bun run serve` in `examples/meridian-workbench`; `MERIDIAN_WORKBENCH_URL` overrides for a claims-demo estate on `:4601`) and the
 desk on `:4620`, the whole story is drivable from the page alone:
 **Incoming demand — Meridian** (top right) pulls the demand, Act II's
 form requests the evidence, and the examination runs to a position.
